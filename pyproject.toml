@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contra_nes_policy"
+version = "0.1.0"
+description = "ROCKET-2 cross-view goal-conditioned policy, re-implemented for Contra (NES)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "einops",
+    "imageio",
+    "av",
+    "imageio-ffmpeg",
+    "opencv-python-headless",
+    "lightning>=2.0",
+    "hydra-core>=1.3",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

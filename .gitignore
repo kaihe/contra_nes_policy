@@ -1,0 +1,9 @@
+cache/
+runs/
+weights/
+checkpoints/
+logs/
+__pycache__/
+*.egg-info/
+*.pyc
+outputs/
