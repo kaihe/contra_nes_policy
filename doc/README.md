@@ -13,6 +13,7 @@ Requests to another repo are **issues on that repo**, not docs here — see the
 
 | doc | status | what it decides |
 |---|---|---|
+| [0002 A plain causal transformer over whole episodes](0002-gpt-policy.md) | Proposed | Llama-shaped causal core over `[interaction, goal, frame × 510]`; the episode becomes the sequence, so carried memory, chunking, truncated BPTT and `index_bias` all delete. 6.7× cheaper attention. Depends on 0001. |
 | [0001 The image encoder](0001-image-encoder.md) | Implemented | `src/contra_encoder/`: one symmetric `encode(image)` for frames and goal frames alike, 4-class occupancy decoded from a 512-d token, goal matching left to the policy's attention. Records the rejected alternatives (goal-conditioning, SB3, an LLM backbone, `prev_action`) and the `point_err_px` false alarm. |
 
 ## Open questions not yet in a doc
