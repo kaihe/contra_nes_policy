@@ -15,8 +15,8 @@ target is the 4-class entity map. What has to be pinned:
 * `flatten_window` keeps members aligned, and the entity metrics stay readable on maps
   that are 95-98% empty.
 
-`heatmap_readout` is still tested here even though the encoder no longer calls it: it
-is the policy's readout at stage B and `point_err_px` is pinned by
+`heatmap_readout` is still tested here even though the encoder no longer calls it: the
+rebuilt policy reads grounding out the same way, and `point_err_px` is pinned by
 `contra_nes_evaluation`.
 
 Tests needing the shards skip cleanly.
@@ -34,8 +34,6 @@ from contra_encoder.data import flatten_window
 from contra_encoder.heads import HeatmapHead, ReconstructionHead, heatmap_readout
 
 SHARD_DIR = os.path.expanduser("~/code/contra_nes_data/game_trace/hf")
-BC_CKPT = os.path.expanduser("~/code/contra_nes_policy/runs/2026-07-28/18-01-29/"
-                             "weights/weight-epoch=18-step=30000.ckpt")
 # Small everywhere so the suite stays fast; image_size must remain minres*2^k.
 SMALL = dict(image_size=64, hiddim=32, depth=4, minres=4, proj_ch=16,
              aux_size=32, head_depth=8, recon_depth=4)
@@ -169,25 +167,14 @@ def test_freeze_on_load_disables_every_gradient(tmp_path):
 
 # ── the policy's readout, still pinned ───────────────────────────────────────
 
-@pytest.mark.skipif(not os.path.exists(BC_CKPT),
-                    reason="the BC initialisation checkpoint is not on this machine")
-def test_heatmap_readout_is_identical_to_the_policys():
-    from contra_policy.model import CrossViewContraRocket
-    from contra_policy.rl import checkpoint as ckpt_io
-
-    policy = CrossViewContraRocket(**ckpt_io.model_config_from_checkpoint(BC_CKPT))
-    torch.manual_seed(0)
-    for shape in [(5, 1, 32, 32), (2, 7, 32, 32)]:
-        heat = torch.randn(*shape) * 3
-        p_ref, e_ref = policy.heatmap_readout(heat)
-        p_new, e_new = heatmap_readout(heat)
-        # Bit-identical, not close: point_err_px is pinned by contra_nes_evaluation.
-        assert torch.equal(p_ref, p_new) and torch.equal(e_ref, e_new)
-
-
 def test_soft_argmax_has_no_half_cell_offset():
     """`goal_mask` places a blob at cx = x_norm * A exactly, so the readout inverts that.
-    A half-cell offset would bias every prediction by 0.5/A — about 3.7 px at A=32."""
+    A half-cell offset would bias every prediction by 0.5/A — about 3.7 px at A=32.
+
+    This used to be pinned by differencing against `CrossViewContraRocket.heatmap_readout`.
+    That policy is gone, so the property is asserted directly instead — which is the
+    better test anyway: it states what must hold rather than that two copies agree.
+    """
     A = 32
     for (col, row) in [(0, 0), (7, 21), (31, 31)]:
         heat = torch.full((1, A, A), -30.0)

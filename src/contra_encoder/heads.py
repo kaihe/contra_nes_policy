@@ -78,10 +78,8 @@ class HeatmapHead(nn.Module):
 def heatmap_readout(heat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(..., A, A)`` logits → ``(point, exist)`` in the evaluator's conventions.
 
-    Arithmetic copied from ``CrossViewContraRocket.heatmap_readout`` and it must stay
-    identical, because ``point_err_px`` is pinned by ``contra_nes_evaluation`` and the
-    whole gate on this rebuild is "boss point error no worse than the 5.3 px the
-    current policy reports".
+    ``point_err_px`` is pinned by ``contra_nes_evaluation``, so this arithmetic is too:
+    it is how a heatmap becomes the coordinate that metric scores.
 
     In particular the soft-argmax has **no** +0.5 pixel-centre offset:
     ``goal.goal_mask`` places a blob at ``cx = x_norm * A`` exactly, so dividing the
