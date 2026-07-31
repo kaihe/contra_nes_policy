@@ -168,23 +168,27 @@ rejected, kept as the baseline the current one had to match:
 | traverse | 0.994 | 0.999 | 0.959 | 0.920 |
 | boss | 0.999 | 1.000 | 0.991 | 0.902 |
 
-**Goal-agnostic encoder**, val entity dice — matches or beats it on every class, in a
-fifth of the steps:
+**Goal-agnostic encoder** (20,000 steps, full val) — beats it on every class, and had
+already matched it by step 5,000:
 
-| step | player | player_bullets | enemies | enemy_bullets |
+| | player | player_bullets | enemies | enemy_bullets |
 |---|---|---|---|---|
-| 1000 | 0.900 | 0.539 | 0.854 | 0.689 |
-| 3000 | 0.966 | 0.629 | 0.944 | 0.893 |
-| 5000 | 0.977 | 0.660 | 0.960 | 0.923 |
-| **7000** | **0.982** | **0.688** | **0.964** | **0.938** |
-| baseline | 0.984 | 0.634 | 0.960 | 0.910 |
+| goal-conditioned baseline | 0.984 | 0.634 | 0.960 | 0.910 |
+| step 5000 | 0.977 | 0.660 | 0.960 | 0.923 |
+| **final (20000)** | **0.99** | **0.70** | **0.98** | **0.97** |
 
-Goal-frame dice tracks the agent-frame column (0.97 / 0.66 / 0.94 / 0.98), so the
-painted marker has not pushed goal frames out of distribution — the open risk when we
-chose to supervise them.
+Per family at the end: `kill 0.98/0.96 · item 0.97/0.93 · traverse 0.98/0.97 ·
+boss 0.99/0.97` (enemies / enemy_bullets). **Boss scores highest**, and its
+`enemy_bullets` — ~4.9 sprites of ~2 px per frame, the class most relevant to
+surviving a boss fight — went 0.910 → 0.97.
 
-`player_bullets` is the weak class in both designs (~0.65 against ~0.95 for the
-others). Not diagnosed.
+Goal-frame dice is `0.99 / 0.70 / 0.98 / 0.98`, indistinguishable from the agent-frame
+column. The painted marker did not push goal frames out of distribution, which was the
+open risk when we chose to supervise them.
+
+`player_bullets` is the weak class in both designs (0.70 against ~0.98 for the others).
+Not diagnosed. It is the one class the policy plausibly does not need — the player's own
+bullets are a consequence of its actions, not a thing to react to.
 
 ## 6. Open: is reconstruction worth it?
 
@@ -254,4 +258,4 @@ second boss** (then `boss` stops being one label).
 | removed parameter counts | `sum(p.numel())` per submodule |
 | `ConvDecoder` 27.97M | `dreamer.models.ConvDecoder(256, depth=32, feat_dim=1024)` |
 | goal-conditioned results | `runs/encoder/2026-07-31/11-20-50/`, full val (782 batches) |
-| goal-agnostic results | `runs/encoder/2026-07-31/18-00-11/metrics.csv`, `phase=val` |
+| goal-agnostic results | `runs/encoder/2026-07-31/18-00-11/`, `phase=val_full`, whole val set |
