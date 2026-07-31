@@ -25,10 +25,14 @@ What changes for Contra, and why:
   embedding is one ``nn.Embedding(21, hiddim)`` rather than a per-key sum.
 * **Goal mask.** Regenerated from the shard's goal points rather than shipped as a
   segmentation mask (see :mod:`contra_policy.goal`).
+* **Aux head.** ROCKET-2 regresses scalars — ``Linear(hiddim, 1+2+4)`` for
+  exist/point/bbox. Here it is a dense ``aux_size**2`` goal-occupancy heatmap; see
+  the head's own comment below for why the scalars could not work on this data.
+  ``exist`` and ``point`` are still emitted, read out of the map.
 
 Everything else — the resampler, the interaction embedding, the prev-action dropout
 embedding, ``index_bias`` bookkeeping, the clipped-causal memory transformer, the
-``exist``/``point``/``bbox`` aux head — is the reference design.
+aux head's placement on the interaction token — is the reference design.
 """
 
 from __future__ import annotations
