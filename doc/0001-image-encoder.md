@@ -171,17 +171,42 @@ objective's metrics, since fixed):
 
 ## 5. Sequencing
 
-1. **Stage A — encoder pretraining.** Done; `src/contra_encoder/`, 31 tests.
-   Gate marginal on boss.
+1. **Stage A — encoder pretraining.** Done; `src/contra_encoder/`. Gate passed on
+   every family once the metric was corrected (§4). Superseded by 0002, which retrains
+   a goal-agnostic encoder.
 2. **Stage B — retokenise `contra_policy.model`** to `[interact, goal, img × N]`,
    delete the `prev_action` machinery, rewire the heads. BC at `seq_len: 32` first, so
    a grounding regression surfaces in a cheap run. Gate: completion vs 72.8%.
 3. **Stage C — `win_len: 256` with a per-chunk goal prefix, `maxlen` toward 1024.**
    The invariant that makes this safe: `maxlen ≥ chunk token length` means the chunk's
    own goal prefix can never be evicted by `clipped_causal`.
-4. **Blocked elsewhere:** confirming any boss result on held-out data needs more boss
-   val tasks — n=57 is ~16× underpowered for the effect sizes in play. Tracked as an
-   issue on `contra_nes_data`.
+### Boss val power — considered and dropped
+
+An earlier draft called the 57-task boss val split a blocker: separating 8.8% from
+12.9% at 80% power needs ~920 tasks per arm, so it is ~16× underpowered, and the first
+RL run's boss gain (4.9% → 12.9% on training rollouts, disjoint CIs) could not be
+confirmed on held-out data.
+
+**Not pursued.** Two reasons, and the second is the stronger:
+
+- **RL manufactures boss experience.** BC is only the initialisation. A 500-update run
+  already generated 2,093 boss episodes from 466 train tasks; at 5,000 updates that is
+  ~21,000. Training data was never the constraint.
+- **Boss is a single label.** All 466 train and 57 val tasks are `boss_level1` — one
+  encounter, different starting states. "Generalising across boss tasks" is therefore a
+  much narrower claim than for `traverse` (many level positions) or `kill` (five enemy
+  types), and held-out tasks carry correspondingly less information.
+
+With 2,000+ boss episodes on training rollouts against 57 val tasks, the **training
+rollouts are the better-powered estimate**. Val's remaining job is detecting gross
+overfitting, not measuring boss performance.
+
+Revisit if either changes:
+
+- **a run past ~5,000 updates** — per-task repetition reaches 45×, and at 180× (20,000
+  updates) memorising 466 savestates becomes plausible;
+- **a second boss exists** — then `boss` stops being one label and cross-boss
+  generalisation is a real question that same-encounter tasks cannot answer.
 
 ---
 
