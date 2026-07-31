@@ -4,13 +4,16 @@ Conventions in the `contra-nes-workflow` skill. In short: `NNNN-topic.md`, seque
 and never dated, every doc carries a `Status:` header, and this index is the first
 thing to read. A doc whose status is stale is worse than no doc.
 
+One doc per **topic**, not per revision: a superseded design belongs in its successor's
+"what was rejected" section, where a reader meets it in context, rather than in a
+separate file they must reconcile.
+
 Requests to another repo are **issues on that repo**, not docs here — see the
 `contra-nes-handoff` skill.
 
 | doc | status | what it decides |
 |---|---|---|
-| [0001 One token per frame: the image encoder](0001-image-encoder.md) | Implemented — §2 superseded by 0002 | `src/contra_encoder/`, one 512-d token per frame with occupancy decoded from it; `prev_action` deleted; the gate is `peak_hit`/`pck16`, **not** `point_err_px`; SB3 and an LLM backbone rejected |
-| [0002 A goal-agnostic encoder](0002-symmetric-encoder.md) | Proposed | one symmetric `encode(image)` for frames and goals alike; goal matching moves to the policy's attention; 3.65M of goal-specific machinery deleted; reconstruction behind an ablation |
+| [0001 The image encoder](0001-image-encoder.md) | Implemented | `src/contra_encoder/`: one symmetric `encode(image)` for frames and goal frames alike, 4-class occupancy decoded from a 512-d token, goal matching left to the policy's attention. Records the rejected alternatives (goal-conditioning, SB3, an LLM backbone, `prev_action`) and the `point_err_px` false alarm. |
 
 ## Open questions not yet in a doc
 
