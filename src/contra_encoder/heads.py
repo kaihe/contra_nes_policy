@@ -9,8 +9,8 @@ That is not a new bet. ``contra_agent/dreamer/train_ae.py`` pretrains this same
 ``ConvEncoder`` with an ``EntityHead(embed_dim, n_classes=4, grid, depth)`` that decodes
 four occupancy maps out of the embedding, precisely because — in its words — a
 recon-only frozen encoder "goes entity-blind". This is that head, generalised over
-class count so the 1-class goal target works now and the 4-class entity target works
-once ``contra_nes_data`` exports per-frame RAM.
+class count. Since 0002 the encoder is goal-agnostic, so the only occupancy target is
+the 4-class entity map; the parameter stays because a future target may not be 4.
 """
 
 from __future__ import annotations
@@ -102,3 +102,44 @@ def heatmap_readout(heat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     point = torch.stack([x, y], dim=-1).to(heat.dtype)
     exist = flat.max(dim=-1).values.unsqueeze(-1)
     return point, exist
+
+
+class ReconstructionHead(nn.Module):
+    """``(B, dim)`` → ``(B, 3, size, size)`` in [0, 1] — pixels back out of the token.
+
+    Off by default. It is the open question in ``doc/0002-symmetric-encoder.md`` §4:
+    a full-width decoder at the encoder's own config is 27.97M parameters, more than
+    everything else combined, and the precedent (``contra_agent/dreamer/train_ae.py``)
+    only establishes that a **recon-only** encoder goes entity-blind — not that
+    reconstruction adds anything once an entity head is already forcing sprites into
+    the token. ``recon_depth`` is therefore separate from the encoder's ``depth``, so
+    the ablation can be run at a size that is worth paying for.
+
+    Mirrors the trunk: a linear projection to a ``base`` x ``base`` seed, then stride-2
+    transposed convs up to ``size``, halving channels each step.
+    """
+
+    def __init__(self, dim: int, size: int = 256, depth: int = 16, base: int = 4):
+        super().__init__()
+        if base <= 0 or not float(math.log2(size / base)).is_integer():
+            raise ValueError(f"size {size} must be base {base} times a power of two")
+        n_up = int(round(math.log2(size / base)))
+        ch = depth * 2 ** min(n_up, 5)          # cap the widest layer; 2**n explodes
+        self.base, self.seed_ch = base, ch
+        self.seed = nn.Linear(dim, ch * base * base)
+
+        layers: list[nn.Module] = []
+        for _ in range(n_up):
+            out = max(depth, ch // 2)
+            layers += [nn.ConvTranspose2d(ch, out, 4, stride=2, padding=1),
+                       _norm(out), nn.SiLU()]
+            ch = out
+        self.ups = nn.Sequential(*layers)
+        # Sigmoid, not a raw linear output: the target is a [0, 1] image, and an
+        # unbounded head spends early training learning the range instead of the content.
+        self.out = nn.Sequential(nn.Conv2d(ch, 3, 3, padding=1), nn.Sigmoid())
+
+    def forward(self, token: torch.Tensor) -> torch.Tensor:
+        b = token.shape[0]
+        x = self.seed(token).view(b, self.seed_ch, self.base, self.base)
+        return self.out(self.ups(x))

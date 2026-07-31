@@ -390,19 +390,30 @@ class ContraCrossViewDataset(Dataset):
         # `entities` is absent from shards exported before 2026-07-30; an all-zero target
         # is the honest fallback (no entities known), and `want_entities` callers should
         # check `entities_available` rather than train on silence.
-        entity = None
+        entity = goal_entity = None
         if self.want_entities:
             C = len(self.ENTITY_CLASSES)
             entity = np.zeros((T, C, A, A), dtype=np.float32)
             ent = meta.get("entities")
+
+            def render(frame_idx: int, into: np.ndarray) -> None:
+                for c, name in enumerate(self.ENTITY_CLASSES):
+                    col = ent.get(name)
+                    if col is None or frame_idx >= len(col) or not col[frame_idx]:
+                        continue
+                    into[c] = goal_mask(col[frame_idx], A, self.entity_sigma_px)
+
             if ent is not None:
                 for k in range(n):
-                    j = start + k
-                    for c, name in enumerate(self.ENTITY_CLASSES):
-                        col = ent.get(name)
-                        if col is None or j >= len(col) or not col[j]:
-                            continue
-                        entity[k, c] = goal_mask(col[j], A, self.entity_sigma_px)
+                    render(start + k, entity[k])
+                # The goal frame's own entity target. `goal.png` IS an episode frame
+                # with the target painted into it, and `goal_frame_idx` says which —
+                # so a goal-agnostic encoder can supervise goal frames with exactly the
+                # same signal as any other frame, rather than leaving them unlabelled.
+                gi = meta.get("goal_frame_idx")
+                if gi is not None:
+                    goal_entity = np.zeros((C, A, A), dtype=np.float32)
+                    render(int(gi), goal_entity)
 
         mask = np.zeros(T, dtype=np.float32)
         mask[:n] = 1.0
@@ -433,6 +444,8 @@ class ContraCrossViewDataset(Dataset):
         }
         if entity is not None:
             out["entity_heatmap"] = torch.from_numpy(entity)
+        if goal_entity is not None:
+            out["goal_entity_heatmap"] = torch.from_numpy(goal_entity)
         return out
 
 
