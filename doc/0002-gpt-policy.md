@@ -143,6 +143,46 @@ extending it is surgery rather than a config change.
 **Interleaving action tokens (Decision-Transformer style).** See §2 — the `prev_action`
 ablation rules it out on measured grounds, not aesthetic ones.
 
+**Training at a short context (128) and cutting long traces into fragments**, each
+re-prefixed with `[interaction, goal]` so it stays self-contained. This is the LLM
+staged short→long recipe, and the construction is right — the prefix is exactly the
+invariant that keeps a fragment interpretable. It is rejected on measured cost.
+
+Aggregate attention over all 6,904 BC episodes (692,179 frames):
+
+| scheme | query-key pairs | vs full-episode |
+|---|---|---|
+| full episode, no cut | 48,710,573 | 1.00× |
+| fragments of 128 | 36,938,636 | **1.32×** |
+| fragments of 256 | 45,781,266 | 1.06× |
+| fragments of 512 | 48,705,986 | 1.00× |
+
+**Cutting to 128 saves 24%** — the quadratic term never gets going, because the mean
+episode is 100 frames and the tail is thin. And the 24% is paid by the wrong family:
+
+| family | fits one 126-frame fragment | mean fragments | p90 length |
+|---|---|---|---|
+| kill | 93.1% | 1.07 | 120 |
+| item | 99.3% | 1.01 | 68 |
+| traverse | 88.0% | 1.17 | 194 |
+| **boss** | **42.7%** | **1.80** | **305** |
+
+57% of boss episodes would be cut — the family this work exists to fix, and the one
+whose attack cycles were the argument for long context. Trading whole-episode context
+on boss for 24% of a cost that is already negligible inverts the priority.
+
+Why the LLM recipe does not transfer: it exists because long documents are *scarce* in
+pretraining corpora (so paying 32k for the whole run wastes capacity) and because 32k²
+is expensive at trillions of tokens. Here the long episodes are exactly the ones we care
+about, and the whole dataset costs 48.7M pairs — a rounding error beside the conv trunk.
+
+Worth noting it is not a regression against today's model: 126 frames is 4× the current
+32-decision window. It is simply strictly worse than full-episode for 32% more cost.
+
+**Revisit if** a future level ships budgets in the thousands, where the quadratic term
+would start to bite, or if activation memory becomes binding — it is not today
+(`flex_attention` makes the attention term O(n), and stage A peaked at 2.5 GB of 16).
+
 **An LLM-scale backbone.** Already rejected in 0001 §3 and unchanged here: we are
 GPU-bound at 76%, and this is about *removing* work. The proposal is minimind's
 *architecture* — a small Llama — not its scale. The current core is 12.77M and there is
@@ -187,6 +227,7 @@ causal model over whole episodes learns this task as well as a windowed recurren
 | attention pair counts | causal `n(n+1)/2` at 512 tokens vs `ceil(T/32) × 192 × 384 × 0.75` for the chunked scheme |
 | episode length distribution | 6,904 train demos: mean 100, p50 102, p90 150, max 519 |
 | padding waste | 400 sampled batches per scheme; bucketed = sort then batch neighbours |
+| fragmentation cost | causal `n(n+1)/2` summed per episode; fragments of `ctx` = `floor(L/(ctx-2))` full rows plus the remainder, each with a 2-token prefix |
 | current core 12.77M | `sum(p.numel())` over `CrossViewContraRocket.recurrent`, 4 layers / 512 hid / 8 heads |
 | `prev_action` ablation | 0001 §3 — `contra_nes_evaluation/runs/0729-e18` vs `-noprev` |
 | `index_bias` bug | `src/contra_policy/model.py:108-114` |
