@@ -1,0 +1,101 @@
+hydra:
+  run:
+    dir: ./runs/encoder/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# Both targets are rendered by `goal.goal_mask`, the same renderer that draws the
+# cross-view prompt, from fields already in each episode's .json:
+#
+#   goal occupancy (1 ch)   <- `centroids` + `visibility`, present since the beginning
+#   entity occupancy (4 ch) <- `entities`, added by the 2026-07-30 re-export
+#
+# Shards older than that re-export have no `entities` field; the loader falls back to an
+# all-zero target rather than failing, so check `[enc] entity target` at startup before
+# trusting an entity number.
+shard_dir: ~/code/contra_nes_data/game_trace/hf
+cache_dir: ${hydra:runtime.cwd}/cache
+families: [kill, item, traverse, boss]
+sigma_px: 12.0            # must match the export, the BC run and the prompt renderer
+
+seed: 0
+device: cuda
+precision: bf16           # bf16 | fp16 | fp32
+
+# ── encoder ───────────────────────────────────────────────────────────────────
+encoder:
+  image_size: 256
+  hiddim: 512             # token width; must equal the policy's hiddim to plug in
+  depth: 32               # ConvEncoder base width — 1024 channels on a 4x4 grid at 256px
+  minres: 4
+  mask_depth: 8           # the goal-mask trunk's input is a blob map, not a photograph
+  # Channels kept after a 1x1 reduction of the trunk's 1024, before flattening to a
+  # token. Flattening 1024x4x4 straight into a Linear is 8.4M parameters per projection
+  # — more than the trunk itself; reducing first costs 0.26M and makes it 2.4M.
+  proj_ch: 256
+  aux_size: 32            # heatmap grid A; point_err_px is calibrated at A=32
+  head_depth: 32
+  n_classes: 1            # channels of the goal head; 1 is the policy's contract
+  # Second head, supervised by the shards' per-class entity occupancy
+  # (player, player_bullets, enemies, enemy_bullets). 0 = off.
+  # Landed 2026-07-30; shards exported before then have no `entities` field and the
+  # target falls back to all-zero, so check the loader's report before enabling.
+  entity_classes: 4
+  # An `ae_pretrained.pt` from contra_agent/dreamer/train_ae.py, to initialise the conv
+  # trunk. null = from scratch.
+  view_backbone_ckpt: null
+  # False on purpose, and the whole reason this package exists: the policy freezes the
+  # trunk, so its grounding loss only ever reached the projection layers. Here the
+  # gradient has to reach the convolutions or the token cannot learn to keep sprites.
+  freeze_view_backbone: false
+
+# ── loss ──────────────────────────────────────────────────────────────────────
+loss:
+  # contra_policy.loss.GoalHeatmapLoss, reused unmodified so the number this reports is
+  # the number BC and the evaluator report.
+  heatmap_weight: 1.0
+  # At A=32 with sigma_px=12 the blob is ~1.7% of the map, so unweighted BCE is
+  # minimised by predicting "empty everywhere".
+  pos_weight: 10.0
+  # Entity head. Weighted below the goal head because the goal target feeds the pinned
+  # gate and the entity target is there to enrich the token, not to redefine success.
+  entity_weight: 0.5
+  entity_pos_weight: 10.0
+  # Tighter than the goal's 12 px: at A=32 that is 1.66 cells, which smears a boss
+  # frame's ~4.9 enemy bullets into one blob. 6 px is 0.83 cells.
+  entity_sigma_px: 6.0
+
+# ── loader ────────────────────────────────────────────────────────────────────
+loader:
+  # Decode efficiency only, NOT a model parameter: frames are independent here and get
+  # shuffled into batches anyway. Larger windows mean fewer tar seeks per frame.
+  win_len: 32
+  # Windows per loader batch. The real frame batch is win_len x this, minus padding —
+  # so 4 x 32 = ~128 frames per step. Host RAM is the binding constraint on this box
+  # (20 GB WSL VM); the loader prints its own in-flight estimate at startup.
+  batch_size: 4
+  num_workers: 2
+  prefetch_factor: 2
+
+# ── optimisation ──────────────────────────────────────────────────────────────
+train:
+  steps: 20000
+  learning_rate: 3.0e-4   # from scratch, so much higher than the BC/RL fine-tune LRs
+  weight_decay: 0.01
+  warmup_steps: 500
+  lr_decay: cosine        # none | cosine
+  max_grad_norm: 1.0
+  log_every: 50
+  # Validation is the gate, so it runs often enough to catch a regression early but not
+  # often enough to dominate: ~50 batches every 1000 steps.
+  val_every: 1000
+  # In-run curve: a fixed 50-batch subset (6.4% of val, 613 boss frames). Same frames
+  # every time, so the trend is comparable across steps.
+  val_batches: 50
+  # The closing pass, which is what the gate is read off. 0 = the entire val set
+  # (781 batches, ~3 min) so all 10,128 val boss frames count. Reported as `val_full`.
+  final_val_batches: 0
+  save_every: 2000
+logger: csv               # csv | wandb
+project: contra-encoder
