@@ -175,10 +175,23 @@ class ContraCrossViewDataset(Dataset):
     ``pin_memory``, so a few MB per window turns into tens of GB of host RAM.
     """
 
+    #: Per-class entity occupancy channels, in the order the shards' ``entities`` field
+    #: and ``env.entity.HEATMAP_CLASSES`` use. Position is meaningful — it is the
+    #: channel order of the ``entity_heatmap`` target.
+    ENTITY_CLASSES = ("player", "player_bullets", "enemies", "enemy_bullets")
+
     def __init__(self, index: List[dict], win_len: int = 32, image_size: int = 256,
                  sigma_px: float = 12.0, prev_action_keep_prob: float = 0.25,
-                 aux_size: int = 32, seed: int = 0):
+                 aux_size: int = 32, seed: int = 0, want_entities: bool = False,
+                 entity_sigma_px: float = 6.0):
         self.index = index
+        self.want_entities = want_entities
+        # Tighter than the goal's 12 px on purpose. At A=32 a 12 px sigma is 1.66 cells,
+        # which smears a boss frame's ~4.9 enemy bullets into one blob; 6 px is 0.83
+        # cells and keeps individual sprites separable. The goal blob keeps 12 px
+        # because `goal_mask` also renders the cross-view *prompt* at that width and the
+        # two must agree.
+        self.entity_sigma_px = entity_sigma_px
         self.win_len = win_len
         self.image_size = image_size
         self.sigma_px = sigma_px
@@ -357,6 +370,12 @@ class ContraCrossViewDataset(Dataset):
         exist = np.zeros(T, dtype=np.float32)
         point = np.zeros((T, 2), dtype=np.float32)
         heatmap = np.zeros((T, A, A), dtype=np.float32)
+        # How many centroids the goal has on this frame. `points_to_target` collapses
+        # them to their *mean*, which is a well-defined target only when there is one.
+        # Boss goals span all live components — 4.6 on average, spread ~34 px — so on
+        # those frames `point` names a spot where nothing is, and any error measured
+        # against it grows as a predictor gets sharper. Consumers must gate on this.
+        n_goal_points = np.zeros(T, dtype=np.int64)
         centroids, visibility = meta["centroids"], meta["visibility"]
         for k in range(n):
             j = start + k
@@ -364,7 +383,26 @@ class ContraCrossViewDataset(Dataset):
                 continue
             exist[k] = 1.0
             point[k], _bbox = points_to_target(centroids[j])
+            n_goal_points[k] = len(centroids[j])
             heatmap[k] = goal_mask(centroids[j], A, self.sigma_px)
+
+        # Per-class entity occupancy, off by default so the BC path pays nothing for it.
+        # `entities` is absent from shards exported before 2026-07-30; an all-zero target
+        # is the honest fallback (no entities known), and `want_entities` callers should
+        # check `entities_available` rather than train on silence.
+        entity = None
+        if self.want_entities:
+            C = len(self.ENTITY_CLASSES)
+            entity = np.zeros((T, C, A, A), dtype=np.float32)
+            ent = meta.get("entities")
+            if ent is not None:
+                for k in range(n):
+                    j = start + k
+                    for c, name in enumerate(self.ENTITY_CLASSES):
+                        col = ent.get(name)
+                        if col is None or j >= len(col) or not col[j]:
+                            continue
+                        entity[k, c] = goal_mask(col[j], A, self.entity_sigma_px)
 
         mask = np.zeros(T, dtype=np.float32)
         mask[:n] = 1.0
@@ -375,7 +413,7 @@ class ContraCrossViewDataset(Dataset):
         first = np.zeros(T, dtype=bool)
         first[0] = rel == 0
 
-        return {
+        out = {
             "image": torch.from_numpy(image),
             "cross_view": {
                 "cross_view_image": torch.from_numpy(goal_img),
@@ -388,10 +426,14 @@ class ContraCrossViewDataset(Dataset):
             "exist": torch.from_numpy(exist),
             "point": torch.from_numpy(point),
             "goal_heatmap": torch.from_numpy(heatmap),
+            "n_goal_points": torch.from_numpy(n_goal_points),
             "mask": torch.from_numpy(mask),
             "first": torch.from_numpy(first),
             "family": torch.tensor(FAMILIES.index(ep["family"]), dtype=torch.int64),
         }
+        if entity is not None:
+            out["entity_heatmap"] = torch.from_numpy(entity)
+        return out
 
 
 # ── datamodule ────────────────────────────────────────────────────────────────
@@ -509,7 +551,8 @@ class ContraDataModule:
                  prev_action_keep_prob: float = 0.25, aux_size: int = 32,
                  carry_memory: bool = False, family_balance_alpha: float = 0.0,
                  batch_size: int = 4, num_workers: int = 4, prefetch_factor: int = 2,
-                 cache_dir: str = "cache", seed: int = 0):
+                 cache_dir: str = "cache", seed: int = 0, want_entities: bool = False,
+                 entity_sigma_px: float = 6.0):
         self.shard_dir = os.path.expanduser(shard_dir)
         self.train_tars = shard_paths(self.shard_dir, configs, "train")
         self.val_tars = shard_paths(self.shard_dir, configs, "val")
@@ -521,7 +564,9 @@ class ContraDataModule:
         self.seed = seed
         self.ds_kwargs = dict(win_len=win_len, image_size=image_size, sigma_px=sigma_px,
                               prev_action_keep_prob=prev_action_keep_prob,
-                              aux_size=aux_size, seed=seed)
+                              aux_size=aux_size, seed=seed,
+                              want_entities=want_entities,
+                              entity_sigma_px=entity_sigma_px)
         # Two independent indexes, each cached under its own shard fingerprint.
         train_idx = load_or_build_index(self.train_tars, cache_dir)
         val_idx = load_or_build_index(self.val_tars, cache_dir)
