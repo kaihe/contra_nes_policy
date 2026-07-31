@@ -183,8 +183,13 @@ class ContraCrossViewDataset(Dataset):
     def __init__(self, index: List[dict], win_len: int = 32, image_size: int = 256,
                  sigma_px: float = 12.0, prev_action_keep_prob: float = 0.25,
                  aux_size: int = 32, seed: int = 0, want_entities: bool = False,
-                 entity_sigma_px: float = 6.0):
+                 entity_sigma_px: float = 6.0, whole_episode: bool = False):
         self.index = index
+        # One item = one whole episode at its natural length, unpadded. The policy's
+        # context holds an entire episode, so windows are no longer the unit — and
+        # padding every episode to 1024 would be 201 MB of uint8 frames per item.
+        # Callers must collate with `pad_episodes`, which pads to the batch maximum.
+        self.whole_episode = whole_episode
         self.want_entities = want_entities
         # Tighter than the goal's 12 px on purpose. At A=32 a 12 px sigma is 1.66 cells,
         # which smears a boss frame's ~4.9 enemy bullets into one blob; 6 px is 0.83
@@ -214,7 +219,8 @@ class ContraCrossViewDataset(Dataset):
                 self.episode_windows.append([])
                 continue                       # degenerate single-step episode
             flat = []
-            for r in range(math.ceil(usable / win_len)):
+            n_win = 1 if whole_episode else math.ceil(usable / win_len)
+            for r in range(n_win):
                 flat.append(len(self.windows))
                 self.windows.append((i, r))
             self.episode_windows.append(flat)
@@ -300,8 +306,10 @@ class ContraCrossViewDataset(Dataset):
         meta = json.loads(self._read(ep, "json"))
         actions = vectors_to_indices(np.load(io.BytesIO(self._read(ep, "actions.npy"))))
 
-        T = self.win_len
-        start = rel * T
+        # Whole-episode mode sizes T to this episode rather than to a fixed window.
+        # `usable` is length-1 because the last frame has no action taken *from* it.
+        T = max(1, int(ep["length"]) - 1) if self.whole_episode else self.win_len
+        start = 0 if self.whole_episode else rel * T
         frames = self._frames(ep, start, T)
         # -1 because frames[j] is the state AFTER actions[j]: the action taken FROM
         # the last frame of an episode was never recorded, so that frame has no target.
@@ -678,3 +686,87 @@ class ContraDataModule:
         # stops meaning what the evaluator's pooled number means.
         return self._loader(self.val_dataset, shuffle=False,
                             num_workers=min(2, self.num_workers), persistent=False)
+
+
+# ── whole-episode batching ────────────────────────────────────────────────────
+
+def pad_episodes(items: List[Dict]) -> Dict:
+    """Collate variable-length episodes, padding to the batch maximum.
+
+    Not to the model's context: episodes average 100 frames against a 1024 context, so
+    padding to the context would make ~90% of every batch mask. Padding to the batch
+    maximum and grouping similar lengths together (:class:`LengthGroupedSampler`) brings
+    that to roughly 1%.
+
+    ``mask`` marks real steps and is what every loss must reduce over — a padded step
+    has a fabricated action target of 0 and must never reach a gradient.
+    """
+    t = max(int(x["image"].shape[0]) for x in items)
+    out: Dict = {}
+
+    def stack(key, fill=0):
+        ref = items[0][key]
+        buf = torch.full((len(items), t, *ref.shape[1:]), fill, dtype=ref.dtype)
+        for i, x in enumerate(items):
+            n = x[key].shape[0]
+            buf[i, :n] = x[key]
+        return buf
+
+    for key in ("image", "action", "mask", "goal_heatmap", "exist", "point",
+                "n_goal_points", "prev_action", "prev_action_dropout", "first"):
+        if key in items[0]:
+            out[key] = stack(key)
+    if "entity_heatmap" in items[0]:
+        out["entity_heatmap"] = stack("entity_heatmap")
+
+    # Per-episode members carry no time axis.
+    out["cross_view"] = {
+        "cross_view_image": torch.stack([x["cross_view"]["cross_view_image"] for x in items]),
+        "cross_view_obj_mask": torch.stack(
+            [x["cross_view"]["cross_view_obj_mask"] for x in items]),
+        # One interaction id per episode. The windowed loader emitted it per timestep;
+        # the policy takes a single id, so collapse it here rather than in the model.
+        "cross_view_obj_id": torch.stack(
+            [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
+    }
+    out["family"] = torch.stack([x["family"] for x in items])
+    out["seq_len"] = torch.tensor([int(x["image"].shape[0]) for x in items])
+    return out
+
+
+class LengthGroupedSampler(Sampler):
+    """Batches of similar-length episodes, shuffled.
+
+    Sorting globally would put every long episode in one batch and, because length
+    correlates with family (traverse long, item short), make a batch nearly one family —
+    which changes the gradient's family mix step to step. So sort within a *pool* of
+    ``pool_batches`` batches, then shuffle the batch order: length is close enough for
+    padding, and families still mix.
+    """
+
+    def __init__(self, lengths: Sequence[int], batch_size: int,
+                 pool_batches: int = 32, seed: int = 0, shuffle: bool = True):
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.pool = batch_size * pool_batches
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        order = rng.permutation(len(self.lengths)) if self.shuffle else np.arange(
+            len(self.lengths))
+        batches = []
+        for start in range(0, len(order), self.pool):
+            pool = order[start:start + self.pool]
+            pool = pool[np.argsort([self.lengths[i] for i in pool], kind="stable")]
+            batches += [pool[i:i + self.batch_size].tolist()
+                        for i in range(0, len(pool), self.batch_size)]
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
