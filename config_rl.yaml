@@ -1,0 +1,178 @@
+hydra:
+  run:
+    dir: ./runs/rl/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
+
+# ── initialisation ────────────────────────────────────────────────────────────
+# The BC checkpoint the run starts from. Its `hyper_parameters.model` block defines
+# the architecture — it is read out of the checkpoint rather than restated here, so
+# the model can never drift from the weights being loaded into it.
+init_from: ~/code/contra_nes_policy/runs/2026-07-28/18-01-29/weights/weight-epoch=18-step=30000.ckpt
+# A resumable checkpoint (checkpoints/rl-*.pt). Counters continue; they do not restart.
+resume_from: null
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# Tasks supply the initial emulator state and the completion predicate's metadata;
+# shards supply the cross-view prompt. Joined on (family, uid). Both are the data
+# repo's; nothing about the split is decided here.
+task_root: ~/code/contra_nes_data/game_trace/tasks
+shard_dir: ~/code/contra_nes_data/game_trace/hf
+cache_dir: ${hydra:runtime.cwd}/cache
+families: [kill, item, traverse, boss]
+sigma_px: 12.0            # must match the export and the BC run, or the prompt shifts
+
+seed: 0
+device: cuda
+# Host RAM this run may occupy, in GB, checked before anything is built. 0 disables.
+#
+# This machine is a WSL2 VM with `memory=20GB` in .wslconfig and ~3.4 GB already held
+# by the editor and the agent, so ~16 GB is genuinely free. The ceiling is set below
+# that on purpose: exceeding host RAM here does not fail loudly, it swaps, and a
+# swapping VM stops responding entirely — no traceback, no checkpoint, a reboot.
+# Measured peaks (two-update smoke, steps=2048, batch_size=16, via tools/rss_guard.py):
+#   num_workers=0 -> 3.5 GB     num_workers=2 -> 8.8 GB     num_workers=4 -> >15 GB
+host_ram_budget_gb: 12.0
+precision: bf16           # bf16 | fp16 | fp32; applies to rollout and optimisation
+weight_decay: 0.0         # AdamW decay on the RL phase; 0 keeps the BC solution's scale
+logger: csv               # csv | wandb
+project: contra-rocket2-rl
+
+# ── rollout ───────────────────────────────────────────────────────────────────
+rollout:
+  # Emulator slots held in flight by one worker. Also the GPU forward batch: the
+  # emulator is stepped serially but the policy is evaluated across all slots at once.
+  batch_size: 16
+  # Targets per update. Collection keeps starting episodes until BOTH are met, then
+  # drains what is in flight, so an update always sees many complete episodes.
+  # 2048 steps of 256px frames is ~400 MB of host RAM in the batch — the binding
+  # constraint here, exactly as it is for the BC loader.
+  steps: 2048
+  episodes: 32
+  # The evaluation harness's budget, and it must stay identical to it: budget is what
+  # makes `timeout` mean the same thing in the reward and in the report.
+  budget_mult: 2.0
+  min_budget: 24
+  temperature: 1.0        # 0 = greedy; PPO needs a stochastic policy, so keep it at 1
+  # Artificially cut an episode after this many steps and bootstrap the tail from the
+  # critic. 0 = never — success, death and budget exhaustion are the only terminals,
+  # and none of them bootstraps. Raise it only if a boss episode's frames (196 KB per
+  # step) start dominating host RAM.
+  max_episode_steps: 0
+  # Per-frame authoritative goal points, read from RAM for the grounding auxiliary and
+  # for on-policy `point_err_px`. Privileged labels — never policy input, never reward.
+  collect_goal_points: true
+  # 0 = collect in this process (one emulator, fully deterministic). Above 0, that many
+  # worker processes, each owning exactly one emulator. Start at 0.
+  #
+  # Each worker costs ~2.4 GB of host RAM (its own CUDA context, policy replica and
+  # emulator), so on this 20 GB VM the usable range is 0-2; 4 crosses 15 GB before the
+  # first update finishes and takes the VM into swap. Measured throughput at
+  # steps=2048: 0 workers ~220 steps/s, 2 workers ~300 steps/s — 1.4x for 2.5x the
+  # memory. `host_ram_budget_gb` refuses anything past the ceiling before it starts.
+  num_workers: 0
+  worker_device: cuda
+  prompt_cache: 128       # cached cross-view prompts (~260 KB each at 256 px)
+  segment_cache: 256      # cached task save-states
+
+# ── reward ────────────────────────────────────────────────────────────────────
+# The exact evaluation objective, and the default for the first experiment.
+#
+# Do NOT start with a death penalty or a step penalty. A death penalty rewards
+# cowardly timeout behaviour — refusing to engage scores better than trying and
+# failing — and a step penalty strongly disadvantages long boss tasks, which are the
+# family this run exists to fix. Death and timeout already forfeit the success reward;
+# that is the whole cost they need to carry.
+reward:
+  success: 1.0
+  death: 0.0
+  timeout: 0.0
+  step: 0.0
+  truncated: 0.0          # an artificial cut adds nothing; its tail comes from V(s)
+
+# ── task sampling ─────────────────────────────────────────────────────────────
+# Uniform sampling over training tasks would be 53% traverse, the family already at
+# 83.5% completion, and 6.6% each for item and boss. The balanced component draws
+# family → label → task uniformly, which roughly doubles item and boss exposure while
+# the natural component keeps the real distribution in the loop.
+#
+# No importance correction is applied: the mixture intentionally defines a
+# multi-objective training distribution. Evaluation stays on the natural val set.
+sampling:
+  natural_fraction: 0.7
+  balanced_family_fraction: 0.3
+  # Reweights the family-uniform draw inside the balanced component. For later
+  # ablations (e.g. boss: 3.0). Do not default to boss-only training.
+  family_multiplier:
+    kill: 1.0
+    item: 1.0
+    traverse: 1.0
+    boss: 1.0
+
+# ── PPO ───────────────────────────────────────────────────────────────────────
+ppo:
+  learning_rate: 1.0e-5
+  # Undiscounted, unbootstrapped, complete finite-horizon episodes. At gamma=0.99 a
+  # success 180 decisions ahead is worth 0.16 at the start of a boss episode, and a
+  # low lambda erases the same signal over a long trajectory. With a binary episodic
+  # return the critic supplies the variance reduction instead: every state in a win
+  # targets 1, every state in a loss targets 0.
+  gamma: 1.0
+  gae_lambda: 1.0
+  clip_ratio: 0.1
+  value_coef: 0.5
+  value_clip: 0.2         # 0 disables; the critic starts untrained, so keep it on
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  target_kl: 0.01         # terminate the update early once the batch exceeds this
+  ppo_epochs: 2
+  minibatch_episodes: 4   # episodes per optimiser step — never transitions
+  seq_len: 32             # BPTT chunk; matches the BC window and the memory length
+  normalize_advantages: true
+
+  # ── preserving the 72.8% BC policy ──────────────────────────────────────────
+  # Both default to off so the first run is a clean sparse-PPO baseline (one variable
+  # per run, as elsewhere in this repo). Turn them on as the forgetting-control run:
+  # bc_kl_coef 0.02–0.05 and heatmap_coef ~0.1 are the conservative starting points.
+  #
+  # bc_kl_coef holds a frozen copy of the initialisation and penalises
+  # KL(pi || pi_bc). It costs a second forward pass and a second model on the GPU.
+  bc_kl_coef: 0.0
+  # heatmap_coef continues goal grounding on on-policy frames, against authoritative
+  # goal points read from emulator RAM. Privileged labels, not a reward: heatmap
+  # confidence must never be paid for.
+  heatmap_coef: 0.0
+  heatmap_pos_weight: 10.0
+
+# ── critic warmup ─────────────────────────────────────────────────────────────
+# The value head received no gradient during BC (the BC objective never reads vpred),
+# so at update 0 the critic is untrained and every advantage is `return - noise`.
+# Warmup collects with the policy fixed and fits the critic first.
+critic_warmup:
+  rounds: 2               # collection rounds before the first policy update
+  steps: 2048
+  episodes: 32
+  epochs: 4
+  learning_rate: 1.0e-4
+  params: value_head      # value_head | all — 'all' is faster to fit and riskier
+
+# ── optional BC minibatches mixed into PPO updates ────────────────────────────
+bc_mix:
+  batches_per_minibatch: 0   # 0 = off; the loader is not even built
+  weight: 1.0
+  batch_size: 4
+  num_workers: 2
+  heatmap_weight: 1.0
+
+# ── loop ──────────────────────────────────────────────────────────────────────
+train:
+  updates: 500
+  save_every: 25
+  lr_warmup_updates: 5
+  lr_decay: none          # none | linear
+  # Recompute the stored log-probs and values in the optimisation shape before the
+  # first PPO epoch. Collection runs T=1 over 16 slots and optimisation runs T=32 over
+  # 4 episodes; the parameters and the attention context are identical, but bf16 is
+  # not bit-exact across the two, and a ratio that starts at 1.02 has already spent a
+  # fifth of clip_ratio=0.1. Costs one extra forward pass over the batch.
+  recompute_old_logprobs: true
