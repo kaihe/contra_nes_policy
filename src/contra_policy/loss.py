@@ -74,10 +74,17 @@ class BehaviorCloneLoss(nn.Module):
     """Cross-entropy of the 21-way action head against the recorded action."""
 
     def __init__(self, weight: float = 1.0, label_smoothing: float = 0.0,
-                 class_weights: torch.Tensor | None = None):
+                 class_weights: torch.Tensor | None = None,
+                 modal_action: int | None = None):
         super().__init__()
         self.weight = weight
         self.label_smoothing = label_smoothing
+        # The dataset's most common action. 68.2% of training steps are `R`, so a model
+        # that ignores its input entirely scores bc_acc 0.68 — and action-prior collapse
+        # is a failure this project has already hit (the prev_action run reached 37% on
+        # a single action while boss completion fell to 1.8%). Given this index, the
+        # metrics below can see the collapse that accuracy cannot.
+        self.modal_action = modal_action
         # Buffer, not a plain attribute, so it follows the module across devices and
         # into the checkpoint (making the weighting a recorded property of the run).
         self.register_buffer("class_weights", class_weights, persistent=True)
@@ -95,10 +102,51 @@ class BehaviorCloneLoss(nn.Module):
         # relative pull between classes without rescaling the loss.
         loss = _masked_mean(ce, mask)
         with torch.no_grad():
-            correct = (logits.argmax(-1) == target).float()
+            pred = logits.argmax(-1)
             metrics = {"bc_loss": loss.detach(),
-                       "bc_acc": _masked_mean(correct, mask)}
+                       "bc_acc": _masked_mean((pred == target).float(), mask)}
+            metrics.update(prior_collapse_metrics(
+                pred, target, mask, logits.shape[-1], self.modal_action))
         return self.weight * loss, metrics
+
+
+@torch.no_grad()
+def prior_collapse_metrics(pred: torch.Tensor, target: torch.Tensor,
+                           mask: torch.Tensor, n_classes: int,
+                           modal_action: int | None = None) -> Dict[str, torch.Tensor]:
+    """The three numbers that see through action-prior collapse.
+
+    ``bc_acc`` cannot: 68.2% of training steps are one action, so predicting it
+    unconditionally scores 0.68 against a 0.76 gate — eight points of headroom for a
+    model that never looks at the screen.
+
+    ``pred_modal_frac``  share of *predictions* taken by the single most-predicted
+                         action. Drifting toward the data's 0.68 is collapse, whatever
+                         accuracy is doing.
+    ``bc_bal_acc``       mean per-class recall over the classes actually present. A
+                         constant predictor scores 1/21 ≈ 0.048, not 0.68.
+    ``bc_nonmodal_acc``  accuracy on the ~32% of steps that are *not* the modal action,
+                         which is where every real decision lives.
+    """
+    keep = mask.bool()
+    p, t = pred[keep], target[keep]
+    out: Dict[str, torch.Tensor] = {}
+    if p.numel() == 0:
+        return out
+
+    counts = torch.bincount(p, minlength=n_classes).float()
+    out["pred_modal_frac"] = counts.max() / counts.sum()
+
+    total = torch.bincount(t, minlength=n_classes).float()
+    hit = torch.bincount(t[p == t], minlength=n_classes).float()
+    present = total > 0
+    out["bc_bal_acc"] = (hit[present] / total[present]).mean()
+
+    if modal_action is not None:
+        off = t != int(modal_action)
+        if bool(off.any()):
+            out["bc_nonmodal_acc"] = (p[off] == t[off]).float().mean()
+    return out
 
 
 def point_err_px(pred_point: torch.Tensor, target_point: torch.Tensor) -> torch.Tensor:
@@ -166,10 +214,11 @@ class ContraObjective(nn.Module):
     def __init__(self, bc_weight: float = 1.0, heatmap_weight: float = 1.0,
                  heatmap_pos_weight: float = 10.0, label_smoothing: float = 0.0,
                  class_weights: torch.Tensor | None = None,
-                 families: tuple[str, ...] = ()):
+                 families: tuple[str, ...] = (), modal_action: int | None = None):
         super().__init__()
         self.bc = BehaviorCloneLoss(weight=bc_weight, label_smoothing=label_smoothing,
-                                    class_weights=class_weights)
+                                    class_weights=class_weights,
+                                    modal_action=modal_action)
         self.aux = GoalHeatmapLoss(heatmap_weight, heatmap_pos_weight)
         self.families = families
 
