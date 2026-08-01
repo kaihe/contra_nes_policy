@@ -742,6 +742,15 @@ class LengthGroupedSampler(Sampler):
     which changes the gradient's family mix step to step. So sort within a *pool* of
     ``pool_batches`` batches, then shuffle the batch order: length is close enough for
     padding, and families still mix.
+
+    **The order is always permuted, including when ``shuffle=False``.** The index is
+    ordered by tar path, so walking it directly groups every family together: a caller
+    scoring only the first N batches would miss whole families. That is not
+    hypothetical — a 60-batch validation covered 240 of 846 episodes and contained zero
+    `traverse`, which is 65% of all decision steps, because `traverse` starts at index
+    392. ``shuffle`` therefore controls only whether the permutation *varies between
+    epochs*: ``True`` for training, ``False`` for validation, where the subset must stay
+    representative **and** identical across calls or the trend is unreadable.
     """
 
     def __init__(self, lengths: Sequence[int], batch_size: int,
@@ -757,10 +766,10 @@ class LengthGroupedSampler(Sampler):
         return math.ceil(len(self.lengths) / self.batch_size)
 
     def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
-        self.epoch += 1
-        order = rng.permutation(len(self.lengths)) if self.shuffle else np.arange(
-            len(self.lengths))
+        rng = np.random.default_rng(self.seed + (self.epoch if self.shuffle else 0))
+        if self.shuffle:
+            self.epoch += 1
+        order = rng.permutation(len(self.lengths))
         batches = []
         for start in range(0, len(order), self.pool):
             pool = order[start:start + self.pool]
