@@ -1,0 +1,87 @@
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
+
+# The BC policy this fine-tunes, and the frozen reference the KL pulls towards.
+init_from: ${hydra:runtime.cwd}/runs/bc/2026-08-01/09-05-44/checkpoints/policy-final.pt
+
+task_root: ~/code/contra_nes_data/game_trace/tasks
+shard_dir: ~/code/contra_nes_data/game_trace/hf
+cache_dir: ${hydra:runtime.cwd}/cache
+# Phase 1 (doc/0004 §2): boss excluded for iteration speed — long episodes, ~75%
+# all-failure groups. Not an isolation argument; phase 2 adds it from this same
+# checkpoint.
+families: [kill, item, traverse]
+image_size: 256
+sigma_px: 12.0
+
+seed: 0
+device: cuda
+precision: bf16
+
+# ── rollout ───────────────────────────────────────────────────────────────────
+rollout:
+  # G. A group is the unit: one task, G rollouts from a bit-identical savestate, and
+  # each one's advantage is its return minus its siblings'.
+  #
+  # P(zero variance) = p^G + (1-p)^G, so groups die when their members AGREE — at both
+  # ends. A first rollout on train `kill` measured ~92% success, which is 66% dead
+  # groups at G=4. G=8 halves that to 43%. Raise it if oversample_factor stays high.
+  group_size: 8
+  # Usable groups the update is computed on, after filtering.
+  groups_per_update: 16
+  # Groups drawn per collection round while oversampling toward that target.
+  collect_groups_at_once: 8
+  # Stop drawing at this multiple of groups_per_update. Hitting it means the task mix
+  # cannot produce signal — a finding, not a loop to spin in.
+  max_oversample_factor: 4.0
+  # Drop groups whose G rollouts all agree. On by default: keeping them rescales the
+  # update, because the mean over a batch that is 70% zeros is 0.3x the mean over the
+  # survivors, so the effective step size would track task difficulty.
+  filter_groups: true
+  normalise_advantages: true      # GRPO as published; false gives RLOO's raw difference
+  batch_size: 16                  # emulator slots in flight
+  budget_mult: 2.0                # must stay bit-identical to contra_nes_evaluation
+  min_budget: 24
+  temperature: 1.0                # the ratio is taken against the sampling density
+  max_episode_steps: 0            # 0 = only success, death and budget end an episode
+
+# ── reward ────────────────────────────────────────────────────────────────────
+# The evaluation objective, unshaped. No step penalty: the group baseline compares
+# returns *within* a task, and a per-step cost would make a long survival score worse
+# than a fast death.
+reward:
+  success: 1.0
+  death: 0.0
+  timeout: 0.0
+  truncated: 0.0
+  step: 0.0
+
+# ── task sampling ─────────────────────────────────────────────────────────────
+sampling:
+  natural_fraction: 0.7
+  balanced_family_fraction: 0.3
+  family_multiplier: {kill: 1.0, item: 1.0, traverse: 1.0, boss: 1.0}
+
+# ── GRPO ──────────────────────────────────────────────────────────────────────
+grpo:
+  clip_ratio: 0.2
+  # KL to the frozen BC policy. NOT optional: the previous PPO run left the equivalent
+  # at zero and `item` regressed 76.5% -> 71.1% while boss improved.
+  kl_coef: 0.02
+  entropy_coef: 0.01
+  # Early-stops the update once the batch's KL to the BEHAVIOUR policy exceeds this —
+  # distinct from kl_coef, which pulls towards the frozen reference.
+  target_kl: 0.02
+  max_grad_norm: 1.0
+
+# ── loop ──────────────────────────────────────────────────────────────────────
+train:
+  updates: 500
+  epochs: 1               # passes over one collection; >1 makes the data more off-policy
+  minibatch_episodes: 8
+  learning_rate: 1.0e-6   # far below BC's 3e-4: this is a fine-tune of a working policy
+  weight_decay: 0.0
+  save_every: 25

@@ -35,13 +35,13 @@ def test_a_group_that_all_fails_contributes_nothing():
     """The central open question for GRPO here, made visible instead of inferred."""
     adv, st = group_advantages([0, 0, 0, 0], [0, 0, 0, 0])
     assert np.allclose(adv, 0.0)
-    assert st["degenerate_group_frac"] == 1.0
+    assert st["zero_variance_group_frac"] == 1.0
 
 
 def test_a_group_that_all_succeeds_also_contributes_nothing():
     adv, st = group_advantages([1, 1, 1], [0, 0, 0])
     assert np.allclose(adv, 0.0)
-    assert st["degenerate_group_frac"] == 1.0
+    assert st["zero_variance_group_frac"] == 1.0
 
 
 def test_degenerate_fraction_counts_groups_not_episodes():
@@ -50,7 +50,7 @@ def test_degenerate_fraction_counts_groups_not_episodes():
     g = [0, 0, 0, 1, 1, 1, 2, 2, 2]
     _adv, st = group_advantages(r, g)
     assert st["groups"] == 3.0
-    assert st["degenerate_group_frac"] == pytest.approx(1 / 3)
+    assert st["zero_variance_group_frac"] == pytest.approx(1 / 3)
 
 
 def test_groups_are_scored_independently():
@@ -166,3 +166,61 @@ def test_padded_steps_never_reach_the_loss():
     loss.backward()
     # rows beyond the second episode's 2 real steps must be untouched
     assert logits.grad[1, 2:].abs().sum() == pytest.approx(0.0, abs=1e-7)
+
+
+# ── group filtering (dynamic sampling) ───────────────────────────────────────
+
+def test_filter_drops_groups_whose_members_agree():
+    """Group filtering: a group with zero reward variance has zero advantage
+    everywhere, so it moves the policy not at all. Both tails qualify."""
+    from contra_policy.rl.buffer import filter_groups
+
+    eps = ([_ep(3, 0, 1.0), _ep(3, 0, 0.0)]          # mixed  -> kept
+           + [_ep(3, 1, 0.0), _ep(3, 1, 0.0)]        # all fail    -> dropped
+           + [_ep(3, 2, 1.0), _ep(3, 2, 1.0)])       # all succeed -> dropped
+    kept, st = filter_groups(eps)
+    assert {e.group_id for e in kept} == {0}
+    assert st["groups_collected"] == 3.0 and st["groups_kept"] == 1.0
+    assert st["zero_variance_group_frac"] == pytest.approx(2 / 3)
+    assert st["episodes_discarded"] == 4.0
+
+
+def test_filtering_changes_the_scale_of_the_update_not_only_its_cost():
+    """Why filtering is not merely an optimisation.
+
+    The loss is a mean over the batch, so unfiltered zero-advantage episodes divide the
+    signal down — the effective step size would track how hard the current task mix
+    happens to be rather than staying fixed.
+    """
+    from contra_policy.rl.buffer import filter_groups
+
+    mixed = [_ep(4, 0, 1.0), _ep(4, 0, 0.0)]
+    dead = [_ep(4, 1, 0.0), _ep(4, 1, 0.0)]
+    logits = torch.zeros(2, 4, 21)
+
+    def grad_norm(eps):
+        adv, _ = group_advantages([e.reward for e in eps], [e.group_id for e in eps])
+        lg = logits.clone().requires_grad_(True)
+        b = GroupBatch(eps, adv)
+        loss, _ = grpo_loss(lg, b, GRPOConfig(kl_coef=0.0, entropy_coef=0.0))
+        loss.backward()
+        return float(lg.grad.abs().sum())
+
+    kept, _ = filter_groups(mixed + dead)
+    filtered = grad_norm(kept)
+    # Same signal, diluted by two dead episodes -> the update is literally smaller.
+    unfiltered_all = mixed + dead
+    adv, _ = group_advantages([e.reward for e in unfiltered_all],
+                              [e.group_id for e in unfiltered_all])
+    lg = torch.zeros(4, 4, 21, requires_grad=True)
+    loss, _ = grpo_loss(lg, GroupBatch(unfiltered_all, adv),
+                        GRPOConfig(kl_coef=0.0, entropy_coef=0.0))
+    loss.backward()
+    assert float(lg.grad.abs().sum()) < filtered
+
+
+def test_a_group_smaller_than_two_cannot_be_baselined():
+    from contra_policy.rl.buffer import filter_groups
+
+    kept, st = filter_groups([_ep(3, 0, 1.0)])
+    assert kept == [] and st["groups_kept"] == 0.0
