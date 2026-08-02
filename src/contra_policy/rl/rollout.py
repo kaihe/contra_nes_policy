@@ -551,4 +551,5 @@ class EpisodeCollector:
             logprobs=np.asarray(slot.logprobs, dtype=np.float32),
             reward=float(self.reward.get(slot.outcome, 0.0)),
             outcome=slot.outcome,
+            task_label=slot.task.label,
         )

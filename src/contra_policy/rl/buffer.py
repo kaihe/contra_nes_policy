@@ -41,6 +41,10 @@ class Episode:
     reward: float               # terminal, binary
     outcome: str                # success | death | timeout
     goal_heatmap: Optional[np.ndarray] = None   # (T, A, A) float32, privileged aux
+    #: The task's fine-grained class ("red_turret", "pick_laser"). Carried so the
+    #: difficulty sampler can pool 495 tasks per label into one usable estimate — see
+    #: :class:`~contra_policy.rl.tasks.DifficultyTracker`.
+    task_label: str = ""
 
     def __len__(self) -> int:
         return int(self.frames.shape[0])

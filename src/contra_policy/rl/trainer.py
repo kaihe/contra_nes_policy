@@ -36,7 +36,8 @@ from contra_policy.rl.buffer import (EpisodeOutcome, filter_groups, group_advant
                                      iter_minibatches)
 from contra_policy.rl.grpo import GRPOConfig, grpo_loss
 from contra_policy.rl.rollout import EpisodeCollector
-from contra_policy.rl.tasks import GroupSampler, TaskCatalog, TaskSampler
+from contra_policy.rl.tasks import (DifficultyTracker, GroupSampler, TaskCatalog,
+                                    TaskSampler)
 
 FAMILIES = ("kill", "item", "traverse", "boss")
 
@@ -115,7 +116,21 @@ class GRPOTrainer:
                               OmegaConf.to_container(args.sampling.family_multiplier,
                                                      resolve=True),
                               seed=int(args.seed))
-        self.groups = GroupSampler(sampler, int(args.rollout.group_size))
+        bias = args.sampling.get("difficulty_bias", {})
+        tracker = None
+        if bool(bias.get("enabled", False)):
+            tracker = DifficultyTracker(
+                group_size=int(args.rollout.group_size),
+                decay=float(bias.get("decay", 0.9)),
+                prior=float(bias.get("prior", 1.0)),
+                min_weight=float(bias.get("min_weight", 0.05)))
+        self.groups = GroupSampler(
+            sampler, int(args.rollout.group_size), difficulty=tracker,
+            candidates=int(bias.get("candidates", 1)) if tracker else 1,
+            seed=int(args.seed))
+        if tracker is not None:
+            print(f"[grpo] difficulty bias on · tournament of "
+                  f"{int(bias.get('candidates', 1))} · decay {tracker.decay}", flush=True)
         self.collector = EpisodeCollector(
             self.policy, self.catalog, sampler,
             batch_size=int(args.rollout.batch_size),
@@ -188,6 +203,10 @@ class GRPOTrainer:
             # reach `want` — it ran to the cap every update in 2026-08-02/11-48-03.
             eps = self.collector.collect_groups(groups, base_gid=drawn)
             drawn += batch_groups
+            # Feed *everything* back, especially the groups about to be filtered out:
+            # an all-success group is the strongest evidence a task is too easy, and it
+            # is exactly what gets discarded next.
+            self.groups.observe(eps)
             # Keep only what reporting needs from the discarded episodes; the frames of
             # a full oversampled draw are gigabytes.
             outcomes.extend(EpisodeOutcome.of(e) for e in eps)
@@ -302,7 +321,7 @@ class GRPOTrainer:
                        # Outcome stats over EVERYTHING rolled, not just what survived —
                        # filtering is an update-side decision and must not flatter the
                        # success rate it reports.
-                       **self.outcome_stats(outcomes),
+                       **self.outcome_stats(outcomes), **self.groups.stats(),
                        "seconds": time.time() - t0}
                 self._emit(row)
                 if int(self.args.train.save_every) and \

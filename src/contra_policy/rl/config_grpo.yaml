@@ -64,6 +64,17 @@ sampling:
   natural_fraction: 0.7
   balanced_family_fraction: 0.3
   family_multiplier: {kill: 1.0, item: 1.0, traverse: 1.0, boss: 1.0}
+  # Prefer tasks whose groups will actually carry gradient. Measured need: at ~83%
+  # success on TRAIN tasks, 59% of groups came back all-success and 58% of the rollout
+  # budget bought nothing (runs/grpo/2026-08-02/11-48-03).
+  difficulty_bias:
+    enabled: true
+    # Tournament size: draw this many tasks from the mixture above, keep one with
+    # probability proportional to P(its group survives filtering). 1 disables.
+    candidates: 4
+    decay: 0.9        # geometric forgetting; effective window ~G/(1-decay) rollouts
+    prior: 1.0        # Laplace — an unseen task reads p=0.5 and is explored first
+    min_weight: 0.05  # never exclude a task outright; boss must stay rediscoverable
 
 # ── GRPO ──────────────────────────────────────────────────────────────────────
 grpo:
@@ -82,10 +93,19 @@ train:
   updates: 500
   epochs: 1               # passes over one collection; >1 makes the data more off-policy
   minibatch_episodes: 8
-  learning_rate: 1.0e-6   # far below BC's 3e-4: this is a fine-tune of a working policy
+  # Calibrated, not guessed. At 1e-6 the first run held approx_kl at 2.13e-4 — 100x
+  # under target_kl, so it spent rollouts on steps too small to measure. grad_norm was
+  # above max_grad_norm on every update, so clipping always fires and the effective step
+  # is exactly `lr`; KL then scales as lr^2, giving lr = 1e-6*sqrt(0.005/2.13e-4) ~ 5e-6
+  # to sit at a quarter of target_kl and leave the guard room to guard.
+  learning_rate: 5.0e-6
   weight_decay: 0.0
   save_every: 25
   # Abort (saving a checkpoint) once system-wide used memory crosses this. The guest is
-  # a 20 GB WSL2 VM; past ~15 GB it swaps and stops responding rather than OOM-killing
-  # anything. 0 disables. See tools/rss_guard.py for the external equivalent.
-  memory_limit_gb: 15.0
+  # a 20 GB WSL2 VM with ~19.5 GB usable; past that it swaps and stops responding rather
+  # than OOM-killing anything, so this must fire *before* the ceiling, not at it.
+  #
+  # Measured at the settings above: the trainer peaks at 8.65 GB. VS Code's server adds
+  # ~7 GB when it is open, which is most of the remaining margin — close it for a long
+  # run, or expect this guard to be what stops you. 0 disables.
+  memory_limit_gb: 17.0

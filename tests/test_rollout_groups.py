@@ -61,6 +61,7 @@ class _FakeCollector:
 class _FakeSampler:
     def __init__(self, group_size=4):
         self.group_size, self.n = group_size, 0
+        self.observed = []
 
     def sample_groups(self, n_groups):
         groups = []
@@ -68,6 +69,12 @@ class _FakeSampler:
             self.n += 1
             groups.append([_task(f"task-{self.n}")] * self.group_size)
         return groups
+
+    def observe(self, episodes):
+        self.observed.extend(episodes)
+
+    def stats(self):
+        return {}
 
 
 def _trainer(rewards, *, want=16, at_once=8, factor=4.0, memory_limit_gb=0.0):
@@ -137,6 +144,14 @@ def test_the_collection_stat_is_namespaced_away_from_the_advantage_one():
 
 
 # ── discarded episodes are not retained ──────────────────────────────────────
+
+def test_discarded_groups_still_feed_the_difficulty_estimate():
+    """An all-success group is the strongest evidence a task is too easy, and it is
+    exactly what filtering throws away — so the sampler must see it first."""
+    t = _trainer([[1, 1, 1, 1], [1, 0, 0, 0]], want=8, at_once=8)
+    _, outcomes, _ = t.collect_filtered()
+    assert len(t.groups.observed) == len(outcomes)
+
 
 def test_rolled_episodes_are_returned_without_frames():
     t = _trainer([[1, 1, 1, 1], [1, 0, 0, 0]], want=8, at_once=8)
