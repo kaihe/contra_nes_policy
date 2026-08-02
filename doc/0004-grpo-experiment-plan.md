@@ -97,7 +97,37 @@ nothing:
 All the leverage is in the base rate; none is in G. A larger G buys a linear rollout
 cost for a shrinking share of usable groups.
 
-**And the failure looks like a data problem, not an algorithm one.** Measured on the 57
+### Degeneracy is two-sided — measured after writing the rollout
+
+`P(degenerate) = p^G + (1−p)^G`. A group is useless when its members **agree**, and they
+agree at *both* ends:
+
+| p(success) | G=4 | G=8 | G=16 |
+|---|---|---|---|
+| 3.5% (boss) | 87% | 75% | 57% |
+| 30% | 25% | 6% | 0% |
+| **50%** | **12%** | **1%** | **0%** |
+| 90% | 66% | 43% | 19% |
+| 95% | 81% | 66% | 44% |
+
+A first end-to-end rollout on `kill` **train** tasks scored ~92% success (12 episodes,
+3 groups — small, but the direction is clear) and **67% of groups were degenerate
+because they all succeeded.** That is nearly as wasteful as boss, from the opposite
+side, and it was not anticipated: §2's G=4 was chosen from val success rates of 67-76%,
+but GRPO trains on *train* tasks, where the policy is much stronger.
+
+This changes phase 1. Options, in the order I would try them:
+
+1. **Filter degenerate groups before the update** — standard practice in LLM RLVR
+   ("prompt filtering"): a group whose members agree contributes nothing, so drop it and
+   spend the rollout budget elsewhere. Cheap, and `degenerate_group_frac` already
+   measures the waste.
+2. **Bias the task sampler toward p ≈ 0.5** — keep a per-task running success estimate
+   and oversample the uncertain ones. This is a curriculum by another name, and it is
+   the same mechanism the boss request asks the data repo for.
+3. **Raise G** — the weakest lever, since the tails fall slowly and cost is linear.
+
+**And the boss failure looks like a data problem, not an algorithm one.** Measured on the 57
 val boss episodes: **55 deaths, median 40 steps — 14% of the budget**, against an expert
 that needs ~140. The policy dies *on approach*, two seconds in. That is what imitating a
 `push_right`-shaped charge looks like: MC search survives the dangerous line with
