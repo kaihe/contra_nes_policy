@@ -95,10 +95,16 @@ def test_encode_takes_one_image_and_is_the_same_function_for_both_kinds():
         a, b = enc.encode(frame), enc.encode(goal)
     assert a.shape == b.shape == (3, enc.cfg.hiddim)
     # Same weights, no branch: encoding both together equals encoding them apart.
+    #
+    # atol is 1e-4, not 1e-5: batch 3 and batch 6 take different vectorisation paths
+    # through the conv kernels, and float32 accumulation differs by up to 3.3e-5 across
+    # seeds (measured over 300). At 1e-5 this failed about one run in 25. The property
+    # under test survives the looser bound — an actual branch on frame-vs-goal would
+    # differ by orders of magnitude more, not by a rounding step.
     with torch.no_grad():
         both = enc.encode(torch.cat([frame, goal], 0))
-    assert torch.allclose(both[:3], a, atol=1e-5)
-    assert torch.allclose(both[3:], b, atol=1e-5)
+    assert torch.allclose(both[:3], a, atol=1e-4)
+    assert torch.allclose(both[3:], b, atol=1e-4)
 
 
 def test_forward_shapes_and_optional_heads():
