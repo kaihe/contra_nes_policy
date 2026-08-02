@@ -1,7 +1,18 @@
 # A plain causal transformer over whole episodes
 
-Status: Proposed
+Status: Implemented — first BC run measured, see below
 Supersedes: —
+
+> **Closed-loop result (2026-08-01).** `policy-final` scores **67.5%** [64.3, 70.6] on
+> the 846-task val set — far above every baseline, so the architecture is real, but
+> **−5.3 pp against ROCKET BC's 72.8%** (paired McNemar, p = 0.0029). Boss *regressed*,
+> 8.8% → 3.5%: whole-episode context was this document's boss hypothesis and it did not
+> pay off. Full analysis in `contra_nes_evaluation/doc/0005-gpt-bc.md`.
+>
+> The `val/bc_acc ≥ 0.76` gate in §7 was **doubly wrong**. It never fired — and the
+> checkpoint with the best `bc_acc` (step 4,000, 0.739) scores **53.3%** closed-loop
+> against final's 67.5%, a 14-point penalty for selecting on it. `point_err_px`
+> tracked completion; `bc_acc` anti-tracked it.
 Depends on: [0001](0001-image-encoder.md) — one token per image is what makes this fit.
 
 **Question.** The policy's temporal core is VPT's `ResidualRecurrentBlocks`: a
