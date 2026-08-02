@@ -85,3 +85,7 @@ train:
   learning_rate: 1.0e-6   # far below BC's 3e-4: this is a fine-tune of a working policy
   weight_decay: 0.0
   save_every: 25
+  # Abort (saving a checkpoint) once system-wide used memory crosses this. The guest is
+  # a 20 GB WSL2 VM; past ~15 GB it swaps and stops responding rather than OOM-killing
+  # anything. 0 disables. See tools/rss_guard.py for the external equivalent.
+  memory_limit_gb: 15.0

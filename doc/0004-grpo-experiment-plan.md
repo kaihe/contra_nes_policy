@@ -127,6 +127,28 @@ This changes phase 1. Options, in the order I would try them:
    the same mechanism the boss request asks the data repo for.
 3. **Raise G** — the weakest lever, since the tails fall slowly and cost is linear.
 
+### Measured on the three easy families: 0.59, not the 0.25 the table predicts
+
+The first phase-1 attempt (`runs/grpo/2026-08-02/11-48-03`) ran 8 updates before a bug
+took the VM down. Its usable numbers: at ~83% pooled success, the true zero-variance
+fraction on `kill`/`item`/`traverse` was **0.50–0.67, mean 0.59** — well above the 0.3
+stop-early threshold in §2, and from the *high* tail, as this section anticipated for
+`kill` but not for all three.
+
+So the §2 setup collects roughly **2.4x more rollouts than it uses**, on the families
+chosen for being cheap. Option 2 above (bias the sampler toward p ≈ 0.5) is therefore
+not a boss-only measure; it is the phase-1 economics too.
+
+Three faults kept this invisible at the time and are fixed with regression tests in
+`tests/test_rollout_groups.py`: group ids restarted at 0 on every collection call so
+unrelated tasks were pooled into one group (destroying the same-task baseline and making
+the oversample loop's exit unreachable); the collection-side
+`zero_variance_group_frac` shared a CSV key with the post-filter one, which is zero by
+construction, and was overwritten by it; and whole episodes were retained just to report
+success rates, at ~18 MB each and 512 per update — ~9 GB, which is what exhausted the
+20 GB guest. **The 8 updates of training are not interpretable**, because the advantages
+were computed across pooled tasks.
+
 **And the boss failure looks like a data problem, not an algorithm one.** Measured on the 57
 val boss episodes: **55 deaths, median 40 steps — 14% of the budget**, against an expert
 that needs ~140. The policy dies *on approach*, two seconds in. That is what imitating a
@@ -165,3 +187,5 @@ along each trace. Tracked separately; **not** gated on either phase here.
 | weapon not recorded | episode JSON keys — no weapon field |
 | degenerate-group table | `(1 - p)**G` at the measured 3.5% |
 | zero gradient from a degenerate group | `tests/test_grpo.py::test_a_zero_advantage_batch_produces_no_policy_gradient` |
+| zero-variance fraction 0.59 on the three easy families | `runs/grpo/2026-08-02/11-48-03/metrics.csv`, recovered as `1 − (episodes_used/G)/groups_drawn` |
+| the three faults in that run | `tests/test_rollout_groups.py` |

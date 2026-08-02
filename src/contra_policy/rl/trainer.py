@@ -32,7 +32,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from contra_policy.model import PolicyConfig, build_policy, load_policy
-from contra_policy.rl.buffer import (filter_groups, group_advantages, iter_minibatches)
+from contra_policy.rl.buffer import (EpisodeOutcome, filter_groups, group_advantages,
+                                     iter_minibatches)
 from contra_policy.rl.grpo import GRPOConfig, grpo_loss
 from contra_policy.rl.rollout import EpisodeCollector
 from contra_policy.rl.tasks import GroupSampler, TaskCatalog, TaskSampler
@@ -138,6 +139,34 @@ class GRPOTrainer:
 
     # -- collection ---------------------------------------------------------
 
+    def _check_memory(self) -> None:
+        """Abort cleanly before the VM starts swapping.
+
+        ``tools/rss_guard.py`` does this from outside with a SIGKILL, which loses the
+        checkpoint. This is the in-process half: it raises, so ``run``'s ``finally``
+        still saves. The number watched is system-wide ``MemTotal - MemAvailable``,
+        because on a 20 GB WSL2 guest nothing is ever technically out of memory — it
+        swaps, and the VM stops responding before any OOM killer fires.
+        """
+        limit = float(self.args.train.get("memory_limit_gb", 0.0) or 0.0)
+        if limit <= 0:
+            return
+        total = avail = 0.0
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total = float(line.split()[1]) / 1e6
+                elif line.startswith("MemAvailable:"):
+                    avail = float(line.split()[1]) / 1e6
+                    break
+        used = total - avail
+        if used > limit:
+            raise MemoryError(
+                f"host memory at {used:.2f} GB > train.memory_limit_gb={limit:.1f} "
+                f"(total {total:.1f} GB). Aborting before the guest swaps; the final "
+                f"checkpoint is still written. Lower rollout.groups_per_update or "
+                f"rollout.max_oversample_factor.")
+
     def collect_filtered(self):
         """Draw groups until ``groups_per_update`` survive filtering.
 
@@ -150,13 +179,18 @@ class GRPOTrainer:
         batch_groups = int(self.args.rollout.collect_groups_at_once)
         cap = int(want * float(self.args.rollout.max_oversample_factor))
 
-        kept, all_eps, drawn = [], [], 0
+        kept, outcomes, drawn = [], [], 0
         stats: Dict[str, float] = {}
         while True:
             groups = self.groups.sample_groups(batch_groups)
-            eps = self.collector.collect_groups(groups)
+            # `base_gid=drawn` keeps ids unique across iterations. Without it every call
+            # restarts at 0, `n_kept` saturates at `batch_groups`, and the loop can never
+            # reach `want` — it ran to the cap every update in 2026-08-02/11-48-03.
+            eps = self.collector.collect_groups(groups, base_gid=drawn)
             drawn += batch_groups
-            all_eps.extend(eps)
+            # Keep only what reporting needs from the discarded episodes; the frames of
+            # a full oversampled draw are gigabytes.
+            outcomes.extend(EpisodeOutcome.of(e) for e in eps)
             if self.args.rollout.filter_groups:
                 surv, st = filter_groups(eps)
             else:
@@ -164,14 +198,20 @@ class GRPOTrainer:
                                        "groups_kept": float(batch_groups),
                                        "zero_variance_group_frac": 0.0}
             kept.extend(surv)
+            del eps
             n_kept = len({e.group_id for e in kept})
+            self._check_memory()
             if n_kept >= want or drawn >= cap:
                 stats = {
                     "groups_drawn": float(drawn),
                     "groups_kept": float(n_kept),
                     "oversample_factor": drawn / max(1, want),
-                    "zero_variance_group_frac": 1.0 - n_kept / max(1, drawn),
-                    "episodes_rolled": float(len(all_eps)),
+                    # Namespaced: `group_advantages` also emits
+                    # `zero_variance_group_frac`, and it is merged into the same row.
+                    # Sharing the key let the post-filter value (0 by construction)
+                    # overwrite this one, hiding a real 0.59 behind a logged 0.0.
+                    "collect/zero_variance_group_frac": 1.0 - n_kept / max(1, drawn),
+                    "episodes_rolled": float(len(outcomes)),
                     "episodes_used": float(len(kept)),
                 }
                 if drawn >= cap and n_kept < want:
@@ -179,7 +219,7 @@ class GRPOTrainer:
                           f"survived from {drawn} drawn. The task mix is saturated or "
                           f"impossible — see doc/0004 §5.", flush=True)
                 break
-        return kept, all_eps, stats
+        return kept, outcomes, stats
 
     # -- update -------------------------------------------------------------
 
@@ -247,10 +287,11 @@ class GRPOTrainer:
         try:
             while self.update < total:
                 t0 = time.time()
-                kept, all_eps, cstats = self.collect_filtered()
+                kept, outcomes, cstats = self.collect_filtered()
                 if not kept:
                     raise RuntimeError(
                         "no groups survived filtering; nothing to learn from")
+                self._check_memory()
                 adv, astats = group_advantages(
                     [e.reward for e in kept], [e.group_id for e in kept],
                     normalise=bool(self.args.rollout.normalise_advantages))
@@ -261,7 +302,7 @@ class GRPOTrainer:
                        # Outcome stats over EVERYTHING rolled, not just what survived —
                        # filtering is an update-side decision and must not flatter the
                        # success rate it reports.
-                       **self.outcome_stats(all_eps),
+                       **self.outcome_stats(outcomes),
                        "seconds": time.time() - t0}
                 self._emit(row)
                 if int(self.args.train.save_every) and \
@@ -273,9 +314,16 @@ class GRPOTrainer:
 
     def _emit(self, row: Dict[str, float]) -> None:
         self.logger.log(row)
-        head = " ".join(f"{k}={row[k]:.4g}" for k in
-                        ("success", "policy_loss", "kl_ref", "approx_kl", "entropy",
-                         "zero_variance_group_frac", "oversample_factor")
+        # `zero_var` must be the *collection*-side fraction. The post-filter one is zero
+        # by construction — the groups with no spread have already been removed — so
+        # printing that is printing a constant, which is how a real 0.59 went unnoticed
+        # for 8 updates in 2026-08-02/11-48-03. doc/0004 §2 stops the run above 0.3.
+        head = " ".join(f"{label}={row[k]:.4g}" for k, label in
+                        (("success", "success"), ("policy_loss", "policy_loss"),
+                         ("kl_ref", "kl_ref"), ("approx_kl", "approx_kl"),
+                         ("entropy", "entropy"),
+                         ("collect/zero_variance_group_frac", "zero_var"),
+                         ("oversample_factor", "oversample_factor"))
                         if k in row)
         print(f"[update {self.update}/{int(self.args.train.updates)}] {head} "
               f"({row.get('seconds', 0):.0f}s)", flush=True)

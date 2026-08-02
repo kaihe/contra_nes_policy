@@ -387,7 +387,8 @@ class EpisodeCollector:
 
     # -- collection --------------------------------------------------------
 
-    def collect_groups(self, groups: Sequence[Sequence["RLTask"]]) -> List[Episode]:
+    def collect_groups(self, groups: Sequence[Sequence["RLTask"]],
+                       base_gid: int = 0) -> List[Episode]:
         """Roll out every task in every group, and return the finished episodes.
 
         The unit is the *group*, not a step budget: GRPO needs all G rollouts of a task
@@ -397,9 +398,16 @@ class EpisodeCollector:
         Slots are filled from a flat queue across groups, so a group's members run
         concurrently in different slots rather than serially — each still restores the
         same savestate, and the emulator is stepped per slot anyway.
+
+        ``base_gid`` offsets the group ids this call hands out. A caller that invokes
+        this repeatedly and pools the results — :meth:`GRPOTrainer.collect_filtered`
+        does — **must** advance it, or ids collide across calls and episodes of
+        different tasks end up sharing a group. That silently destroys GRPO's premise:
+        the baseline stops being same-task. Pinned by
+        ``tests/test_rollout_groups.py::test_group_ids_are_unique_across_calls``.
         """
         self.open()
-        queue = [(gid, t) for gid, g in enumerate(groups) for t in g]
+        queue = [(gid, t) for gid, g in enumerate(groups, start=base_gid) for t in g]
         slots: List[Optional[_Slot]] = [None] * self.batch_size
         out: List[Episode] = []
 

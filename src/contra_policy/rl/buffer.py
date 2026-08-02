@@ -46,6 +46,30 @@ class Episode:
         return int(self.frames.shape[0])
 
 
+@dataclass
+class EpisodeOutcome:
+    """What reporting needs from an episode, without the frames.
+
+    An :class:`Episode` at 256px carries ``T × 256 × 256 × 3`` bytes — ~18 MB at the
+    measured 96-step mean. Success rates are reported over *everything* rolled including
+    the groups filtering discarded, so holding whole Episodes just to count them cost
+    ~9 GB per update and took the VM down (run ``2026-08-02/11-48-03``). This is the
+    same information at ~100 bytes.
+    """
+
+    family: str
+    outcome: str
+    reward: float
+    n_steps: int
+
+    @classmethod
+    def of(cls, e: "Episode") -> "EpisodeOutcome":
+        return cls(family=e.family, outcome=e.outcome, reward=e.reward, n_steps=len(e))
+
+    def __len__(self) -> int:
+        return self.n_steps
+
+
 def group_advantages(rewards: Sequence[float], group_ids: Sequence[int],
                      normalise: bool = True, eps: float = 1e-4
                      ) -> tuple[np.ndarray, Dict[str, float]]:
