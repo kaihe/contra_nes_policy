@@ -1,8 +1,9 @@
 # GRPO in two phases: what each one is allowed to conclude
 
-Status: Proposed
+Status: Implemented — both phases run; see §4 for how the predictions resolved
 Supersedes: —
 Depends on: [0002](0002-gpt-policy.md) (the policy), [0003](0003-grpo-code-layout.md) (the stack)
+Followed by: [0005](0005-graded-reward.md), which addresses the waste §5 measures
 
 **Question.** GRPO replaces the critic with a group baseline. Two things are unknown and
 they are not the same question: does the stack work, and does it help `boss`? What does
@@ -81,6 +82,36 @@ Recording predictions so the result can surprise us:
 The last row is the one worth being explicit about. PPO already made boss *worse*
 (8.8% → 5.3%). If GRPO moves it, that is a genuine surprise and the reasoning in §5 is
 wrong.
+
+### How they resolved
+
+Phase 1 = `runs/grpo/2026-08-02/15-22-32`; phase 2 = `runs/grpo/2026-08-03/09-23-22`,
+both from BC `policy-final` as §3 requires. Val numbers from
+`contra_nes_evaluation/doc/0006-grpo.md` and `0008-grpo-with-boss.md`.
+
+| prediction | outcome |
+|---|---|
+| kill reaches ~75-80% | **met, at the low end.** 66.9% → 74.4% val at phase-2 u075. |
+| `item` holds within 2 pp | **held.** 66.7% → 66.7% (phase 1), → 72.2% (phase 2). The reference KL did its job. |
+| boss zero-variance ≈ 0.75 at G=8 | **falsified.** Predicted from the *val* rate of 3.5%; boss scores ~10% on train, giving 0.43. Boss groups were less degenerate than assumed — the strongest argument for having run phase 2 at all. |
+| **boss does not improve materially** (falsified by boss > 10%) | **falsified, just.** Boss reached **10.5%** val at phase-2 final — 3×, best in the series, and past this doc's own threshold. The §5 reasoning is wrong somewhere. |
+
+Two lessons that outlived the predictions, both about measurement rather than the
+algorithm:
+
+**Pooled val landed at ~71% for both phases** (70.6% and 71.6%), statistically
+indistinguishable from ROCKET BC's 72.8%. The bar in §2 was PPO's historical gain and
+GRPO cleared it — but two recipes now plateau at the same place, so the ceiling is not
+where §2 assumed.
+
+**Every per-family number in `metrics.csv` is measured on what the difficulty sampler
+chose**, and that sampler tracks p ≈ 0.5, so the denominator moves as the policy
+improves. Phase 2 logged boss climbing 0.093 → 0.338 on train while the same checkpoints
+scored 0.035 → 0.105 on val. That is not task difficulty: train and val boss match on
+weapon mix (within 4.2 pp; reweighting val to train's mix shifts success ≤ 0.6 pp) and on
+expert length (median 140.5 vs 138.0). It was selection. The fixed `probe` in
+`config_grpo.yaml` exists because of this, and any future doc quoting a train rate should
+quote the probe instead.
 
 ## 5. What neither phase can conclude
 
