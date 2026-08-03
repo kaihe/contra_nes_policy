@@ -412,6 +412,12 @@ class GRPOTrainer:
                     normalise=bool(self.args.rollout.normalise_advantages))
                 m = self.train_on(kept, adv)
                 self.update += 1
+                # Release the training batch before anything else allocates. `kept` holds
+                # groups_per_update x G episodes of raw frames — ~128 at the defaults —
+                # and the probe below rolls another 192. Holding both put ~320 episodes
+                # of frames live at once, for no reason: nothing after this point reads
+                # `kept`, and `outcomes` carries what the row needs at ~100 bytes each.
+                kept = adv = None
 
                 row = {"update": self.update, **cstats, **astats, **m,
                        # Outcome stats over EVERYTHING rolled, not just what survived —
