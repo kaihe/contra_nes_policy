@@ -97,21 +97,57 @@ observed during the episode. An episode that dies before the boss ever spawns ha
 
 ### Measured on real rollouts before the run
 
-Four boss groups of G=8 at `grpo-000075`:
+Both schemes computed over the *same* BC-policy rollouts, so every difference is the
+reward definition and nothing else:
 
-| | binary | graded |
-|---|---|---|
-| `zero_variance_group_frac` | **0.50** | **0.00** |
-| failures with non-zero credit | 0% | 96% |
-| largest failure reward | 0.0 | 0.275 |
+| | boss, 6 groups × G=8 | | kill, 3 groups × G=8 | |
+|---|---|---|---|---|
+| | binary | graded | binary | graded |
+| `zero_variance_group_frac` | 0.67 | **0.00** | 0.67 | 0.67 |
+| groups contributing gradient | 2/6 | **6/6** | 1/3 | 1/3 |
+| success rate | 0.12 | 0.12 | 0.71 | 0.71 |
+| largest failure reward | 0.0 | 0.38 | 0.0 | 0.0 |
 
-The two all-failure groups — discarded outright under the binary reward — came back with
-real spread (`[0.039 … 0.164]` and `[0.0 … 0.141]`). Ranges stayed disjoint.
+Four boss groups were all-failure and discarded outright; they came back as
+`[0.03 … 0.15]`, `[0.00 … 0.06]`, `[0.00 … 0.06]`, `[0.00 … 0.03]`.
+
+`kill` is **unchanged**, as intended — `KillEnemyMaker` exposes no HP accessor, so it
+stays binary, and its two all-*success* groups stay degenerate. That is the high tail,
+and it is §3's job.
+
+### Group standardisation must be switched off
+
+Found by the comparison above, and it changes the run's configuration.
+
+`group_advantages` divides by the group's own standard deviation. Under a **binary**
+reward that was harmless: every non-degenerate group had the same reward set `{0, 1}`
+and so a comparable std. Grading breaks the equivalence — a group where every rollout
+barely scratched the boss has a tiny std, and dividing by it inflates trivial
+differences to full strength:
+
+| group | its best rollout | advantage, normalised | unnormalised |
+|---|---|---|---|
+| all-failure, damage 0-6% | scratched the boss | **+2.31** | +0.02 |
+| mixed, 3 wins of 8 | **actually won the fight** | +1.26 | **+0.54** |
+
+A ~2 HP difference among eight hopeless rollouts produced **1.8× the gradient of a
+genuine win**. Standardisation erases the distinction between "this group learned
+something" and "these eight differed by noise", which is precisely the distinction
+grading exists to create.
+
+So phase 1 runs with **`rollout.normalise_advantages: false`** — the RLOO-style
+unnormalised difference `buffer.py` already supports. A group's gradient magnitude then
+reflects how much was actually at stake in it, and the win dominates the scratch by 27×.
+
+The alternative, a minimum *absolute* spread in `filter_groups` rather than its `1e-4`
+epsilon, needs a magic number and discards the rollouts entirely; the switch keeps them
+at their honest weight.
 
 ### The confirmation run
 
 A matched repeat of `runs/grpo/2026-08-03/09-23-22`: **same BC init, same 50% boss
-sampling, same G, KL, lr and 100 updates**, adding only `reward.progress_coef: 0.5`. That
+sampling, same G, KL, lr and 100 updates**, adding `reward.progress_coef: 0.5` and
+`rollout.normalise_advantages: false` for the reason above. That
 run is the control, and its checkpoints are already evaluated
 (`contra_nes_evaluation/doc/0008-grpo-with-boss.md`), so the comparison is against
 published numbers rather than a re-run.
@@ -197,7 +233,7 @@ to expect a different ceiling. If pooled jumps, the reasoning here is wrong some
 | **reward hacking** — plink from safety, farm damage, never commit | successes ≥ 0.9 strictly dominate partials ≤ 0.5; watch for boss episodes lengthening while success is flat, visible in the probe within ~20 updates |
 | **β too high** trades success for speed | start at 0.1; `kill`/`traverse` must not fall on the probe |
 | **partial credit inflates train numbers** | report `zero_var` and probe success, never pooled train success — see §7 |
-| boss HP is multi-component and may not decrease monotonically | sum over boss slots; verify on expert traces before trusting the signal |
+| boss HP is multi-component and may not decrease monotonically | **checked, and it holds.** 12 expert traces replayed: 3 boss-type slots active, and the sum never rises after its peak in any of them. But the boss is **not** zeroed at the win — expert wins end at 2-29 HP (median 12), because Wall Plating (`0x0A`) is a boss-objective type that survives the level clear. So maximum achievable damage is ~54-97%, varying per task. Harmless here: GRPO compares only *within* a group, one task and one anchor, and `group_advantages` removes the per-task scale. |
 
 ## 7. What this cannot conclude
 
@@ -220,6 +256,8 @@ difficulty sampler.
 | **symmetric step penalty** (`−α` per step, all outcomes) | scores a fast death above a long survival. Our boss failure *is* dying early, at 27% of the expert's episode; this would optimise directly against the fix. The warning is already in `rollout.py:_finish`. |
 | flat per-step penalty rather than budget-normalised | budgets span 180 → 776 decisions across weapons; one constant cannot suit both |
 | per-step shaped rewards with returns-to-go | breaks `buffer.py`'s one-scalar-per-episode contract and reintroduces the credit assignment GRPO exists to avoid. A terminal graded score gets the same information for none of the machinery. |
+| keeping `normalise_advantages: true` | equivalent to unnormalised under a binary reward, but not under a graded one: a group of eight hopeless rollouts differing by ~2 HP produced 1.8x the gradient of a group containing an actual win (§2) |
+| anchoring damage on the episode's own peak | the boss spawns in stages `16 -> 48 -> ~64`, so a rollout dying mid-spawn normalises its damage against 16 instead of 63 and outscores one that survived to full reveal for the same damage — rewarding early death, the exact failure mode. Use the task's `boss_hp_start`. |
 | grading `kill` by enemy HP as well | `live_slots()` makes it easy, but `kill` runs at 85% — its degeneracy is on the *success* side, which phase 2 already handles |
 | raising G instead | tails fall slowly and cost is linear; [0004](0004-grpo-experiment-plan.md) §5 |
 | conditioning the policy on HP or weapon | would need a new input token. Rejected by the author: reward shaping needs neither, and the policy's contract stays `[interaction, goal, frame…]` |
@@ -236,5 +274,8 @@ difficulty sampler.
 | policy dies at 27% of the expert's episode | 69 boss deaths at `u075`, replayed trajectories in world coordinates |
 | 2.2px matched vs 3.6px mismatched | same analysis, null control against a different task's expert path |
 | expert length by weapon (90 / 108 / 242 / 321) | 523 boss task `.npz`, replayed to read `ADDR_WEAPON` |
-| `step: 0.0` is a dead config key | `rollout.py:552` reads only `self.reward[outcome]` |
+| `step: 0.0` is a dead config key | `rollout.py` read only `self.reward[outcome]` before this doc |
+| binary vs graded A/B, and the standardisation distortion | 6 boss + 3 kill groups of G=8 rolled once from BC `policy-final`, both rewards computed on the same episodes |
+| boss spawns in stages `16 -> 48 -> ~64`; `boss_hp_start` is the full-reveal anchor | `contra_nes_data/src/agent/boss_search.py`, `doc/0001-boss-search-curriculum.md` |
+| expert wins end at 2-29 boss HP, not 0 | 12 expert traces replayed; the sum spans 3 boss-type slots including Wall Plating, which survives the level clear |
 | zero gradient from a zero-variance group | `tests/test_grpo.py::test_a_zero_advantage_batch_produces_no_policy_gradient` |
