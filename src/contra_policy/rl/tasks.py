@@ -507,24 +507,50 @@ class GroupSampler:
         self.candidates = int(candidates)
         self.rng = np.random.default_rng(seed)
 
+    #: Cap on rejection draws when filling a tournament pool from one family. At the
+    #: rarest configured share (~7%) the expected cost is ~14 draws, and `sample()` is a
+    #: few RNG calls, so this only guards against a family that cannot be drawn at all.
+    _POOL_TRIES = 200
+
+    def _draw_in_family(self, family: str) -> "RLTask":
+        """Another task from ``family``, distributed as the mixture is *within* it.
+
+        Rejection sampling on :meth:`TaskSampler.sample` rather than a bespoke
+        within-family draw, because the mixture is two branches (natural and balanced)
+        that weight labels differently; rejecting on the real thing keeps the
+        family-conditional exact instead of approximating it with one branch's shape.
+        """
+        for _ in range(self._POOL_TRIES):
+            t = self.sampler.sample()
+            if t.family == family:
+                return t
+        return self.sampler.sample()   # pathological mixture; do not spin
+
     def sample_group(self) -> List["RLTask"]:
         """``group_size`` references to one task. Identical objects on purpose: the
         rollout layer restores the same savestate for each.
 
         With a :class:`DifficultyTracker` and ``candidates > 1`` this is *tournament
-        selection*: draw that many tasks from the base mixture, then pick one with
-        probability proportional to how likely its group is to survive filtering.
+        selection*: the first draw fixes the **family** through the configured mixture,
+        the rest of the pool is drawn from that same family, and difficulty then picks
+        among them by how likely each one's group is to survive filtering.
 
-        Tournament rather than a global weighted draw over all 6438 tasks, for two
-        reasons. It preserves the base mixture's shape — the family/label balance
-        :class:`TaskSampler` exists to enforce is still what generates the candidates,
-        and difficulty only reorders within them. And ``candidates`` is a single dial
-        for how aggressive the bias is: 1 disables it entirely, and larger values
-        concentrate harder on p~0.5 without ever reaching a deterministic argmax.
+        **The tournament must not choose the family.** Difficulty weight is
+        ``1 - p^G - (1-p)^G``, which is near its minimum for a family the policy almost
+        never solves — so a pool spanning families would systematically discard exactly
+        the hard family an upsampling config was written to emphasise. Measured: a pool
+        that is 50% boss yields 25.4% boss picks at G=8, halving the configured share.
+        Fixing the family first makes the two knobs independent — ``family_multiplier``
+        decides *which* family, difficulty decides *which task within* it.
+
+        ``candidates`` remains the single dial for bias strength: 1 disables it, larger
+        values concentrate harder on p~0.5 without ever becoming a deterministic argmax.
         """
         if self.difficulty is None or self.candidates == 1:
             return [self.sampler.sample()] * self.group_size
-        pool = [self.sampler.sample() for _ in range(self.candidates)]
+        first = self.sampler.sample()
+        pool = [first] + [self._draw_in_family(first.family)
+                          for _ in range(self.candidates - 1)]
         w = np.array([self.difficulty.weight(t) for t in pool], dtype=np.float64)
         task = pool[int(self.rng.choice(len(pool), p=w / w.sum()))]
         return [task] * self.group_size

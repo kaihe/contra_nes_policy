@@ -13,7 +13,7 @@ cache_dir: ${hydra:runtime.cwd}/cache
 # Phase 1 (doc/0004 §2): boss excluded for iteration speed — long episodes, ~75%
 # all-failure groups. Not an isolation argument; phase 2 adds it from this same
 # checkpoint.
-families: [kill, item, traverse]
+families: [kill, item, traverse, boss]
 image_size: 256
 sigma_px: 12.0
 
@@ -61,9 +61,17 @@ reward:
 
 # ── task sampling ─────────────────────────────────────────────────────────────
 sampling:
-  natural_fraction: 0.7
-  balanced_family_fraction: 0.3
-  family_multiplier: {kill: 1.0, item: 1.0, traverse: 1.0, boss: 1.0}
+  # Solved for **50% boss rollouts**, not hand-tuned. Boss is only 6.75% of the 6904
+  # train tasks, and the balanced component can contribute at most
+  # `balanced_family_fraction`, so at the old 0.7/0.3 split boss caps at
+  # 0.7*0.0675 + 0.3*1.0 = 34.7% — 50% is unreachable however large the multiplier.
+  # Inverting `natural*share + balanced*w` for boss=0.50 at a 0.3/0.7 split gives
+  # w_boss = 0.685, i.e. multiplier 0.685*3/(1-0.685) = 6.53.
+  #
+  # Resulting mix: boss 0.500  traverse 0.234  kill 0.173  item 0.093
+  natural_fraction: 0.3
+  balanced_family_fraction: 0.7
+  family_multiplier: {kill: 1.0, item: 1.0, traverse: 1.0, boss: 6.53}
   # Prefer tasks whose groups will actually carry gradient. Measured need: at ~83%
   # success on TRAIN tasks, 59% of groups came back all-success and 58% of the rollout
   # budget bought nothing (runs/grpo/2026-08-02/11-48-03).

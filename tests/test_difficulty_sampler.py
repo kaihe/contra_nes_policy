@@ -192,6 +192,76 @@ def test_a_group_is_still_g_copies_of_one_task():
         assert len(g) == 8 and len({t.uid for t in g}) == 1
 
 
+# ── the tournament must not choose the family ────────────────────────────────
+
+class _MixSampler:
+    """Draws families at fixed shares from a *fixed* task pool per family, so the
+    configured mix is checkable exactly and per-task estimates refer to real draws."""
+
+    def __init__(self, shares, seed=0, per_family=200):
+        self.fams = list(shares)
+        self.p = np.array([shares[f] for f in self.fams], float)
+        self.p /= self.p.sum()
+        self.rng = np.random.default_rng(seed)
+        self.per_family = per_family
+
+    def sample(self):
+        f = self.fams[int(self.rng.choice(len(self.fams), p=self.p))]
+        i = int(self.rng.integers(self.per_family))
+        return SimpleNamespace(uid=f"{f}-{i}", family=f, label=f)
+
+    def state(self):
+        return {}
+
+    def load_state(self, s):
+        pass
+
+
+def test_difficulty_bias_does_not_change_the_family_mix():
+    """The regression behind upsampling boss to 50%. Boss groups nearly always fail, so
+    its difficulty weight is near the minimum — a pool spanning families would discard
+    exactly the family the config is trying to emphasise. Measured before the fix: a
+    50% boss pool yielded 25.4% boss picks."""
+    d = DifficultyTracker(group_size=8, min_weight=0.05)
+    for i in range(200):                       # boss ~3.5%, everything else ~85%
+        d.observe(f"boss-{i}", "boss", 0.28, 8)
+        d.observe(f"traverse-{i}", "traverse", 6.8, 8)
+    gs = GroupSampler(_MixSampler({"boss": 0.5, "traverse": 0.5}), group_size=8,
+                      difficulty=d, candidates=4, seed=0)
+    picks = [g[0].family for g in gs.sample_groups(3000)]
+    assert d.weight(_t("b", "boss")) < 0.5 * d.weight(_t("t", "traverse"))
+    assert picks.count("boss") / len(picks) == pytest.approx(0.5, abs=0.03)
+
+
+def test_draw_in_family_only_returns_that_family():
+    gs = GroupSampler(_MixSampler({"a": 0.5, "b": 0.3, "c": 0.2}), group_size=4,
+                      difficulty=DifficultyTracker(4), candidates=5, seed=3)
+    for fam in ("a", "b", "c"):
+        assert all(gs._draw_in_family(fam).family == fam for _ in range(200))
+
+
+def test_a_family_the_mixture_never_draws_does_not_hang():
+    """Rejection sampling is capped; an unreachable family falls back rather than spins."""
+    gs = GroupSampler(_MixSampler({"a": 1.0}), group_size=4,
+                      difficulty=DifficultyTracker(4), candidates=3, seed=0)
+    assert gs._draw_in_family("absent").family == "a"
+
+
+def test_difficulty_still_reorders_within_the_chosen_family():
+    """Family fixed by the mixture, task chosen by difficulty — both knobs live."""
+    d = DifficultyTracker(group_size=8, min_weight=0.0)
+    gs = GroupSampler(_MixSampler({"f": 1.0}), group_size=8,
+                      difficulty=d, candidates=4, seed=0)
+    for i in range(400):                       # make even uids easy, odd uids mid
+        d.observe(f"f-{i}", "f", 8.0 if i % 2 == 0 else 4.0, 8)
+    picks = [g[0].uid for g in gs.sample_groups(1500)]
+    odd = sum(int(u.split("-")[1]) % 2 for u in picks)
+    # Weights are 0.99 (odd, p~0.53) against 0.22 (even, p~0.97). Averaging over a
+    # binomial pool of 4 the analytic pick rate is 0.755, against 0.5 unbiased; the
+    # bound sits below that rather than on it.
+    assert odd / len(picks) > 0.70
+
+
 # ── resumption ───────────────────────────────────────────────────────────────
 
 def test_state_round_trips_the_difficulty_estimates():
