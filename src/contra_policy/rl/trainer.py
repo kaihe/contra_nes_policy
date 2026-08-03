@@ -43,6 +43,17 @@ from contra_policy.rl.tasks import (DifficultyTracker, GroupSampler, TaskCatalog
 FAMILIES = ("kill", "item", "traverse", "boss")
 
 
+def _won(e) -> bool:
+    """Did the episode reach its goal?
+
+    Read the **outcome**, never ``reward > 0``. Since doc/0005 §2 a losing boss episode
+    scores ``progress_coef * (HP removed / HP peak)``, so a positive reward means "dealt
+    some damage", not "won". The first run with grading on reported ``boss=0.76`` and
+    ``probe boss=0.90`` against a true rate near 0.10 before this was caught.
+    """
+    return e.outcome == "success"
+
+
 def wilson(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """95% Wilson interval — the one that behaves at 0/n and n/n, which per-family
     counts hit constantly (boss succeeds ~3.5% of the time)."""
@@ -343,8 +354,8 @@ class GRPOTrainer:
         self._probe_gid += len(groups)
 
         out: Dict[str, float] = {}
-        r = np.array([e.reward for e in eps])
-        out["probe/success"] = float(r.mean())
+        out["probe/success"] = float(np.mean([_won(e) for e in eps]))
+        out["probe/reward_mean"] = float(np.mean([e.reward for e in eps]))
         out["probe/episodes"] = float(len(eps))
         out["probe/mean_len"] = float(np.mean([len(e) for e in eps]))
         macro = []
@@ -352,7 +363,7 @@ class GRPOTrainer:
             sel = [e for e in eps if e.family == fam]
             if not sel:
                 continue
-            s = int(sum(e.reward > 0 for e in sel))
+            s = int(sum(_won(e) for e in sel))
             lo, hi = wilson(s, len(sel))
             out[f"probe/{fam}/success"] = s / len(sel)
             out[f"probe/{fam}/ci_lo"], out[f"probe/{fam}/ci_hi"] = lo, hi
@@ -369,15 +380,15 @@ class GRPOTrainer:
         out: Dict[str, float] = {}
         if not episodes:
             return out
-        r = np.array([e.reward for e in episodes])
-        out["success"] = float(r.mean())
+        out["success"] = float(np.mean([_won(e) for e in episodes]))
+        out["reward_mean"] = float(np.mean([e.reward for e in episodes]))
         out["episodes"] = float(len(episodes))
         out["mean_len"] = float(np.mean([len(e) for e in episodes]))
         for fam in FAMILIES:
             sel = [e for e in episodes if e.family == fam]
             if not sel:
                 continue
-            s = int(sum(e.reward > 0 for e in sel))
+            s = int(sum(_won(e) for e in sel))
             lo, hi = wilson(s, len(sel))
             out[f"{fam}/success"] = s / len(sel)
             out[f"{fam}/episodes"] = float(len(sel))

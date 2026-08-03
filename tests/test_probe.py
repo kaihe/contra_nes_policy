@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
-from contra_policy.rl.buffer import Episode
+from contra_policy.rl.buffer import Episode, EpisodeOutcome
 from contra_policy.rl.trainer import GRPOTrainer
 
 FAMS = ("kill", "item", "traverse", "boss")
@@ -159,3 +159,45 @@ def test_the_probe_does_not_feed_the_difficulty_sampler():
     t = _trainer({"kill": 40, "boss": 40}, per=8)
     assert not hasattr(t, "groups")
     t.run_probe()          # would raise if it tried to observe
+
+
+# ── success means the goal, not a positive reward ────────────────────────────
+
+def test_success_counts_the_outcome_not_a_positive_reward():
+    """Since doc/0005 §2 a losing boss episode scores `progress_coef * damage`, so
+    `reward > 0` means "dealt some damage", not "won". The first graded run reported
+    boss=0.76 and probe boss=0.90 against a true rate near 0.10 before this was caught."""
+    t = _trainer({"boss": 40}, per=8)
+    winners = {t.probe_tasks[0].uid}          # 1 of 8 tasks actually wins
+
+    def graded(groups, base_gid=0):
+        out = []
+        for i, g in enumerate(groups):
+            for task in g:
+                won = task.uid in winners
+                out.append(Episode(
+                    task_uid=task.uid, family=task.family, group_id=base_gid + i,
+                    frames=np.zeros((5, 4, 4, 3), np.uint8),
+                    goal_image=np.zeros((4, 4, 3), np.uint8), interaction=0,
+                    actions=np.zeros(5, np.int64), logprobs=np.zeros(5, np.float32),
+                    reward=1.0 if won else 0.25,   # every loser still scores > 0
+                    outcome="success" if won else "death", task_label=task.label))
+        return out
+
+    t.collector.collect_groups = graded
+    out = t.run_probe()
+    assert out["probe/boss/success"] == pytest.approx(1 / 8)   # not 1.0
+    # the graded signal is still reported, just not as "success"
+    assert out["probe/reward_mean"] == pytest.approx((1.0 + 7 * 0.25) / 8)
+
+
+def test_outcome_stats_agrees_with_the_probe_on_what_success_means():
+    """Both reporting paths must read `outcome`, or the two lines in the log disagree."""
+    stub = SimpleNamespace()
+    stub.outcome_stats = GRPOTrainer.outcome_stats.__get__(stub)
+    eps = [EpisodeOutcome(family="boss", outcome="death", reward=0.4, n_steps=5),
+           EpisodeOutcome(family="boss", outcome="success", reward=1.0, n_steps=5)]
+    out = stub.outcome_stats(eps)
+    assert out["success"] == pytest.approx(0.5)      # not 1.0
+    assert out["reward_mean"] == pytest.approx(0.7)
+    assert out["boss/success"] == pytest.approx(0.5)
