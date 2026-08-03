@@ -78,9 +78,54 @@ policy dies at **27% of the expert's episode** (val: 32%), at the approach→eng
 transition. Every one of those currently scores identically to a rollout that nearly
 won.
 
-**Normalising by `HP_start` is what makes mid-fight tasks work.** Tasks generated from a
+**Normalising by the anchor is what makes mid-fight tasks work.** Tasks generated from a
 savestate partway through a fight begin with the boss already damaged; absolute damage
 would understate them. This is why `boss_hp_start` is requested as task metadata.
+
+### The anchor is the observed peak, not the value at step 0
+
+Found on implementation, and it would have silently produced a no-op. A boss task begins
+at the boss *reveal*, **before** the boss occupies an active enemy slot — so `boss_hp`
+reads **0** at step 0 and only climbs once it spawns. Measured over 24 rollouts: `hp0`
+was 0 for **all 24**, peaking at 25-64, and successes ended at 28-30 against deaths at
+59-64.
+
+Anchoring on the initial read scored every episode as having dealt no damage —
+`progress_coef` had literally no effect. The anchor is therefore `hp_peak`, the maximum
+observed during the episode. An episode that dies before the boss ever spawns has
+`hp_peak == 0` and scores zero, which is correct: it made no progress.
+
+### Measured on real rollouts before the run
+
+Four boss groups of G=8 at `grpo-000075`:
+
+| | binary | graded |
+|---|---|---|
+| `zero_variance_group_frac` | **0.50** | **0.00** |
+| failures with non-zero credit | 0% | 96% |
+| largest failure reward | 0.0 | 0.275 |
+
+The two all-failure groups — discarded outright under the binary reward — came back with
+real spread (`[0.039 … 0.164]` and `[0.0 … 0.141]`). Ranges stayed disjoint.
+
+### The confirmation run
+
+A matched repeat of `runs/grpo/2026-08-03/09-23-22`: **same BC init, same 50% boss
+sampling, same G, KL, lr and 100 updates**, adding only `reward.progress_coef: 0.5`. That
+run is the control, and its checkpoints are already evaluated
+(`contra_nes_evaluation/doc/0008-grpo-with-boss.md`), so the comparison is against
+published numbers rather than a re-run.
+
+Not bit-identical: the fixed `probe` was added afterwards and consumes rollouts, which
+shifts the sampling stream. It trains on nothing and feeds the sampler nothing, so the
+comparison is statistically clean but not seed-exact.
+
+**Confirmed if** boss `zero_var` falls below 0.2 *and* val boss beats 10.5% at matched
+updates. **Refuted if** val boss is unchanged — which would mean the recovered gradient
+is real but uninformative, and the boss path is entirely a data problem.
+
+Either way the next step is the diversified data from `kaihe/contra_nes_data#2`; this run
+decides whether graded reward ships alongside it or is dropped.
 
 **Dependency.** `boss_hp` does not exist yet. `env/utility.py:boss_enemy_present()` in
 the data repo already walks exactly the right slots (`ADDR_ENEMY_HP`, filtered by
@@ -117,19 +162,24 @@ Normalising also *guarantees* the ordering below.
 Every success outranks every failure at any α ≤ 0.5, β ≤ 0.1. The speed term can only
 break ties *among winners*; it can never trade a win for a fast loss.
 
-## 4. Why sequenced, not both at once
+## 4. Sequencing
 
-They are independently falsifiable and they touch different families. Boss is ~50% of
-rollouts under the current sampling and the easy families are the rest, so shipping both
-together would leave a change in `zero_var` unattributable — and `zero_var` is the whole
-point. Phase 1 also has an external dependency (the HP accessor) while phase 2 has none;
-sequencing lets phase 2 proceed if the data repo is slow.
+1. **Phase 1 confirmation run** — §2, matched against `2026-08-03/09-23-22`.
+2. **Diversified boss data** — `kaihe/contra_nes_data#2`, independent of the outcome
+   above and the actual path for boss (§7).
+3. **Phase 2, the speed term** — after, and only measured once phase 1 has settled.
+
+Phases 1 and 2 are independently falsifiable and touch different families. Boss is ~50%
+of rollouts under the current sampling and the easy families are the rest, so shipping
+both together would leave a change in `zero_var` unattributable — and `zero_var` is the
+whole point. Phase 1 turned out to have no external blocker after all: the data repo
+landed `KillBossMaker.boss_hp` before this was written.
 
 ## 5. What we expect, written down in advance
 
 | prediction | why | falsified by |
 |---|---|---|
-| phase 1 cuts boss `zero_var` from ~0.6 to < 0.2 | damage is near-continuous; ties become rare | boss `zero_var` > 0.4 |
+| phase 1 cuts boss `zero_var` from ~0.6 to < 0.2 | measured 0.50 → 0.00 on four groups before the run | boss `zero_var` > 0.4 |
 | phase 1 raises **val** boss above 10.5% | the failure signal becomes informative | val boss ≤ 10.5% at matched updates |
 | phase 2 cuts overall `zero_var` below 0.30 | 12 of 14 labels are > 0.84, all rescued | `zero_var` > 0.40 |
 | neither changes **pooled** val by more than ~2 pp | this buys sample efficiency, not a better objective | pooled moves > 5 pp either way |

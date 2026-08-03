@@ -57,7 +57,12 @@ reward:
   death: 0.0
   timeout: 0.0
   truncated: 0.0
-  step: 0.0
+  step: 0.0            # dead key: `_finish` looks up only the outcome name
+  # Graded failure credit: a losing episode scores `progress_coef * (boss HP removed /
+  # HP at start)`. Turns a boss group of eight identical zeros — 43-75% of boss groups
+  # at G=8 — into one with real advantage spread. Must stay <= 0.5 so no failure can
+  # ever outrank a success. 0 reproduces the pure binary reward. doc/0005 §2.
+  progress_coef: 0.5
 
 # ── task sampling ─────────────────────────────────────────────────────────────
 sampling:

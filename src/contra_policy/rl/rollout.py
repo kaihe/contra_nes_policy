@@ -295,6 +295,17 @@ class _Slot:
     values: List[float] = field(default_factory=list)
     goal_points: List[List[List[int]]] = field(default_factory=list)
     goal_visible: List[bool] = field(default_factory=list)
+    #: Boss HP for the graded failure reward (doc/0005 §2). ``-1`` means the task's
+    #: maker exposes no progress signal.
+    #:
+    #: ``hp_peak`` is the anchor, **not** the value at step 0: a boss task begins at the
+    #: boss *reveal*, before the boss occupies an active enemy slot, so HP reads 0 for
+    #: the first several steps and only then rises to its full value. Measured over 24
+    #: rollouts, every task started at 0 and peaked at 25-64. Anchoring on the initial
+    #: read would score every episode as having dealt no damage.
+    hp0: int = -1
+    hp_peak: int = -1
+    hp_last: int = -1
 
 
 # ── the collector ─────────────────────────────────────────────────────────────
@@ -331,7 +342,7 @@ class EpisodeCollector:
         self.stop_on_death = stop_on_death
         self.collect_goal_points = collect_goal_points
         self.reward = {"success": 1.0, "death": 0.0, "timeout": 0.0, "step": 0.0,
-                       "truncated": 0.0, **(reward or {})}
+                       "truncated": 0.0, "progress_coef": 0.0, **(reward or {})}
         self.actor = TokenHistoryActor(model, batch_size, device=device,
                                   temperature=temperature, seed=seed, precision=precision)
         self._vectors = actions_np(np.uint8)
@@ -454,8 +465,21 @@ class EpisodeCollector:
         slot.state = self._env.em.get_state()
         slot.prev_ram = self._env.unwrapped.get_ram().copy()
         slot.prev_action = IDLE_ACTION
+        slot.hp0 = slot.hp_peak = slot.hp_last = self._progress(slot, slot.prev_ram)
         slot.frame = self._peek(slot)
         return slot
+
+    @staticmethod
+    def _progress(slot: _Slot, ram) -> int:
+        """Interpreted progress for this task's family, or -1 if it has none.
+
+        Read through the maker rather than from RAM: `KillBossMaker.boss_hp` is the data
+        repo's published accessor, so no ``ADDR_*`` knowledge enters this repo
+        (`kaihe/contra_nes_data#2`). Families whose maker exposes nothing keep the
+        binary reward untouched.
+        """
+        fn = getattr(slot.maker, "boss_hp", None)
+        return int(fn(ram)) if fn is not None else -1
 
     def _peek(self, slot: _Slot) -> np.ndarray:
         """Render a frame for a state without advancing that state's clock."""
@@ -511,6 +535,12 @@ class EpisodeCollector:
             self._env.step(vector)
         cur = self._env.unwrapped.get_ram().copy()
         slot.steps += 1
+        if slot.hp0 >= 0:
+            # Every step, not just the last: `prev_ram` is deliberately not advanced on
+            # the step that ends the episode, so reading it at `_finish` would miss the
+            # damage dealt by the final action — and the peak would be missed entirely.
+            slot.hp_last = self._progress(slot, cur)
+            slot.hp_peak = max(slot.hp_peak, slot.hp_last)
 
         # Both predicates are always evaluated (they are cheap RAM reads) so that
         # `died` is recorded even on the step the task is completed; `classify_step`
@@ -530,14 +560,38 @@ class EpisodeCollector:
             slot.prev_ram = cur
             slot.prev_action = action
 
-    def _finish(self, slot: _Slot) -> Episode:
-        """A completed rollout, as the buffer wants it.
+    def _reward_for(self, slot: _Slot) -> float:
+        """Terminal reward: ``reward[outcome]``, plus graded credit on failure.
 
-        The reward is terminal and binary — ``reward["success"]`` on success, otherwise
-        zero. No per-step shaping: the group baseline needs episode returns to be
-        comparable within a group, and a step penalty would make a long survival look
-        worse than a fast death.
+        **Still one scalar per episode.** ``progress_coef`` grades *failures* by the
+        fraction of boss HP removed, so a group whose members all fail — 43-75% of boss
+        groups at G=8 — has real advantage spread instead of eight identical zeros
+        (doc/0005 §2). It adds no per-step credit: the buffer still broadcasts one
+        number across the episode.
+
+        **Damage is measured from the observed peak, not from step 0.** A boss task
+        begins at the boss reveal, before the boss occupies an enemy slot, so HP starts
+        at 0 and climbs. An episode that dies before the boss ever spawns has
+        ``hp_peak == 0`` and scores zero, which is the right answer: it made no progress.
+
+        **The ranges must stay disjoint.** At ``progress_coef <= 0.5`` a failure scores
+        at most 0.5 against a success's 1.0, so no amount of damage can outrank a win
+        and the objective is still "kill the boss". Pinned by
+        ``tests/test_reward.py::test_no_failure_can_outscore_a_success``.
+
+        Deliberately *not* a symmetric step penalty. That would score a fast death above
+        a long survival, and the boss failure mode is dying early — at 27% of the
+        expert's episode, measured over 69 deaths. See doc/0005 §8.
         """
+        base = float(self.reward.get(slot.outcome, 0.0))
+        alpha = float(self.reward.get("progress_coef", 0.0))
+        if slot.outcome == "success" or alpha <= 0 or slot.hp_peak <= 0:
+            return base
+        removed = max(0, slot.hp_peak - max(0, slot.hp_last))
+        return base + alpha * (removed / slot.hp_peak)
+
+    def _finish(self, slot: _Slot) -> Episode:
+        """A completed rollout, as the buffer wants it."""
         n = len(slot.actions)
         return Episode(
             task_uid=slot.task.uid,
@@ -549,7 +603,7 @@ class EpisodeCollector:
             interaction=slot.prompt.interaction,
             actions=np.asarray(slot.actions, dtype=np.int64),
             logprobs=np.asarray(slot.logprobs, dtype=np.float32),
-            reward=float(self.reward.get(slot.outcome, 0.0)),
+            reward=self._reward_for(slot),
             outcome=slot.outcome,
             task_label=slot.task.label,
         )
