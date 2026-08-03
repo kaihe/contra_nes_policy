@@ -19,6 +19,7 @@ mix where nothing survives should stop the run, not spin.
 
 from __future__ import annotations
 
+import collections
 import csv
 import math
 import os
@@ -152,6 +153,14 @@ class GRPOTrainer:
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         self.update = 0
 
+        self.probe_tasks = self._build_probe()
+        self._probe_gid = 10 ** 9      # keep probe ids far from any training group id
+        if self.probe_tasks:
+            byfam = collections.Counter(t.family for t in self.probe_tasks)
+            print(f"[grpo] probe: {len(self.probe_tasks)} fixed train tasks "
+                  f"({' '.join(f'{k} {v}' for k, v in sorted(byfam.items()))}) "
+                  f"every {int(self.args.probe.get('every', 10))} updates", flush=True)
+
     # -- collection ---------------------------------------------------------
 
     def _check_memory(self) -> None:
@@ -278,6 +287,82 @@ class GRPOTrainer:
                     return {k: float(np.mean(v)) for k, v in agg.items()}
         return {k: float(np.mean(v)) for k, v in agg.items()}
 
+    # -- the probe ----------------------------------------------------------
+
+    def _build_probe(self) -> List:
+        """A fixed, family-stratified sample of train tasks, drawn once.
+
+        **Why this exists.** Every per-family number in `metrics.csv` is measured on
+        whatever the sampler chose to roll, and the sampler is *deliberately* biased:
+        the difficulty tournament picks tasks whose success rate is near 0.5, tracking
+        that frontier upward as the policy improves. So the logged rate is an estimate
+        over a self-selected subset, not over the task population — it rises partly
+        because the selection moves.
+
+        That is not hypothetical. Run ``2026-08-03/09-23-22`` logged boss climbing
+        0.093 -> 0.338 on train while the same checkpoints scored 0.035 -> 0.105 on the
+        held-out val set. Boss has the widest per-task spread of any family (expert
+        lengths 78-305, four weapons), so the selection effect is largest exactly where
+        the headline number was read.
+
+        The probe removes both moving parts: the *same* tasks every time, drawn
+        uniformly within each family, with no filtering and no difficulty weighting.
+        Paired across updates, so task-selection variance cancels and a trend means
+        something even at modest n.
+
+        **What it is not.** These tasks stay in the training pool, so this is an
+        unbiased estimate of *train* success — not of generalisation. The val harness in
+        `contra_nes_evaluation` remains the only thing that measures that.
+        """
+        cfg = self.args.get("probe", {})
+        per = int(cfg.get("tasks_per_family", 0))
+        if not per:
+            return []
+        rng = np.random.default_rng(int(cfg.get("seed", 12345)))
+        out = []
+        for fam in sorted(self.catalog.by_family):
+            tasks = [t for lab in sorted(self.catalog.by_family[fam])
+                     for t in self.catalog.by_family[fam][lab]]
+            idx = rng.permutation(len(tasks))[:min(per, len(tasks))]
+            out.extend(tasks[int(i)] for i in idx)
+        return out
+
+    def run_probe(self) -> Dict[str, float]:
+        """Roll every probe task once and report success, unweighted.
+
+        Groups of size 1: the probe is a measurement, not a gradient source, so it
+        needs no baseline. Results are deliberately **not** fed to the
+        :class:`DifficultyTracker` — the probe must not perturb the sampler it exists
+        to measure around.
+        """
+        if not self.probe_tasks:
+            return {}
+        reps = int(self.args.probe.get("repeats", 1))
+        groups = [[t] for t in self.probe_tasks for _ in range(reps)]
+        eps = self.collector.collect_groups(groups, base_gid=self._probe_gid)
+        self._probe_gid += len(groups)
+
+        out: Dict[str, float] = {}
+        r = np.array([e.reward for e in eps])
+        out["probe/success"] = float(r.mean())
+        out["probe/episodes"] = float(len(eps))
+        out["probe/mean_len"] = float(np.mean([len(e) for e in eps]))
+        macro = []
+        for fam in FAMILIES:
+            sel = [e for e in eps if e.family == fam]
+            if not sel:
+                continue
+            s = int(sum(e.reward > 0 for e in sel))
+            lo, hi = wilson(s, len(sel))
+            out[f"probe/{fam}/success"] = s / len(sel)
+            out[f"probe/{fam}/ci_lo"], out[f"probe/{fam}/ci_hi"] = lo, hi
+            macro.append(s / len(sel))
+        if macro:
+            # Macro average, because the probe is family-balanced by construction while
+            # the training mix is not — pooling would hide a family behind the others.
+            out["probe/macro"] = float(np.mean(macro))
+        return out
+
     # -- metrics ------------------------------------------------------------
 
     def outcome_stats(self, episodes) -> Dict[str, float]:
@@ -321,8 +406,15 @@ class GRPOTrainer:
                        # Outcome stats over EVERYTHING rolled, not just what survived —
                        # filtering is an update-side decision and must not flatter the
                        # success rate it reports.
-                       **self.outcome_stats(outcomes), **self.groups.stats(),
-                       "seconds": time.time() - t0}
+                       **self.outcome_stats(outcomes), **self.groups.stats()}
+                every = int(self.args.get("probe", {}).get("every", 0) or 0)
+                # Probed *after* the update, so the number describes the weights this
+                # row's checkpoint would contain. Update 1 is probed too, giving the
+                # init's baseline on the same tasks.
+                if every and (self.update == 1 or self.update % every == 0):
+                    row.update(self.run_probe())
+                    self._check_memory()
+                row["seconds"] = time.time() - t0
                 self._emit(row)
                 if int(self.args.train.save_every) and \
                         self.update % int(self.args.train.save_every) == 0:
@@ -351,6 +443,13 @@ class GRPOTrainer:
                for f in FAMILIES if f"{f}/success" in row]
         if fam:
             print("    " + " ".join(fam), flush=True)
+        # The probe is the line to read. The one above it is measured on whatever the
+        # difficulty sampler chose, which is a moving target by design.
+        pf = [f"{f}={row[f'probe/{f}/success']:.2f}"
+              for f in FAMILIES if f"probe/{f}/success" in row]
+        if pf:
+            print(f"    PROBE macro={row['probe/macro']:.3f} " + " ".join(pf) +
+                  f"  (n={int(row['probe/episodes'])}, fixed tasks)", flush=True)
 
     def save(self, final: bool = False) -> str:
         tag = "final" if final else f"{self.update:06d}"

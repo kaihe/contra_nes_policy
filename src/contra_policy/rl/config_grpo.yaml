@@ -84,6 +84,21 @@ sampling:
     prior: 1.0        # Laplace — an unseen task reads p=0.5 and is explored first
     min_weight: 0.05  # never exclude a task outright; boss must stay rediscoverable
 
+# ── unbiased train probe ──────────────────────────────────────────────────────
+# Every per-family number above is measured on whatever the difficulty sampler chose,
+# and that sampler deliberately tracks tasks near p=0.5 — so the logged rate rises
+# partly because the selection moves. Run 2026-08-03/09-23-22 logged boss 0.093 -> 0.338
+# on train while the same checkpoints scored 0.035 -> 0.105 on val.
+#
+# The probe fixes both: the same tasks every time, uniform within family, no filtering,
+# no difficulty weighting, results not fed back to the sampler. It measures *train*
+# success without selection bias — not generalisation; val remains the only gate.
+probe:
+  every: 10              # updates between probes; 0 disables. Update 1 is always probed.
+  tasks_per_family: 48   # 4 families x 48 = 192 episodes, ~40s, ~6% overhead at every=10
+  repeats: 1             # rollouts per task; >1 tightens the estimate at linear cost
+  seed: 12345            # fixed, so the task set is identical across runs and resumes
+
 # ── GRPO ──────────────────────────────────────────────────────────────────────
 grpo:
   clip_ratio: 0.2
