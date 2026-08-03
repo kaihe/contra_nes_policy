@@ -20,10 +20,13 @@ from contra_policy.rl.buffer import group_advantages
 from contra_policy.rl.rollout import EpisodeCollector
 
 
-def _slot(outcome, hp_peak=100, hp_last=100):
-    """`hp_peak`, not the value at step 0: a boss task starts at the reveal, before the
-    boss occupies an enemy slot, so HP reads 0 for the first several steps."""
-    return SimpleNamespace(outcome=outcome, hp0=hp_peak, hp_peak=hp_peak, hp_last=hp_last)
+def _slot(outcome, hp_ref=100, hp_last=100, hp_peak=None):
+    """`hp_ref` is the task's `boss_hp_start` — a task-level constant. Neither step 0
+    (the boss has not spawned) nor the episode's own peak (the boss spawns in stages,
+    16 -> 48 -> ~64) is a sound denominator."""
+    return SimpleNamespace(outcome=outcome, hp_ref=hp_ref,
+                           hp_peak=hp_peak if hp_peak is not None else hp_ref,
+                           hp_last=hp_last)
 
 
 def _reward_fn(**reward):
@@ -43,7 +46,7 @@ def test_a_failure_is_graded_by_the_fraction_of_hp_removed():
     assert r(_slot("death", 100, 0)) == pytest.approx(0.50)     # everything, still died
 
 
-def test_grading_is_relative_to_the_peak_hp():
+def test_grading_is_relative_to_the_reference_hp():
     """Mid-fight tasks begin with the boss already damaged; absolute HP removed would
     understate them. The fraction makes tasks comparable wherever they start."""
     r = _reward_fn(progress_coef=0.5)
@@ -115,4 +118,33 @@ def test_dying_before_the_boss_spawns_scores_zero():
     An episode that never gets there has no peak to measure damage against, and made no
     progress — measured: all 24 sampled tasks read hp=0 at step 0 and peaked at 25-64."""
     r = _reward_fn(progress_coef=0.5)
-    assert r(_slot("death", hp_peak=0, hp_last=0)) == 0.0
+    assert r(_slot("death", hp_ref=0, hp_last=0, hp_peak=0)) == 0.0
+
+
+def test_the_anchor_is_the_task_constant_not_the_episode_peak():
+    """The inversion this prevents. The boss spawns 16 -> 48 -> ~64, so a rollout that
+    dies mid-spawn has a small peak. Normalising by its own peak would score 8 damage
+    against 16 = 0.50, while a rollout that survived to full reveal and did the same
+    damage scores 8/63 = 0.13 — rewarding the one that died sooner, which is exactly
+    the failure mode (deaths at 27% of the expert's episode)."""
+    r = _reward_fn(progress_coef=0.5)
+    early = _slot("death", hp_ref=63, hp_last=8, hp_peak=16)    # died mid-spawn
+    late = _slot("death", hp_ref=63, hp_last=55, hp_peak=63)    # survived to full reveal
+    assert r(early) == pytest.approx(0.5 * 55 / 63, abs=1e-6)
+    assert r(late) == pytest.approx(0.5 * 8 / 63, abs=1e-6)
+    # both measured on one scale; had we used each episode's own peak, `early` would
+    # have scored 0.5 * 8/16 = 0.25 against `late`'s 0.5 * 8/63 = 0.063
+    assert r(early) / r(late) == pytest.approx(55 / 8, rel=1e-6)
+
+
+def test_the_episode_peak_is_the_fallback_when_metadata_is_absent():
+    r = _reward_fn(progress_coef=0.5)
+    assert r(_slot("death", hp_ref=-1, hp_last=30, hp_peak=60)) == pytest.approx(0.25)
+
+
+def test_damage_cannot_exceed_the_reference():
+    """`hp_last` above the reference (peaks vary 59-64 across tasks) must not go
+    negative, and damage must not exceed 1.0 of the anchor."""
+    r = _reward_fn(progress_coef=0.5)
+    assert r(_slot("death", hp_ref=63, hp_last=64)) == 0.0
+    assert r(_slot("death", hp_ref=63, hp_last=0)) == pytest.approx(0.5)

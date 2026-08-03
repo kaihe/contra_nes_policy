@@ -298,12 +298,18 @@ class _Slot:
     #: Boss HP for the graded failure reward (doc/0005 §2). ``-1`` means the task's
     #: maker exposes no progress signal.
     #:
-    #: ``hp_peak`` is the anchor, **not** the value at step 0: a boss task begins at the
-    #: boss *reveal*, before the boss occupies an active enemy slot, so HP reads 0 for
-    #: the first several steps and only then rises to its full value. Measured over 24
-    #: rollouts, every task started at 0 and peaked at 25-64. Anchoring on the initial
-    #: read would score every episode as having dealt no damage.
-    hp0: int = -1
+    #: The anchor is ``hp_ref``, the task's ``boss_hp_start`` metadata — a **task-level
+    #: constant**, not the value at step 0 and not this episode's peak.
+    #:
+    #: A boss task begins at the reveal, and the boss spawns in stages: the data repo
+    #: measured ``16 -> 48 -> ~64`` (`contra_nes_data/doc/0001-boss-search-curriculum.md`).
+    #: So HP reads 0 initially, then climbs. Anchoring on step 0 scores every episode as
+    #: having dealt no damage; anchoring on the *episode's own* peak is worse than that
+    #: — a rollout that dies mid-spawn normalises 8 damage against 16 rather than 63 and
+    #: scores 0.5 where a rollout that survived to full reveal and did the same damage
+    #: scores 0.13. That rewards dying early, which is precisely the failure mode
+    #: (deaths at 27% of the expert's episode).
+    hp_ref: int = -1
     hp_peak: int = -1
     hp_last: int = -1
 
@@ -465,7 +471,13 @@ class EpisodeCollector:
         slot.state = self._env.em.get_state()
         slot.prev_ram = self._env.unwrapped.get_ram().copy()
         slot.prev_action = IDLE_ACTION
-        slot.hp0 = slot.hp_peak = slot.hp_last = self._progress(slot, slot.prev_ram)
+        slot.hp_peak = slot.hp_last = self._progress(slot, slot.prev_ram)
+        if slot.hp_peak >= 0:
+            # `boss_hp_start` is the data repo's own anchor: the maximum boss HP over
+            # the source trace, i.e. the value at full reveal. Shared by every rollout
+            # of the task, so members of a group are always compared on one scale.
+            meta = getattr(seg, "meta", None) or {}
+            slot.hp_ref = int(meta.get("boss_hp_start", -1) or -1)
         slot.frame = self._peek(slot)
         return slot
 
@@ -535,7 +547,7 @@ class EpisodeCollector:
             self._env.step(vector)
         cur = self._env.unwrapped.get_ram().copy()
         slot.steps += 1
-        if slot.hp0 >= 0:
+        if slot.hp_peak >= 0:
             # Every step, not just the last: `prev_ram` is deliberately not advanced on
             # the step that ends the episode, so reading it at `_finish` would miss the
             # damage dealt by the final action — and the peak would be missed entirely.
@@ -569,10 +581,12 @@ class EpisodeCollector:
         (doc/0005 §2). It adds no per-step credit: the buffer still broadcasts one
         number across the episode.
 
-        **Damage is measured from the observed peak, not from step 0.** A boss task
-        begins at the boss reveal, before the boss occupies an enemy slot, so HP starts
-        at 0 and climbs. An episode that dies before the boss ever spawns has
-        ``hp_peak == 0`` and scores zero, which is the right answer: it made no progress.
+        **Damage is measured against the task's ``boss_hp_start``**, the data repo's
+        full-reveal anchor, falling back to this episode's peak only when the metadata
+        is absent. The boss spawns in stages (16 -> 48 -> ~64), so neither step 0 nor
+        the episode's own peak is a sound denominator — see `_Slot.hp_ref`. An episode
+        that dies before the boss spawns at all has no damage and scores zero, which is
+        the right answer: it made no progress.
 
         **The ranges must stay disjoint.** At ``progress_coef <= 0.5`` a failure scores
         at most 0.5 against a success's 1.0, so no amount of damage can outrank a win
@@ -585,10 +599,13 @@ class EpisodeCollector:
         """
         base = float(self.reward.get(slot.outcome, 0.0))
         alpha = float(self.reward.get("progress_coef", 0.0))
-        if slot.outcome == "success" or alpha <= 0 or slot.hp_peak <= 0:
+        if slot.outcome == "success" or alpha <= 0:
             return base
-        removed = max(0, slot.hp_peak - max(0, slot.hp_last))
-        return base + alpha * (removed / slot.hp_peak)
+        ref = slot.hp_ref if slot.hp_ref > 0 else slot.hp_peak
+        if ref <= 0:
+            return base
+        removed = min(ref, max(0, ref - max(0, slot.hp_last)))
+        return base + alpha * (removed / ref)
 
     def _finish(self, slot: _Slot) -> Episode:
         """A completed rollout, as the buffer wants it."""
