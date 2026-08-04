@@ -115,9 +115,11 @@ Four boss groups were all-failure and discarded outright; they came back as
 stays binary, and its two all-*success* groups stay degenerate. That is the high tail,
 and it is §3's job.
 
-### Group standardisation must be switched off
+### Group standardisation: switched off, and switched back on
 
-Found by the comparison above, and it changes the run's configuration.
+The reasoning below looked right on paper and was **refuted by the run that tried it**.
+Kept because the argument is sound as far as it goes, and the refutation is the useful
+part.
 
 `group_advantages` divides by the group's own standard deviation. Under a **binary**
 reward that was harmless: every non-degenerate group had the same reward set `{0, 1}`
@@ -135,19 +137,45 @@ genuine win**. Standardisation erases the distinction between "this group learne
 something" and "these eight differed by noise", which is precisely the distinction
 grading exists to create.
 
-So phase 1 runs with **`rollout.normalise_advantages: false`** — the RLOO-style
-unnormalised difference `buffer.py` already supports. A group's gradient magnitude then
-reflects how much was actually at stake in it, and the win dominates the scratch by 27×.
+On that basis the first confirmation attempt (`runs/grpo/2026-08-03/18-54-05`) ran with
+`normalise_advantages: false`. **It failed.**
 
-The alternative, a minimum *absolute* spread in `filter_groups` rather than its `1e-4`
-epsilon, needs a magic number and discards the rollouts entirely; the switch keeps them
-at their honest weight.
+| boss success, rolled episodes | graded + unnormalised | control |
+|---|---|---|
+| u1-25 | 0.086 | 0.128 |
+| u26-50 | 0.089 | 0.189 |
+| u51-75 | 0.086 | 0.263 |
+| u76-100 | **0.109** | **0.309** |
+
+Flat where the control climbs monotonically, and the unbiased probe agrees — boss
+0.12 → **0.06** on the fixed 48 tasks while every other family improved.
+
+Two things went wrong with the reasoning:
+
+- **Unnormalised advantages down-weight boss specifically.** An all-failure boss group
+  contributes deviations around 0.05; a group containing wins contributes ~0.5. So the
+  switch discounted boss learning by roughly 10x — the exact opposite of upsampling boss
+  to 50% of rollouts.
+- **The updates stopped accumulating.** `adv_abs_mean` 0.197 vs 0.829 and `kl_ref` 0.016
+  vs 0.030: half the drift from BC over the same 100 updates, while `approx_kl` was
+  *higher* (0.006 vs 0.0025). Larger per-update movement, less cumulative movement —
+  the updates were wobbling rather than compounding.
+
+**And the experiment was confounded**, which is the process error worth recording:
+`0005` §2 defines the confirmation run as a matched repeat with `progress_coef` as the
+only change, and this run changed two things. "Grading hurt boss" and "unnormalising
+hurt boss" cannot be separated from it. Normalisation is a **separate question** and
+needs its own experiment; a std *floor* (`max(std, 0.1)`) is the version worth testing,
+since it caps the amplification without discounting genuine small-scale signal.
+
+Phase 1 therefore runs with `normalise_advantages: **true**`, matching the control.
 
 ### The confirmation run
 
 A matched repeat of `runs/grpo/2026-08-03/09-23-22`: **same BC init, same 50% boss
-sampling, same G, KL, lr and 100 updates**, adding `reward.progress_coef: 0.5` and
-`rollout.normalise_advantages: false` for the reason above. That
+sampling, same G, KL, lr, advantage normalisation and 100 updates**, adding
+`reward.progress_coef: 0.5` and nothing else. The first attempt violated that by also
+flipping normalisation and had to be discarded — see above. That
 run is the control, and its checkpoints are already evaluated
 (`contra_nes_evaluation/doc/0008-grpo-with-boss.md`), so the comparison is against
 published numbers rather than a re-run.
@@ -256,7 +284,7 @@ difficulty sampler.
 | **symmetric step penalty** (`−α` per step, all outcomes) | scores a fast death above a long survival. Our boss failure *is* dying early, at 27% of the expert's episode; this would optimise directly against the fix. The warning is already in `rollout.py:_finish`. |
 | flat per-step penalty rather than budget-normalised | budgets span 180 → 776 decisions across weapons; one constant cannot suit both |
 | per-step shaped rewards with returns-to-go | breaks `buffer.py`'s one-scalar-per-episode contract and reintroduces the credit assignment GRPO exists to avoid. A terminal graded score gets the same information for none of the machinery. |
-| keeping `normalise_advantages: true` | equivalent to unnormalised under a binary reward, but not under a graded one: a group of eight hopeless rollouts differing by ~2 HP produced 1.8x the gradient of a group containing an actual win (§2) |
+| **switching `normalise_advantages` off** | argued for in §2 on the standardisation distortion, then **refuted by measurement**: boss went flat (0.109 vs the control's 0.309) and drift from BC halved. Deferred to its own experiment; a std *floor* is the version worth testing. |
 | anchoring damage on the episode's own peak | the boss spawns in stages `16 -> 48 -> ~64`, so a rollout dying mid-spawn normalises its damage against 16 instead of 63 and outscores one that survived to full reveal for the same damage — rewarding early death, the exact failure mode. Use the task's `boss_hp_start`. |
 | grading `kill` by enemy HP as well | `live_slots()` makes it easy, but `kill` runs at 85% — its degeneracy is on the *success* side, which phase 2 already handles |
 | raising G instead | tails fall slowly and cost is linear; [0004](0004-grpo-experiment-plan.md) §5 |

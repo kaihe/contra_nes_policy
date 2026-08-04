@@ -41,13 +41,14 @@ rollout:
   # update, because the mean over a batch that is 70% zeros is 0.3x the mean over the
   # survivors, so the effective step size would track task difficulty.
   filter_groups: true
-  # RLOO's raw difference, NOT GRPO-as-published — because the reward is graded.
-  # Dividing by the group's std was harmless under a binary reward (every non-degenerate
-  # group had the same {0,1} spread), but with partial credit a group of eight hopeless
-  # rollouts differing by ~2 boss HP gets standardised up to +2.31 while a group
-  # containing an actual win gets +1.26. Unnormalised, the win leads 0.54 to 0.02.
-  # doc/0005 §2.
-  normalise_advantages: false
+  # GRPO as published. Switching this off looked right on paper — with a graded reward,
+  # standardising a group of eight hopeless rollouts differing by ~2 boss HP inflates it
+  # to +2.31 against +1.26 for a group containing a real win — but the run that tried it
+  # (2026-08-03/18-54-05) went flat on boss where the control climbed 0.128 -> 0.309, and
+  # drifted only half as far from BC (kl_ref 0.016 vs 0.030). Unnormalised advantages
+  # also down-weight boss specifically: an all-failure group contributes ~0.05-scale
+  # deviations against ~0.5 for one containing wins. doc/0005 §2.
+  normalise_advantages: true
   batch_size: 16                  # emulator slots in flight
   budget_mult: 2.0                # must stay bit-identical to contra_nes_evaluation
   min_budget: 24
