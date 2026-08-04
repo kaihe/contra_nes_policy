@@ -1,19 +1,21 @@
 # Compile the shared policy core, then gate boundary-safe varlen packing
 
-Status: Proposed
+Status: Implemented (experimental paths retained, defaults rejected)
 Supersedes: —
 
 **Question.** Which training-efficiency changes should the next base-policy run test
 if every optimization must also be useful in on-policy RL, where frame tokens cannot
 be precomputed?
 
-**Answer.** Run two controlled optimizations in order. First compile the causal core
+**Answer.** We ran two controlled optimizations in order. First compile the causal core
 with dynamic sequence length while leaving batching unchanged. Then test true packed
 episodes through a variable-length FlashAttention kernel using cumulative sequence
 boundaries. Keep each change only if it improves steady-state end-to-end throughput by
 at least 10% without changing task isolation, checkpoint format, loss, or closed-loop
-behavior. Do not build a cached-encoder-token path: it accelerates BC only and therefore
-optimizes a data path RL cannot use.
+behavior. Neither cleared that gate in the 500-step BC measurement, so both remain
+explicitly opt-in and the next base-policy run stays eager/padded. Do not build a
+cached-encoder-token path: it accelerates BC only and therefore optimizes a data path
+RL cannot use.
 
 ---
 
@@ -181,6 +183,43 @@ baseline and finishes unchanged.
 6. Run a short fixed-token training comparison and closed-loop evaluation before making
    either switch a default. Update this doc to `Implemented` only for the optimizations
    that pass their gates; record rejected results here rather than deleting them.
+
+## 6. Implementation and measured result (2026-08-04)
+
+Both execution paths are implemented behind the same keys in BC and GRPO. Compilation
+wraps an unregistered callable, leaving the raw eager core as checkpoint owner; strict
+cross-load and absence of `_orig_mod` keys are tested. Varlen batches concatenate raw
+frames before the encoder, carry `seq_len`/`cu_seqlens`, reset RoPE positions per
+episode and call the autograd-enabled ATen varlen FlashAttention operator. The same
+layout is wired through BC, GRPO minibatches and rollout token histories. PyTorch 2.9
+does not yet expose the public `torch.nn.attention.varlen` API, so the CUDA call is an
+explicit version-sensitive boundary in `causal.py`; CPU uses an independent-segment
+reference implementation for correctness tests.
+
+The controlled BC benchmark used the same checkpoint, seed, batch schedule, batch size
+4, BF16, RTX 4090 Laptop GPU, 20 warm-up steps and 500 measured update steps. Every
+timing includes DataLoader acquisition, transfer, encoder, core, backward and optimizer.
+
+| run | useful tok/s | vs E | median ms | p90 ms | peak GB | padding | graphs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E eager/padded | 2,229 | — | 106.9 | 431.1 | 2.747 | 4.19% | — |
+| C compiled/padded | 2,271 | +1.9% | 105.8 | 449.6 | 2.747 | 4.19% | 1 |
+| V eager/varlen | 2,269 | +1.8% | 117.8 | 364.9 | 2.710 | 0% | — |
+| CV compiled/varlen | 2,206 | -1.0% | 113.3 | 392.0 | 2.710 | 0% | 2 |
+
+Compile warm-up cost 14.8 seconds for C and 12.7 seconds for CV. Mean loss stayed
+within 0.001 across variants (0.1840-0.1850); mean gradient norm stayed within 0.04
+(1.76-1.80). The complete test suite passes, including packed-versus-independent core
+and whole-policy equivalence, task-boundary isolation, packed GRPO advantage mapping and
+checkpoint transparency.
+
+**Decision.** Reject both as defaults for the next base-policy run. C and V each gain
+about 2%, far below the 10% maintenance gate, and CV is slightly slower. The 100-step
+exploration misleadingly suggested roughly 20% gains because periodic loader stalls
+dominated such a short wall-clock sample; the planned 500-step result is authoritative.
+The opt-in paths stay available to benchmark GRPO update and rollout phases, but no RL
+speed or closed-loop-quality claim is made yet. GPU utilization was not sampled during
+this run; peak allocation is reported above.
 
 No other repository is blocked on this experiment, so no handoff issue is required.
 

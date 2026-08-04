@@ -152,7 +152,8 @@ class TokenHistoryActor:
     """
 
     def __init__(self, model, batch_size: int, *, device: torch.device,
-                 temperature: float = 1.0, seed: int = 0, precision: str = "bf16"):
+                 temperature: float = 1.0, seed: int = 0, precision: str = "bf16",
+                 attention_layout: str = "padded"):
         self.model = model
         self.batch_size = batch_size
         self.device = device
@@ -164,6 +165,7 @@ class TokenHistoryActor:
         self.generator = torch.Generator(device=device).manual_seed(int(seed))
         self.d = model.encoder.cfg.hiddim
         self.prefix = 2
+        self.attention_layout = attention_layout
         self.frames: List[Optional[torch.Tensor]] = [None] * batch_size
         self.goal: List[Optional[torch.Tensor]] = [None] * batch_size
         self.inter: List[Optional[torch.Tensor]] = [None] * batch_size
@@ -225,6 +227,19 @@ class TokenHistoryActor:
 
     def _core_over_histories(self, active: Sequence[int]) -> torch.Tensor:
         """Left-align each slot's history into a padded batch and read its last step."""
+        if self.attention_layout == "varlen":
+            segments = [torch.cat([self.inter[i], self.goal[i], self.frames[i]], dim=0)
+                        for i in active]
+            lengths = torch.tensor([x.shape[0] for x in segments], device=self.device,
+                                   dtype=torch.int32)
+            if int(lengths.max()) > self.model.context:
+                raise RuntimeError("rollout history exceeds policy context")
+            cu = torch.cat([torch.zeros(1, device=self.device, dtype=torch.int32),
+                            lengths.cumsum(0).to(torch.int32)])
+            h = self.model._run_core_varlen(
+                torch.cat(segments, dim=0), cu, int(lengths.max()))
+            return self.model.pi_head(h[cu[1:].long() - 1])
+
         lens = [int(self.frames[i].shape[0]) for i in active]
         max_t = max(lens)
         L = self.prefix + max_t
@@ -246,7 +261,9 @@ class TokenHistoryActor:
             n = self.prefix + t
             attn[k, 0, :n, :n] = idx[:n, None] >= idx[None, :n]
             last[k] = n - 1
-        h = self.model.core(x, attn_mask=attn)
+        # Route through the policy execution wrapper so rollout and optimiser updates
+        # test the same compiled core. The raw registered core still owns checkpoints.
+        h = self.model._run_core(x, attn_mask=attn)
         h_last = h.gather(1, last.view(b, 1, 1).expand(b, 1, self.d)).squeeze(1)
         return self.model.pi_head(h_last)
 
@@ -336,7 +353,8 @@ class EpisodeCollector:
                  temperature: float = 1.0, precision: str = "bf16", seed: int = 0,
                  reward: Optional[Dict[str, float]] = None,
                  max_episode_steps: int = 0, stop_on_death: bool = True,
-                 collect_goal_points: bool = True, owner: str = "EpisodeCollector"):
+                 collect_goal_points: bool = True, owner: str = "EpisodeCollector",
+                 attention_layout: str = "padded"):
         catalog.assert_split("train")
         self.catalog = catalog
         self.sampler = sampler
@@ -350,7 +368,8 @@ class EpisodeCollector:
         self.reward = {"success": 1.0, "death": 0.0, "timeout": 0.0, "step": 0.0,
                        "truncated": 0.0, "progress_coef": 0.0, **(reward or {})}
         self.actor = TokenHistoryActor(model, batch_size, device=device,
-                                  temperature=temperature, seed=seed, precision=precision)
+                                  temperature=temperature, seed=seed, precision=precision,
+                                  attention_layout=attention_layout)
         self._vectors = actions_np(np.uint8)
         self._die = None
         self._makers: Dict[str, object] = {}

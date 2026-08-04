@@ -131,21 +131,34 @@ class GroupBatch:
     """
 
     def __init__(self, episodes: Sequence[Episode], advantages: np.ndarray,
-                 device: Optional[torch.device] = None):
+                 device: Optional[torch.device] = None, layout: str = "padded"):
         b = len(episodes)
-        t = max(len(e) for e in episodes)
-        s = episodes[0].frames.shape[1]
-
-        image = np.zeros((b, t, s, s, 3), dtype=np.uint8)
-        action = np.zeros((b, t), dtype=np.int64)
-        logprob = np.zeros((b, t), dtype=np.float32)
-        mask = np.zeros((b, t), dtype=np.float32)
-        for i, e in enumerate(episodes):
-            n = len(e)
-            image[i, :n] = e.frames
-            action[i, :n] = e.actions
-            logprob[i, :n] = e.logprobs
-            mask[i, :n] = 1.0
+        self.layout = layout
+        self.n_episodes = b
+        lengths = np.asarray([len(e) for e in episodes], dtype=np.int64)
+        if layout == "varlen":
+            image = np.concatenate([e.frames for e in episodes], axis=0)
+            action = np.concatenate([e.actions for e in episodes], axis=0)
+            logprob = np.concatenate([e.logprobs for e in episodes], axis=0)
+            mask = np.ones(int(lengths.sum()), dtype=np.float32)
+            self.episode_index = torch.from_numpy(
+                np.repeat(np.arange(b, dtype=np.int64), lengths))
+        elif layout == "padded":
+            t = int(lengths.max())
+            s = episodes[0].frames.shape[1]
+            image = np.zeros((b, t, s, s, 3), dtype=np.uint8)
+            action = np.zeros((b, t), dtype=np.int64)
+            logprob = np.zeros((b, t), dtype=np.float32)
+            mask = np.zeros((b, t), dtype=np.float32)
+            for i, e in enumerate(episodes):
+                n = len(e)
+                image[i, :n] = e.frames
+                action[i, :n] = e.actions
+                logprob[i, :n] = e.logprobs
+                mask[i, :n] = 1.0
+            self.episode_index = None
+        else:
+            raise ValueError(f"unknown attention layout {layout!r}")
 
         self.image = torch.from_numpy(image)
         self.goal_image = torch.from_numpy(
@@ -155,6 +168,7 @@ class GroupBatch:
         self.action = torch.from_numpy(action)
         self.old_logprob = torch.from_numpy(logprob)
         self.mask = torch.from_numpy(mask)
+        self.seq_len = torch.from_numpy(lengths)
         # One scalar per episode, broadcast over its steps at use. Broadcasting rather
         # than materialising keeps it obvious that there is no per-step credit here.
         self.advantage = torch.from_numpy(advantages.astype(np.float32))
@@ -165,8 +179,10 @@ class GroupBatch:
 
     def to(self, device: torch.device) -> "GroupBatch":
         for k in ("image", "goal_image", "interaction", "action", "old_logprob",
-                  "mask", "advantage", "reward"):
-            setattr(self, k, getattr(self, k).to(device, non_blocking=True))
+                  "mask", "advantage", "reward", "seq_len", "episode_index"):
+            value = getattr(self, k)
+            if value is not None:
+                setattr(self, k, value.to(device, non_blocking=True))
         return self
 
     @property
@@ -174,12 +190,13 @@ class GroupBatch:
         return int(self.mask.sum())
 
     def __len__(self) -> int:
-        return int(self.mask.shape[0])
+        return self.n_episodes
 
 
 def iter_minibatches(episodes: Sequence[Episode], advantages: np.ndarray,
                      minibatch_episodes: int, rng: np.random.Generator,
-                     device: Optional[torch.device] = None):
+                     device: Optional[torch.device] = None,
+                     layout: str = "padded"):
     """Shuffle **episodes**, never steps.
 
     An episode is one sequence to the causal core; splitting it across minibatches would
@@ -195,7 +212,8 @@ def iter_minibatches(episodes: Sequence[Episode], advantages: np.ndarray,
     for start in range(0, len(order), minibatch_episodes):
         idx = order[start:start + minibatch_episodes]
         idx = idx[np.argsort([len(episodes[i]) for i in idx], kind="stable")]
-        yield GroupBatch([episodes[i] for i in idx], advantages[idx], device=device)
+        yield GroupBatch([episodes[i] for i in idx], advantages[idx], device=device,
+                         layout=layout)
 
 
 def filter_groups(episodes: Sequence[Episode], eps: float = 1e-4

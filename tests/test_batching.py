@@ -14,7 +14,7 @@ import os
 import pytest
 import torch
 
-from contra_policy.dataset import LengthGroupedSampler, pad_episodes
+from contra_policy.dataset import LengthGroupedSampler, pack_episodes, pad_episodes
 
 
 def _lengths(n=800, seed=0):
@@ -114,6 +114,14 @@ def test_interaction_collapses_to_one_id_per_episode():
 def test_goal_image_is_one_per_episode_with_no_time_axis():
     out = pad_episodes([_ep(4, fam=1), _ep(6, fam=2)])
     assert out["cross_view"]["cross_view_image"].shape[0] == 2
+    assert out["family"].tolist() == [1, 2]
+
+
+def test_pack_episodes_removes_padding_and_keeps_boundaries():
+    out = pack_episodes([_ep(3, fam=1), _ep(7, fam=2)])
+    assert out["image"].shape[0] == 10
+    assert out["action"].shape == (10,)
+    assert out["seq_len"].tolist() == [3, 7]
     assert out["family"].tolist() == [1, 2]
 
 

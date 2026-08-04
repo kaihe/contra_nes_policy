@@ -101,6 +101,14 @@ class GRPOTrainer:
         # -- policy, and a frozen copy of where it started ---------------------
         self.policy = load_policy(args.init_from, map_location="cpu").to(self.device)
         self.cfg = GRPOConfig(**OmegaConf.to_container(args.grpo, resolve=True))
+        perf = args.get("performance", {})
+        compile_core = bool(perf.get("compile_core", False))
+        compile_dynamic = bool(perf.get("compile_dynamic", True))
+        self.attention_layout = str(perf.get("attention_layout", "padded"))
+        if self.attention_layout not in ("padded", "varlen"):
+            raise ValueError(f"unknown attention layout {self.attention_layout!r}")
+        if compile_core:
+            self.policy.compile_core(dynamic=compile_dynamic)
         self.ref = None
         if self.cfg.kl_coef > 0:
             # Not optional on measured grounds: the previous PPO run left this at zero
@@ -110,11 +118,14 @@ class GRPOTrainer:
             for p in self.ref.parameters():
                 p.requires_grad = False
             self.ref.eval()
+            if compile_core:
+                self.ref.compile_core(dynamic=compile_dynamic)
 
         n = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         print(f"[grpo] {n/1e6:.2f}M trainable · G={int(args.rollout.group_size)} · "
               f"reference KL {'on' if self.ref else 'OFF'} · "
-              f"filtering {'on' if args.rollout.filter_groups else 'OFF'}", flush=True)
+              f"filtering {'on' if args.rollout.filter_groups else 'OFF'} · "
+              f"core {'compiled' if compile_core else 'eager'}", flush=True)
 
         # -- data ------------------------------------------------------------
         self.catalog = TaskCatalog(
@@ -153,7 +164,8 @@ class GRPOTrainer:
             seed=int(args.seed),
             reward=OmegaConf.to_container(args.reward, resolve=True),
             max_episode_steps=int(args.rollout.max_episode_steps),
-            collect_goal_points=False, owner="GRPOTrainer")
+            collect_goal_points=False, owner="GRPOTrainer",
+            attention_layout=self.attention_layout)
 
         self.optimizer = torch.optim.AdamW(
             [p for p in self.policy.parameters() if p.requires_grad],
@@ -266,6 +278,10 @@ class GRPOTrainer:
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null())
         with ctx:
+            if batch.layout == "varlen":
+                return model.forward_varlen(
+                    batch.image, batch.goal_image, batch.interaction,
+                    batch.seq_len)["pi_logits"]
             return model(batch.image, batch.goal_image, batch.interaction)["pi_logits"]
 
     def train_on(self, episodes, advantages) -> Dict[str, float]:
@@ -273,7 +289,8 @@ class GRPOTrainer:
         for _ in range(int(self.args.train.epochs)):
             for batch in iter_minibatches(
                     episodes, advantages,
-                    int(self.args.train.minibatch_episodes), self.rng, self.device):
+                    int(self.args.train.minibatch_episodes), self.rng, self.device,
+                    layout=self.attention_layout):
                 logits = self._forward_logits(batch, self.policy)
                 ref_logits = None
                 if self.ref is not None:

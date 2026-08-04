@@ -21,6 +21,12 @@ seed: 0
 device: cuda
 precision: bf16
 
+# Execution-only switches shared with BC. They do not alter checkpoint structure.
+performance:
+  compile_core: false
+  compile_dynamic: true
+  attention_layout: padded  # padded | varlen (Factor B; implemented separately)
+
 # ── rollout ───────────────────────────────────────────────────────────────────
 rollout:
   # G. A group is the unit: one task, G rollouts from a bit-identical savestate, and
