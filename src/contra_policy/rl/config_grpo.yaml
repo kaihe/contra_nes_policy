@@ -4,8 +4,9 @@ hydra:
   job:
     chdir: true
 
-# The BC policy this fine-tunes, and the frozen reference the KL pulls towards.
-init_from: ${hydra:runtime.cwd}/runs/bc/2026-08-01/09-05-44/checkpoints/policy-final.pt
+# Completed action-only GPT base policy trained on boss-full-v1. This initializes both
+# the trainable policy and the frozen reference used by the KL term.
+init_from: ${hydra:runtime.cwd}/runs/bc/2026-08-04/15-19-58/checkpoints/policy-final.pt
 
 task_root: ~/code/contra_nes_data/game_trace/tasks
 shard_dir: ~/code/contra_nes_data/game_trace/hf
