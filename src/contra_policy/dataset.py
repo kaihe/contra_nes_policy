@@ -40,6 +40,7 @@ window and no sampling (or its retry logic) is needed.
 from __future__ import annotations
 
 import collections
+import glob
 import hashlib
 import io
 import json
@@ -159,8 +160,8 @@ class ContraCrossViewDataset(Dataset):
     ``prev_action``             (T,) int64            action that produced this frame
     ``prev_action_dropout``     (T,) float32          1 = use it, 0 = "unknown" embedding
     ``action``                  (T,) int64            BC target: action taken *from* it
-    ``goal_heatmap``            (T, A, A) float32     aux target the head trains on
-    ``exist`` / ``point``       (T,) (T,2) float32    aux *metrics* only, [0,1] screen
+    ``goal_heatmap``            (T, A, A) float32     optional when ``aux_size > 0``
+    ``exist`` / ``point``       (T,) (T,2) float32    optional with the heatmap target
     ``mask``                    (T,) float32          1 on real steps, 0 on tail padding
     ``first``                   (T,) bool             True at t=0 of an episode's first
                                                       window — resets attention memory
@@ -375,24 +376,23 @@ class ContraCrossViewDataset(Dataset):
         # `boss` (100.0% goal-visible) literally no negative examples; a heatmap makes
         # every pixel outside the blob a negative on every frame.
         A = self.aux_size
-        exist = np.zeros(T, dtype=np.float32)
-        point = np.zeros((T, 2), dtype=np.float32)
-        heatmap = np.zeros((T, A, A), dtype=np.float32)
-        # How many centroids the goal has on this frame. `points_to_target` collapses
-        # them to their *mean*, which is a well-defined target only when there is one.
-        # Boss goals span all live components — 4.6 on average, spread ~34 px — so on
-        # those frames `point` names a spot where nothing is, and any error measured
-        # against it grows as a predictor gets sharper. Consumers must gate on this.
-        n_goal_points = np.zeros(T, dtype=np.int64)
-        centroids, visibility = meta["centroids"], meta["visibility"]
-        for k in range(n):
-            j = start + k
-            if j >= len(centroids) or not visibility[j] or not centroids[j]:
-                continue
-            exist[k] = 1.0
-            point[k], _bbox = points_to_target(centroids[j])
-            n_goal_points[k] = len(centroids[j])
-            heatmap[k] = goal_mask(centroids[j], A, self.sigma_px)
+        exist = point = heatmap = n_goal_points = None
+        if A > 0:
+            exist = np.zeros(T, dtype=np.float32)
+            point = np.zeros((T, 2), dtype=np.float32)
+            heatmap = np.zeros((T, A, A), dtype=np.float32)
+            # How many centroids the goal has on this frame. `points_to_target`
+            # collapses them to their mean, which is well-defined only for one target.
+            n_goal_points = np.zeros(T, dtype=np.int64)
+            centroids, visibility = meta["centroids"], meta["visibility"]
+            for k in range(n):
+                j = start + k
+                if j >= len(centroids) or not visibility[j] or not centroids[j]:
+                    continue
+                exist[k] = 1.0
+                point[k], _bbox = points_to_target(centroids[j])
+                n_goal_points[k] = len(centroids[j])
+                heatmap[k] = goal_mask(centroids[j], A, self.sigma_px)
 
         # Per-class entity occupancy, off by default so the BC path pays nothing for it.
         # `entities` is absent from shards exported before 2026-07-30; an all-zero target
@@ -400,6 +400,8 @@ class ContraCrossViewDataset(Dataset):
         # check `entities_available` rather than train on silence.
         entity = goal_entity = None
         if self.want_entities:
+            if A <= 0:
+                raise ValueError("want_entities requires aux_size > 0")
             C = len(self.ENTITY_CLASSES)
             entity = np.zeros((T, C, A, A), dtype=np.float32)
             ent = meta.get("entities")
@@ -442,14 +444,17 @@ class ContraCrossViewDataset(Dataset):
             "prev_action": torch.from_numpy(prev),
             "prev_action_dropout": torch.from_numpy(keep),
             "action": torch.from_numpy(act),
-            "exist": torch.from_numpy(exist),
-            "point": torch.from_numpy(point),
-            "goal_heatmap": torch.from_numpy(heatmap),
-            "n_goal_points": torch.from_numpy(n_goal_points),
             "mask": torch.from_numpy(mask),
             "first": torch.from_numpy(first),
             "family": torch.tensor(FAMILIES.index(ep["family"]), dtype=torch.int64),
         }
+        if heatmap is not None:
+            out.update({
+                "exist": torch.from_numpy(exist),
+                "point": torch.from_numpy(point),
+                "goal_heatmap": torch.from_numpy(heatmap),
+                "n_goal_points": torch.from_numpy(n_goal_points),
+            })
         if entity is not None:
             out["entity_heatmap"] = torch.from_numpy(entity)
         if goal_entity is not None:
@@ -471,9 +476,20 @@ def _worker_init(worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
-def shard_paths(shard_dir: str, configs: Sequence[str], split: str) -> List[str]:
-    """``<shard_dir>/<config>-<split>-00000.tar`` for each config."""
-    return [os.path.join(shard_dir, f"{c}-{split}-00000.tar") for c in configs]
+def shard_paths(shard_dir: str, configs: Sequence[str], split: str,
+                overrides: Dict[str, str] | None = None) -> List[str]:
+    """Resolve every family shard, with optional family-specific directories.
+
+    Missing families retain the old deterministic ``00000`` path so the caller raises
+    a useful ``FileNotFoundError`` instead of silently training without that family.
+    """
+    overrides = overrides or {}
+    paths: List[str] = []
+    for family in configs:
+        root = os.path.expanduser(overrides.get(family, shard_dir))
+        matches = sorted(glob.glob(os.path.join(root, f"{family}-{split}-*.tar")))
+        paths.extend(matches or [os.path.join(root, f"{family}-{split}-00000.tar")])
+    return paths
 
 
 def family_weights(index: List[dict], alpha: float) -> np.ndarray:

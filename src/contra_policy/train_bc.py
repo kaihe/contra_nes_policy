@@ -3,20 +3,10 @@
     python -m contra_policy.train_bc
     python -m contra_policy.train_bc train.steps=200 loader.num_workers=0   # smoke
 
-**The gate is `val/bc_acc` against 0.76**, the number the previous windowed recurrent
-policy reached. That is what decides whether 0002's bet holds: a plain causal
-transformer over whole episodes learning this as well as a Transformer-XL over a
-32-step window with carried memory.
-
-It is a *proxy*, deliberately. The number that matters is task completion against
-72.8%, which needs closed-loop rollout in ``contra_nes_evaluation`` and cannot be
-measured here. The two can disagree — the `prev_action` ablation barely moved accuracy
-while collapsing boss completion 8.8% → 1.8% — so a passing `bc_acc` licenses the next
-step, not the conclusion.
-
-Per-family accuracy matters more than the pooled figure: `traverse` is 65% of training
-steps and the family already handled best, so a pooled move says little about where it
-came from.
+The base-policy contract is deliberately GPT-like: masked action cross-entropy is the
+only objective, and its optimisation telemetry matches ``build-nanogpt``. Closed-loop
+task completion remains an evaluation job; offline diagnostic heads and accuracies do
+not belong to this trainer. See ``doc/0006-action-only-base-policy.md``.
 
 The encoder is **frozen by default**. That makes the causal core the only thing that
 changed, so a bad number is unambiguously its fault rather than a co-adaptation between
@@ -30,6 +20,7 @@ import math
 import os
 import signal
 import time
+from collections import Counter
 from typing import Dict, List, Optional
 
 import hydra
@@ -38,9 +29,9 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset, LengthGroupedSampler,
+from contra_policy.dataset import (ContraCrossViewDataset, LengthGroupedSampler,
                                    load_or_build_index, pad_episodes, shard_paths)
-from contra_policy.loss import ContraObjective, action_class_weights
+from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
 
 
@@ -87,6 +78,16 @@ def _model_tokens(batch: Dict) -> int:
     return int(batch_size) * (int(padded_frames) + PREFIX)
 
 
+def _require_family_counts(index: List[dict], expected: Dict, split: str) -> None:
+    """Refuse a silently incomplete or accidentally duplicated release."""
+    actual = Counter(ep["family"] for ep in index)
+    for family, count in expected.items():
+        if actual[family] != int(count):
+            raise ValueError(
+                f"{split} family {family!r}: expected {int(count)} episodes, "
+                f"resolved {actual[family]}")
+
+
 class BCTrainer:
     def __init__(self, args: DictConfig, run_dir: str):
         self.args, self.run_dir = args, run_dir
@@ -99,8 +100,15 @@ class BCTrainer:
         # -- data ------------------------------------------------------------
         shard_dir = os.path.expanduser(args.shard_dir)
         fams = list(args.families)
-        train_idx = load_or_build_index(shard_paths(shard_dir, fams, "train"), args.cache_dir)
-        val_idx = load_or_build_index(shard_paths(shard_dir, fams, "val"), args.cache_dir)
+        overrides = {k: os.path.expanduser(str(v))
+                     for k, v in dict(args.get("shard_overrides", {})).items()}
+        train_tars = shard_paths(shard_dir, fams, "train", overrides)
+        val_tars = shard_paths(shard_dir, fams, "val", overrides)
+        train_idx = load_or_build_index(train_tars, args.cache_dir)
+        val_idx = load_or_build_index(val_tars, args.cache_dir)
+        expected = args.get("expected_episodes", {})
+        _require_family_counts(train_idx, dict(expected.get("train", {})), "train")
+        _require_family_counts(val_idx, dict(expected.get("val", {})), "val")
         ds_kw = dict(whole_episode=True, image_size=int(args.image_size),
                      sigma_px=float(args.sigma_px), aux_size=int(args.policy.aux_size),
                      prev_action_keep_prob=0.0, seed=int(args.seed))
@@ -110,9 +118,6 @@ class BCTrainer:
         self.train_len = [max(1, e["length"] - 1) for e in train_idx]
         self.val_len = [max(1, e["length"] - 1) for e in val_idx]
 
-        counts = np.zeros(21, dtype=np.int64)
-        for ep in train_idx:
-            counts += np.asarray(ep["action_counts"], dtype=np.int64)
         longest = max(self.train_len + self.val_len)
         print(f"[bc] {len(train_idx)} train / {len(val_idx)} val episodes · "
               f"longest {longest} frames", flush=True)
@@ -131,18 +136,7 @@ class BCTrainer:
               f"({'frozen' if pcfg.freeze_encoder else 'TRAINABLE'} encoder) · "
               f"context {self.policy.context}", flush=True)
 
-        modal = int(counts.argmax())
-        print(f"[bc] modal action is index {modal} at {counts[modal]/counts.sum():.1%} "
-              f"of train steps — a constant predictor would score that as bc_acc, so "
-              f"watch bc_bal_acc and pred_modal_frac beside it", flush=True)
-        w = action_class_weights(counts, alpha=float(args.loss.action_loss_alpha))
-        self.objective = ContraObjective(
-            bc_weight=float(args.loss.bc_weight),
-            heatmap_weight=float(args.loss.heatmap_weight),
-            heatmap_pos_weight=float(args.loss.heatmap_pos_weight),
-            label_smoothing=float(args.loss.label_smoothing),
-            class_weights=None if w is None else w.to(self.device),
-            families=tuple(FAMILIES), modal_action=modal).to(self.device)
+        self.objective = BehaviorCloneLoss(diagnostics=False).to(self.device)
 
         self.optimizer = torch.optim.AdamW(
             [p for p in self.policy.parameters() if p.requires_grad],
@@ -154,7 +148,7 @@ class BCTrainer:
         self.logger = CSVLogger(os.path.join(run_dir, "metrics.csv"))
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         self.step = 0
-        self.best = -1.0
+        self.best = math.inf
 
     # -- plumbing -----------------------------------------------------------
 
@@ -198,7 +192,7 @@ class BCTrainer:
 
     # -- the loop -----------------------------------------------------------
 
-    def train_step(self, batch: Dict) -> Dict[str, float]:
+    def train_step(self, batch: Dict) -> tuple[Dict[str, float], int]:
         self.policy.train()
         if self.policy.cfg.freeze_encoder:
             self.policy.encoder.eval()      # keep frozen norms in inference mode
@@ -216,11 +210,8 @@ class BCTrainer:
         self.scheduler.step()
 
         row = {k: float(v) for k, v in metrics.items()}
-        row.update({"grad_norm": float(gn), "lr": self.optimizer.param_groups[0]["lr"],
-                    "frames": float(batch["mask"].sum()),
-                    "tokens": float(_model_tokens(batch)),
-                    "pad_frac": 1.0 - float(batch["mask"].mean())})
-        return row
+        row.update({"grad_norm": float(gn), "lr": self.optimizer.param_groups[0]["lr"]})
+        return row, _model_tokens(batch)
 
     @torch.no_grad()
     def validate(self, max_batches: int = 0) -> Dict[str, float]:
@@ -235,26 +226,23 @@ class BCTrainer:
 
     def run(self) -> None:
         total = int(self.args.train.steps)
-        t0, seen_frames, seen_tokens = time.time(), 0.0, 0.0
         try:
             while self.step < total:
                 for batch in self._loader(self.train_ds, self.train_len, shuffle=True):
                     if self.step >= total:
                         break
-                    row = self.train_step(batch)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    t0 = time.perf_counter()
+                    row, tokens = self.train_step(batch)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    elapsed = max(1e-9, time.perf_counter() - t0)
                     self.step += 1
-                    seen_frames += row["frames"]
-                    seen_tokens += row["tokens"]
                     if self.step % int(self.args.train.log_every) == 0:
-                        # CUDA launches asynchronously. Synchronise before stopping the
-                        # clock or throughput measures Python enqueue speed, not GPU work.
-                        if self.device.type == "cuda":
-                            torch.cuda.synchronize(self.device)
-                        elapsed = max(1e-9, time.time() - t0)
                         row["step"] = self.step
-                        row["frames_per_s"] = seen_frames / elapsed
-                        row["tokens_per_sec"] = seen_tokens / elapsed
-                        t0, seen_frames, seen_tokens = time.time(), 0.0, 0.0
+                        row["step_ms"] = elapsed * 1000.0
+                        row["tokens_per_sec"] = tokens / elapsed
                         self._emit(row, "train")
                     if self.step % int(self.args.train.val_every) == 0:
                         self._run_val(int(self.args.train.val_batches))
@@ -267,33 +255,22 @@ class BCTrainer:
         v = self.validate(batches)
         v["step"] = self.step
         self._emit(v, tag)
-        acc = v.get("bc_acc", -1.0)
-        if acc > self.best:
-            self.best = acc
+        val_loss = v["loss"]
+        if val_loss < self.best:
+            self.best = val_loss
             self.save(best=True)
 
     def _emit(self, row: Dict[str, float], phase: str) -> None:
         self.logger.log({**row, "phase": phase})
         head = [f"{k}={row[k]:.4g}" for k in
-                ("loss", "bc_acc", "bc_bal_acc", "bc_nonmodal_acc", "pred_modal_frac",
-                 "point_err_px") if k in row]
+                ("loss", "lr", "grad_norm", "step_ms", "tokens_per_sec") if k in row]
         line = f"[{phase} {self.step}/{int(self.args.train.steps)}] " + " ".join(head)
-        for k in ("tokens_per_sec", "frames_per_s", "pad_frac"):
-            if k in row:
-                line += f" {k}={row[k]:.3g}"
         print(line, flush=True)
-        # Per family, because traverse is 65% of steps and the family already handled
-        # best — a pooled move says little about where it came from.
-        fam = [f"{f}({row[f'{f}/bc_acc']:.3f})" for f in FAMILIES
-               if f"{f}/bc_acc" in row]
-        if fam:
-            print("    bc_acc: " + " ".join(fam)
-                  + "   [gate 0.76; constant-R scores 0.68]", flush=True)
 
     def save(self, final: bool = False, best: bool = False) -> str:
         tag = "final" if final else ("best" if best else f"{self.step:06d}")
         path = os.path.join(self.run_dir, "checkpoints", f"policy-{tag}.pt")
-        self.policy.save(path, step=self.step, best_bc_acc=self.best,
+        self.policy.save(path, step=self.step, best_val_loss=self.best,
                          train_config=OmegaConf.to_container(self.args, resolve=True))
         return path
 

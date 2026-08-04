@@ -1,6 +1,6 @@
 # Train the base policy as an action-only GPT on the full-fight boss release
 
-Status: Proposed
+Status: Implemented
 Supersedes: —
 
 **Question.** What should the next base-policy checkpoint learn, report, and read now
@@ -134,6 +134,11 @@ silently change its weight.
    `contra_nes_evaluation`. That result, not this implementation commit, decides whether
    the new base policy is better.
 
+Implementation verification on 2026-08-04 resolved 666/57 boss train/validation
+episodes from the configured paths, passed 131 tests, and completed one GPU training
+step plus one validation batch against the real shards. Full training and closed-loop
+evaluation remain future experiment work, not implementation gates.
+
 ---
 
 ## Appendix — provenance
@@ -146,3 +151,5 @@ silently change its weight.
 | the release has 666 train episodes in three shards and a frozen 57-episode validation shard | `/home/kaihe/code/contra_nes_data/doc/0001-boss-search-curriculum.md`, §7 |
 | shard membership, hashes and validation SHA | `/home/kaihe/code/contra_nes_data/game_trace/releases/boss-full-v1/manifest.json` |
 | `boss-full-v1` is built on data commit `db62a0c` | `git -C /home/kaihe/code/contra_nes_data rev-parse HEAD` on 2026-08-04 |
+| configured routing resolves 7,104 train / 846 validation episodes, including 666/57 boss | real index smoke on 2026-08-04; cache fingerprints `856541e18109970a` and `74f1d9241b4180e1` |
+| implementation passes 131 tests and a real GPU train/validation step | `pytest -q`; one-batch `BCTrainer` smoke on 2026-08-04 |

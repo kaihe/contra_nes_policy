@@ -9,6 +9,14 @@ hydra:
 # episode, so windows are no longer the unit — and padding every episode to the context
 # would be 201 MB of uint8 frames per item.
 shard_dir: ~/code/contra_nes_data/game_trace/hf
+# boss-full-v1 already contains the 466 published boss episodes plus 200 new
+# full-fight wins. Override rather than append, or the baseline would be duplicated.
+shard_overrides:
+  boss: ~/code/contra_nes_data/game_trace/releases/boss-full-v1/hf
+# Pin the release contract so a missing shard or duplicated baseline fails at startup.
+expected_episodes:
+  train: {boss: 666}
+  val: {boss: 57}
 cache_dir: ${hydra:runtime.cwd}/cache
 families: [kill, item, traverse, boss]
 image_size: 256
@@ -21,11 +29,12 @@ precision: bf16           # bf16 | fp16 | fp32
 # ── policy ────────────────────────────────────────────────────────────────────
 policy:
   # Stage A's trained encoder. Frozen by default and that is the experiment: it makes
-  # the causal core the only thing that changed, so a bad bc_acc is unambiguously the
-  # core's fault. Unfreeze once the bet is confirmed.
+  # the causal core the only thing that changed, so a bad validation loss is the core's
+  # fault. Unfreeze once the bet is confirmed.
   encoder_ckpt: ${hydra:runtime.cwd}/runs/encoder/2026-07-31/18-00-11/checkpoints/encoder-final.pt
   freeze_encoder: true
-  aux_size: 32            # point_err_px is calibrated at 32
+  value_head: false       # BC has no value target; GRPO has no learned critic
+  aux_size: 0             # no heatmap head or geometric readout in the base policy
   # Images per encoder forward. A whole-episode batch is batch x T frames — 4 x 519 is
   # 2,076 at 256px. Chunking held the peak at 1.59 GB against 4.68 GB unchunked at 548,
   # so one long boss episode cannot OOM a run that was fine a step earlier.
@@ -44,24 +53,11 @@ policy:
     # d_model is taken from the encoder's hiddim; setting it here would be a second
     # source of truth for a number that must match.
 
-# ── loss ──────────────────────────────────────────────────────────────────────
-loss:
-  bc_weight: 1.0
-  label_smoothing: 0.0
-  # Reweights the 21-way action loss towards rare actions. 0 = off, which is the
-  # baseline the 0.76 gate was measured under.
-  action_loss_alpha: 0.0
-  # Grounding, now computed in the policy rather than the encoder — predicting where the
-  # goal is needs this frame compared against the goal token, which attention has just
-  # done. Keeps the aux signal the previous policy trained with.
-  heatmap_weight: 1.0
-  heatmap_pos_weight: 10.0
-
 # ── loader ────────────────────────────────────────────────────────────────────
 loader:
   # Episodes per batch. Frames per step is this times the batch's longest episode, so a
-  # boss batch is far heavier than an item batch. `tokens_per_sec` is dense GPT compute
-  # throughput; compare it with `frames_per_s` and `pad_frac` to see useful work vs padding.
+  # boss batch is far heavier than an item batch. `tokens_per_sec` follows Karpathy's
+  # dense GPT-compute convention and therefore includes padding and the two prefix tokens.
   batch_size: 4
   # LengthGroupedSampler sorts within a pool of this many batches rather than globally.
   # Global sorting would put every long episode together, and length correlates with
@@ -80,6 +76,5 @@ train:
   max_grad_norm: 1.0
   log_every: 50
   val_every: 1000
-  # Batches per in-run validation. 0 in `final_val` means the whole val set, which is
-  # what the gate is read off.
+  # Batches per in-run validation. 0 in `val_full` means the whole validation set.
   val_batches: 60

@@ -59,10 +59,14 @@ class PolicyConfig:
     encoder_ckpt: Optional[str] = None
     encoder: Optional[Dict] = None          # used only when encoder_ckpt is None
     #: Frozen for the first BC run *on purpose*: it makes the causal core the only
-    #: variable, so a bad `bc_acc` is unambiguously the core's fault rather than a
+    #: variable, so a bad validation loss is unambiguously the core's fault rather than a
     #: co-adaptation between two things that both changed.
     freeze_encoder: bool = True
-    aux_size: int = 32                      # goal-heatmap grid; point_err_px assumes 32
+    # Legacy checkpoints omit `value_head` and used aux_size=32, so these defaults must
+    # preserve their exact state-dict shape. New action-only checkpoints explicitly set
+    # value_head=false and aux_size=0.
+    value_head: bool = True
+    aux_size: int = 32                      # 0 disables the legacy goal-heatmap head
     #: Images per encoder forward. A whole-episode batch is batch x T frames — 4 x 321
     #: is 1,284 at 256px, which peaks near the 16 GB card. Chunking bounds the encoder's
     #: activation peak independently of how long the episodes in a batch happen to be,
@@ -91,11 +95,11 @@ class ContraPolicy(nn.Module):
 
         self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d)   # +1 for id -1
         self.pi_head = nn.Linear(d, NUM_ACTIONS)
-        self.value_head = nn.Linear(d, 1)
+        self.value_head = nn.Linear(d, 1) if cfg.value_head else None
         # Grounding lives here now, not in the encoder: predicting where the goal is
         # requires comparing this frame against the goal token, which is what attention
         # upstream has just done.
-        self.aux_head = nn.Linear(d, cfg.aux_size ** 2)
+        self.aux_head = nn.Linear(d, cfg.aux_size ** 2) if cfg.aux_size > 0 else None
 
     @property
     def context(self) -> int:
@@ -135,13 +139,14 @@ class ContraPolicy(nn.Module):
         h = self.core(torch.cat([inter, goal, frames], dim=1), attn_mask=attn_mask)
         h = h[:, PREFIX:]                                        # frame positions only
 
-        heat = self.aux_head(h).view(b, t, self.cfg.aux_size, self.cfg.aux_size)
-        point, exist = heatmap_readout(heat)
-        return {"pi_logits": self.pi_head(h),
-                "vpred": self.value_head(h).squeeze(-1),
-                "goal_heatmap": heat,
-                "point": point,
-                "exist": exist}
+        out = {"pi_logits": self.pi_head(h)}
+        if self.value_head is not None:
+            out["vpred"] = self.value_head(h).squeeze(-1)
+        if self.aux_head is not None:
+            heat = self.aux_head(h).view(b, t, self.cfg.aux_size, self.cfg.aux_size)
+            point, exist = heatmap_readout(heat)
+            out.update({"goal_heatmap": heat, "point": point, "exist": exist})
+        return out
 
     # -- persistence --------------------------------------------------------
 

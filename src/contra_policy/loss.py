@@ -75,7 +75,7 @@ class BehaviorCloneLoss(nn.Module):
 
     def __init__(self, weight: float = 1.0, label_smoothing: float = 0.0,
                  class_weights: torch.Tensor | None = None,
-                 modal_action: int | None = None):
+                 modal_action: int | None = None, diagnostics: bool = True):
         super().__init__()
         self.weight = weight
         self.label_smoothing = label_smoothing
@@ -85,6 +85,7 @@ class BehaviorCloneLoss(nn.Module):
         # a single action while boss completion fell to 1.8%). Given this index, the
         # metrics below can see the collapse that accuracy cannot.
         self.modal_action = modal_action
+        self.diagnostics = diagnostics
         # Buffer, not a plain attribute, so it follows the module across devices and
         # into the checkpoint (making the weighting a recorded property of the run).
         self.register_buffer("class_weights", class_weights, persistent=True)
@@ -101,6 +102,8 @@ class BehaviorCloneLoss(nn.Module):
         # masked mean here divides by valid-step count, so the weighting shifts the
         # relative pull between classes without rescaling the loss.
         loss = _masked_mean(ce, mask)
+        if not self.diagnostics:
+            return self.weight * loss, {"loss": loss.detach()}
         with torch.no_grad():
             pred = logits.argmax(-1)
             metrics = {"bc_loss": loss.detach(),
