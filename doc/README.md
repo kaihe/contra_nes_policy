@@ -13,6 +13,7 @@ Requests to another repo are **issues on that repo**, not docs here — see the
 
 | doc | status | what it decides |
 |---|---|---|
+| [0008 Fourteen-hour GRPO](0008-fourteen-hour-grpo.md) | Proposed | hold the current recipe fixed for a wall-clock-limited ~1,000-update run from the latest action-only BC policy; require true resumption, fixed probes and held-out checkpoint selection before claiming that longer training teaches gameplay. |
 | [0007 Compile and varlen experiment](0007-compiled-varlen-training.md) | Implemented | both optimizations missed the 10% end-to-end gate and were rolled back; eager/padded remains the shared BC/GRPO path, while the corrected loader-inclusive timer stays. |
 | [0006 Action-only base policy](0006-action-only-base-policy.md) | Implemented | train one action-only causal GPT with masked cross-entropy, report only Karpathy's optimisation metrics, and replace the boss slice with all 666 episodes from the full-fight release while preserving old-checkpoint compatibility. |
 | [0005 Graded rewards](0005-graded-reward.md) | Proposed | 53% of every rollout budget produces no gradient because the group's members all agree. Two phases attacking opposite tails: HP grading rescues all-failure boss groups, a budget-normalised speed term rescues all-success ones. Rejects the symmetric step penalty, which scores a fast death above a long survival. |
