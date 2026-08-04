@@ -46,15 +46,16 @@ This revisits, but does not yet overturn, 0002 §3. The original release measure
 the actual batch-4 sampler raise the measured waste, but not enough to assume that a
 new attention backend will pay for its complexity.
 
-The current `tokens_per_sec` timer begins after the DataLoader yields a batch. Karpathy
-starts timing before `next_batch()`. Before any A/B, move the timer boundary so the
-headline rate includes loading, transfer, encoder, core, backward and optimizer work.
+The pre-experiment `tokens_per_sec` timer began after the DataLoader yielded a batch.
+Karpathy starts timing before `next_batch()`. Commit `4a27bcf` corrected the boundary so
+the retained headline rate includes loading, transfer, encoder, core, backward and
+optimizer work.
 
-## 2. The experiment
+## 2. The experiment as run
 
 ### 2.1 Factor A — dynamic core compilation
 
-Add an explicit configuration switch:
+The experiment added an explicit configuration switch:
 
 ```yaml
 performance:
@@ -62,21 +63,20 @@ performance:
   compile_dynamic: true
 ```
 
-Compile only the causal core after device placement. The raw `ContraPolicy` remains the
-checkpoint owner, so enabling compilation must not add `_orig_mod` keys or otherwise
-change its state dict. Dynamic compilation is required because batch-local padding
-produces a different time dimension from one batch to the next.
+It compiled only the causal core after device placement. The raw `ContraPolicy` remained
+the checkpoint owner, so compilation added no `_orig_mod` checkpoint keys. Dynamic
+compilation handled the different time dimensions produced by batch-local padding.
 
-The eager and compiled paths consume identical batches in identical order. Exclude
-first-use compilation from steady-state throughput, but report its wall-clock cost and
-the number of recompilations separately. Test both:
+The eager and compiled paths consumed identical batches in identical order. First-use
+compilation was excluded from steady-state throughput and reported separately. The
+implementation covered both intended callers:
 
 - BC forward/backward/update over whole episodes.
 - GRPO rollout inference and padded optimizer minibatches.
 
 ### 2.2 Factor B — boundary-safe varlen attention
 
-The packed representation concatenates complete episode segments:
+The tested packed representation concatenated complete episode segments:
 
 ```text
 [interaction_A, goal_A, frames_A]
@@ -84,7 +84,7 @@ The packed representation concatenates complete episode segments:
 ...
 ```
 
-It carries `cu_seqlens = [0, L_A, L_A + L_B, ...]`, maximum segment length, reset
+It carried `cu_seqlens = [0, L_A, L_A + L_B, ...]`, maximum segment length, reset
 position IDs, frame/action offsets and a loss mask. A variable-length causal attention
 kernel uses those boundaries directly, so episode B cannot attend to episode A and no
 dense block-diagonal `T x T` mask is materialized. Apply the same representation to raw
@@ -99,13 +99,12 @@ dense custom mask. Sources:
 - <https://docs.nvidia.com/nemo/megatron-bridge/nightly/training/packed-sequences.html>
 - <https://github.com/dao-ailab/flash-attention>
 
-The implementation must cover BC, GRPO optimizer minibatches and ragged rollout
-histories before it is considered shared infrastructure. A BC-only packer is not the
-goal of this experiment.
+The implementation covered BC, GRPO optimizer minibatches and ragged rollout histories;
+it was not a BC-only packer.
 
 ### 2.3 Benchmark matrix and metrics
 
-Run the same fixed batch schedule from the same checkpoint:
+The four runs used the same fixed batch schedule and checkpoint:
 
 | run | core | attention layout | purpose |
 |---|---|---|---|
@@ -114,7 +113,8 @@ Run the same fixed batch schedule from the same checkpoint:
 | V | eager | varlen packed | isolated packing effect |
 | CV | compiled dynamic | varlen packed | interaction and final candidate |
 
-Report separately for BC update, GRPO update and rollout inference:
+BC was the first performance gate. Only a candidate that passed it would advance to
+GRPO-update, rollout-inference and closed-loop measurements. The BC comparison reported:
 
 - end-to-end tokens or decisions per second;
 - steady-state step latency median and p90;
@@ -123,8 +123,11 @@ Report separately for BC update, GRPO update and rollout inference:
 - padding fraction or packed occupancy;
 - loss and gradient norm on the fixed batches.
 
-Compilation and varlen packing are accepted independently. A 10% speed threshold keeps
-small benchmark noise and maintenance-heavy single-digit gains out of the main path.
+No candidate passed, so the later RL and closed-loop benchmarks were deliberately not
+run; doing them could not change the base-policy decision.
+
+Compilation and varlen packing were gated independently. The 10% threshold kept the
+measured single-digit gains and their maintenance burden out of the main path.
 
 ## 3. What was rejected, and why
 
@@ -149,8 +152,8 @@ variable-count chunk loop based on `batch x time`. That is a noisier compiler ta
 than the causal core and risks hiding the value of compilation behind graph breaks.
 
 **Change the active base-policy run.** Compilation changes process construction and
-cannot be enabled safely inside a running job. The current eager/padded run remains the
-baseline and finishes unchanged.
+cannot be enabled safely inside a running job. The eager/padded run active when the
+experiment began remained the baseline and finished unchanged.
 
 ## 4. Risks, and the metric that gates each
 
@@ -164,22 +167,17 @@ baseline and finishes unchanged.
 | speed changes optimization | different kernels change reduction order | fixed-batch loss/gradient checks pass and short-run validation loss stays within 0.01 |
 | BC-only optimization adds a dead RL path | batching contracts currently differ | feature is incomplete until BC, GRPO update and rollout benchmarks exist |
 
-## 5. Sequencing
+## 5. Sequence completed
 
-1. Let the current eager/padded run finish. Its artifacts remain the behavioral
-   baseline; do not restart it for this proposal.
-2. Correct the timer to include batch acquisition and record 500 steady-state eager
-   steps. Gate: reproducible median throughput within 3% across two repeats.
-3. Implement checkpoint-transparent dynamic core compilation and tests. Run C against
-   E. Keep it only at >=10% improvement with no post-warm-up recompilation storm.
-4. Profile padding and attention time independently in BC, GRPO update and rollout.
-   Continue to varlen work only where at least 10% end-to-end headroom is attributable
-   to padding or padded attention.
-5. Implement the varlen layout and boundary-equivalence tests, then run V and CV. Do
-   not substitute the existing dense block mask for the varlen kernel.
-6. Run a short fixed-token training comparison and closed-loop evaluation before making
-   either switch a default. Update this doc to `Implemented` only for the optimizations
-   that pass their gates; record rejected results here rather than deleting them.
+1. The original eager/padded run finished and remains the behavioral baseline.
+2. The timer was corrected and the 500-step eager baseline was measured.
+3. Checkpoint-transparent dynamic compilation was implemented, tested and rejected at
+   +1.9% end-to-end throughput.
+4. Padding was measured at only 4.21% of dense compute positions.
+5. Boundary-safe varlen attention was implemented and tested alone and with compile;
+   both configurations missed the gate.
+6. Closed-loop evaluation was unnecessary because neither candidate passed the speed
+   gate. The experimental paths were removed in `e1965b4`.
 
 ## 6. Result and rollback
 
@@ -213,7 +211,7 @@ No other repository is blocked on this experiment, so no handoff issue is requir
 
 | claim | source |
 |---|---|
-| current BC path is eager, BF16/TF32, ordinary AdamW and SDPA | `src/contra_policy/train_bc.py`, `src/contra_policy/causal.py` at `446676b` |
+| current BC path is eager, BF16/TF32, ordinary AdamW and SDPA | `src/contra_policy/train_bc.py`, `src/contra_policy/causal.py` at `e1965b4` |
 | BC and GRPO update both pad whole episodes | `pad_episodes` and `rl.buffer.GroupBatch` at `446676b` |
 | rollout core input is a padded batch of active histories | `rl.rollout.BatchedPolicyRunner._core_over_histories` at `446676b` |
 | 7,104 train episodes; 725,635 usable frame positions | `cache/shard_index_v2_856541e18109970a.json`, boss-full-v1 configuration |
