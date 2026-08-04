@@ -60,7 +60,8 @@ loss:
 # ── loader ────────────────────────────────────────────────────────────────────
 loader:
   # Episodes per batch. Frames per step is this times the batch's longest episode, so a
-  # boss batch is far heavier than an item batch — watch pad_frac and frames_per_s.
+  # boss batch is far heavier than an item batch. `tokens_per_sec` is dense GPT compute
+  # throughput; compare it with `frames_per_s` and `pad_frac` to see useful work vs padding.
   batch_size: 4
   # LengthGroupedSampler sorts within a pool of this many batches rather than globally.
   # Global sorting would put every long episode together, and length correlates with

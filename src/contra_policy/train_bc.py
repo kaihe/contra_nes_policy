@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader
 from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset, LengthGroupedSampler,
                                    load_or_build_index, pad_episodes, shard_paths)
 from contra_policy.loss import ContraObjective, action_class_weights
-from contra_policy.model import PolicyConfig, build_policy
+from contra_policy.model import PREFIX, PolicyConfig, build_policy
 
 
 class CSVLogger:
@@ -72,6 +72,19 @@ class CSVLogger:
 def _mean_of(rows: List[Dict[str, float]]) -> Dict[str, float]:
     keys = {k for r in rows for k in r}
     return {k: float(np.mean([r[k] for r in rows if k in r])) for k in sorted(keys)}
+
+
+def _model_tokens(batch: Dict) -> int:
+    """Dense causal-transformer tokens in one padded BC batch.
+
+    This deliberately follows build-nanogpt's throughput convention: count tensor
+    positions the backbone computes, including padding, rather than only positions that
+    reach the loss. Each episode contributes the ``interaction`` and ``goal`` prefix
+    tokens followed by the batch-padded frame sequence. ``frames`` remains the useful,
+    unpadded counterpart, so the two rates expose padding overhead instead of hiding it.
+    """
+    batch_size, padded_frames = batch["image"].shape[:2]
+    return int(batch_size) * (int(padded_frames) + PREFIX)
 
 
 class BCTrainer:
@@ -205,6 +218,7 @@ class BCTrainer:
         row = {k: float(v) for k, v in metrics.items()}
         row.update({"grad_norm": float(gn), "lr": self.optimizer.param_groups[0]["lr"],
                     "frames": float(batch["mask"].sum()),
+                    "tokens": float(_model_tokens(batch)),
                     "pad_frac": 1.0 - float(batch["mask"].mean())})
         return row
 
@@ -221,7 +235,7 @@ class BCTrainer:
 
     def run(self) -> None:
         total = int(self.args.train.steps)
-        t0, seen = time.time(), 0.0
+        t0, seen_frames, seen_tokens = time.time(), 0.0, 0.0
         try:
             while self.step < total:
                 for batch in self._loader(self.train_ds, self.train_len, shuffle=True):
@@ -229,11 +243,18 @@ class BCTrainer:
                         break
                     row = self.train_step(batch)
                     self.step += 1
-                    seen += row["frames"]
+                    seen_frames += row["frames"]
+                    seen_tokens += row["tokens"]
                     if self.step % int(self.args.train.log_every) == 0:
+                        # CUDA launches asynchronously. Synchronise before stopping the
+                        # clock or throughput measures Python enqueue speed, not GPU work.
+                        if self.device.type == "cuda":
+                            torch.cuda.synchronize(self.device)
+                        elapsed = max(1e-9, time.time() - t0)
                         row["step"] = self.step
-                        row["frames_per_s"] = seen / max(1e-9, time.time() - t0)
-                        t0, seen = time.time(), 0.0
+                        row["frames_per_s"] = seen_frames / elapsed
+                        row["tokens_per_sec"] = seen_tokens / elapsed
+                        t0, seen_frames, seen_tokens = time.time(), 0.0, 0.0
                         self._emit(row, "train")
                     if self.step % int(self.args.train.val_every) == 0:
                         self._run_val(int(self.args.train.val_batches))
@@ -257,7 +278,7 @@ class BCTrainer:
                 ("loss", "bc_acc", "bc_bal_acc", "bc_nonmodal_acc", "pred_modal_frac",
                  "point_err_px") if k in row]
         line = f"[{phase} {self.step}/{int(self.args.train.steps)}] " + " ".join(head)
-        for k in ("frames_per_s", "pad_frac"):
+        for k in ("tokens_per_sec", "frames_per_s", "pad_frac"):
             if k in row:
                 line += f" {k}={row[k]:.3g}"
         print(line, flush=True)
