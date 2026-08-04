@@ -61,10 +61,7 @@ def grpo_loss(logits: torch.Tensor, batch, cfg: GRPOConfig,
     # One advantage per episode, broadcast over its steps: a terminal reward carries no
     # information about which step earned it, and pretending otherwise is what the
     # critic was doing.
-    if getattr(batch, "episode_index", None) is not None:
-        adv = batch.advantage[batch.episode_index]
-    else:
-        adv = batch.advantage.unsqueeze(-1).expand_as(ratio)
+    adv = batch.advantage.unsqueeze(-1).expand_as(ratio)
 
     unclipped = ratio * adv
     clipped = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * adv

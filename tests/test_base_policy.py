@@ -36,22 +36,6 @@ def test_action_only_policy_has_one_output_and_no_dead_heads():
                    for k in policy.state_dict())
 
 
-def test_varlen_policy_matches_each_episode_evaluated_alone():
-    policy = build_policy(_config(aux_size=0, value_head=False)).eval()
-    a = torch.randint(0, 256, (2, 64, 64, 3), dtype=torch.uint8)
-    b = torch.randint(0, 256, (3, 64, 64, 3), dtype=torch.uint8)
-    goals = torch.randint(0, 256, (2, 64, 64, 3), dtype=torch.uint8)
-    interaction = torch.tensor([0, 1])
-    with torch.no_grad():
-        packed = policy.forward_varlen(
-            torch.cat([a, b]), goals, interaction, torch.tensor([2, 3]))["pi_logits"]
-        alone = torch.cat([
-            policy(a.unsqueeze(0), goals[0:1], interaction[0:1])["pi_logits"][0],
-            policy(b.unsqueeze(0), goals[1:2], interaction[1:2])["pi_logits"][0],
-        ])
-    assert torch.allclose(packed, alone, atol=1e-5)
-
-
 def test_legacy_head_defaults_still_round_trip_strictly(tmp_path):
     policy = build_policy(_config())
     path = policy.save(str(tmp_path / "legacy.pt"))

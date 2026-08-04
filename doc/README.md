@@ -13,7 +13,7 @@ Requests to another repo are **issues on that repo**, not docs here — see the
 
 | doc | status | what it decides |
 |---|---|---|
-| [0007 Compile, then gate varlen packing](0007-compiled-varlen-training.md) | Proposed | benchmark checkpoint-transparent dynamic compilation first, then boundary-safe varlen FlashAttention across BC and RL; explicitly reject cached encoder tokens because they cannot accelerate on-policy rollout. |
+| [0007 Compile and varlen experiment](0007-compiled-varlen-training.md) | Implemented | both optimizations missed the 10% end-to-end gate and were rolled back; eager/padded remains the shared BC/GRPO path, while the corrected loader-inclusive timer stays. |
 | [0006 Action-only base policy](0006-action-only-base-policy.md) | Implemented | train one action-only causal GPT with masked cross-entropy, report only Karpathy's optimisation metrics, and replace the boss slice with all 666 episodes from the full-fight release while preserving old-checkpoint compatibility. |
 | [0005 Graded rewards](0005-graded-reward.md) | Proposed | 53% of every rollout budget produces no gradient because the group's members all agree. Two phases attacking opposite tails: HP grading rescues all-failure boss groups, a budget-normalised speed term rescues all-success ones. Rejects the symmetric step penalty, which scores a fast death above a long survival. |
 | [0004 GRPO in two phases](0004-grpo-experiment-plan.md) | Implemented | phase 1 validates the stack on three families; phase 2 branches from the *same BC checkpoint* to test boss. Both ran: pooled val ~71% for each, boss 3.5% → 10.5%, which falsifies this doc's own "boss does not improve" prediction. §4 records how every prediction resolved. |

@@ -71,16 +71,6 @@ def test_packed_episodes_do_not_attend_to_each_other():
     assert torch.allclose(packed[:, 25:], alone_b, atol=1e-5)
 
 
-def test_varlen_matches_independent_sequences_and_resets_positions():
-    m = _gpt()
-    a, b = torch.randn(17, 32), torch.randn(9, 32)
-    cu = torch.tensor([0, len(a), len(a) + len(b)], dtype=torch.int32)
-    with torch.no_grad():
-        packed = m.forward_varlen(torch.cat([a, b]), cu, max(len(a), len(b)))
-        alone = torch.cat([m(a[None])[0], m(b[None])[0]])
-    assert torch.allclose(packed, alone, atol=1e-5)
-
-
 def test_packing_needs_no_position_reset():
     """RoPE scores depend on relative distance, so the second episode does not need its
     positions restarted at zero — which is a step most packing implementations carry."""

@@ -750,26 +750,6 @@ def pad_episodes(items: List[Dict]) -> Dict:
     return out
 
 
-def pack_episodes(items: List[Dict]) -> Dict:
-    """Collate complete episodes by concatenation; ``seq_len`` preserves boundaries."""
-    out: Dict = {}
-    for key in ("image", "action", "mask", "goal_heatmap", "exist", "point",
-                "n_goal_points", "prev_action", "prev_action_dropout", "first"):
-        if key in items[0]:
-            out[key] = torch.cat([x[key] for x in items], dim=0)
-    out["cross_view"] = {
-        "cross_view_image": torch.stack(
-            [x["cross_view"]["cross_view_image"] for x in items]),
-        "cross_view_obj_mask": torch.stack(
-            [x["cross_view"]["cross_view_obj_mask"] for x in items]),
-        "cross_view_obj_id": torch.stack(
-            [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
-    }
-    out["family"] = torch.stack([x["family"] for x in items])
-    out["seq_len"] = torch.tensor([int(x["image"].shape[0]) for x in items])
-    return out
-
-
 class LengthGroupedSampler(Sampler):
     """Batches of similar-length episodes, shuffled.
 

@@ -92,13 +92,6 @@ class ContraPolicy(nn.Module):
         d = self.encoder.cfg.hiddim
         core_cfg = CausalGPTConfig(**{**cfg.core, "d_model": d})
         self.core = CausalGPT(core_cfg)
-        # A compiled callable must not become a registered child module: doing so adds
-        # ``_orig_mod`` to checkpoint keys and makes an execution optimization part of
-        # the model format.  ``object.__setattr__`` deliberately bypasses nn.Module's
-        # registration machinery; the registered, eager ``self.core`` remains the sole
-        # owner of parameters and state.
-        object.__setattr__(self, "_compiled_core", None)
-        object.__setattr__(self, "_compiled_varlen_core", None)
 
         self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d)   # +1 for id -1
         self.pi_head = nn.Linear(d, NUM_ACTIONS)
@@ -111,30 +104,6 @@ class ContraPolicy(nn.Module):
     @property
     def context(self) -> int:
         return self.core.cfg.context
-
-    def compile_core(self, dynamic: bool = True) -> None:
-        """Compile the causal core without changing checkpoint ownership or keys."""
-        if self._compiled_core is None:
-            compiled = torch.compile(self.core, dynamic=dynamic)
-            object.__setattr__(self, "_compiled_core", compiled)
-            compiled_varlen = torch.compile(self.core.forward_varlen, dynamic=dynamic)
-            object.__setattr__(self, "_compiled_varlen_core", compiled_varlen)
-
-    def eager_core(self) -> None:
-        """Return future forwards to eager execution (useful for A/B tests)."""
-        object.__setattr__(self, "_compiled_core", None)
-        object.__setattr__(self, "_compiled_varlen_core", None)
-
-    def _run_core(self, tokens: torch.Tensor,
-                  attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        core = self._compiled_core if self._compiled_core is not None else self.core
-        return core(tokens, attn_mask=attn_mask)
-
-    def _run_core_varlen(self, tokens: torch.Tensor, cu_seqlens: torch.Tensor,
-                         max_seqlen: int) -> torch.Tensor:
-        core = (self._compiled_varlen_core if self._compiled_varlen_core is not None
-                else self.core.forward_varlen)
-        return core(tokens, cu_seqlens, max_seqlen)
 
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
         """``(B, T, S, S, 3)`` uint8 → ``(B, T, d)``. Frozen encoders skip the graph."""
@@ -149,10 +118,6 @@ class ContraPolicy(nn.Module):
                 tok = torch.cat([self.encoder.encode(flat[i:i + chunk])
                                  for i in range(0, flat.shape[0], chunk)], dim=0)
         return tok.view(b, t, -1)
-
-    def encode_flat_images(self, images: torch.Tensor) -> torch.Tensor:
-        """``(N, S, S, 3)`` uint8 -> ``(N, d)`` without adding padding."""
-        return self.encode_images(images.unsqueeze(0)).squeeze(0)
 
     def forward(self, images: torch.Tensor, goal_image: torch.Tensor,
                 interaction: torch.Tensor,
@@ -171,7 +136,7 @@ class ContraPolicy(nn.Module):
         goal = self.encode_images(goal_image.unsqueeze(1))       # (B, 1, d)
         inter = self.interaction(interaction + 1).unsqueeze(1)   # (B, 1, d)
 
-        h = self._run_core(torch.cat([inter, goal, frames], dim=1), attn_mask=attn_mask)
+        h = self.core(torch.cat([inter, goal, frames], dim=1), attn_mask=attn_mask)
         h = h[:, PREFIX:]                                        # frame positions only
 
         out = {"pi_logits": self.pi_head(h)}
@@ -181,39 +146,6 @@ class ContraPolicy(nn.Module):
             heat = self.aux_head(h).view(b, t, self.cfg.aux_size, self.cfg.aux_size)
             point, exist = heatmap_readout(heat)
             out.update({"goal_heatmap": heat, "point": point, "exist": exist})
-        return out
-
-    def forward_varlen(self, images: torch.Tensor, goal_image: torch.Tensor,
-                       interaction: torch.Tensor,
-                       seq_len: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Packed episodes: ``images`` is ``(sum(T_i), S, S, 3)``."""
-        lengths = seq_len.long()
-        segment_lengths = lengths + PREFIX
-        max_seqlen = int(segment_lengths.max().item())
-        if max_seqlen > self.context:
-            raise ValueError(
-                f"sequence of {max_seqlen} exceeds context {self.context}")
-
-        frames = self.encode_flat_images(images)
-        goal = self.encode_flat_images(goal_image)
-        inter = self.interaction(interaction + 1)
-        cu = torch.cat([torch.zeros(1, device=images.device, dtype=torch.int32),
-                        segment_lengths.cumsum(0).to(torch.int32)])
-        total = frames.shape[0] + PREFIX * lengths.numel()
-        prefix_start = cu[:-1].long()
-        prefix_idx = torch.stack([prefix_start, prefix_start + 1], dim=1).reshape(-1)
-        frame_pos = torch.ones(total, device=images.device, dtype=torch.bool)
-        frame_pos[prefix_idx] = False
-        tokens = frames.new_empty((total, frames.shape[-1]))
-        tokens[prefix_idx] = torch.stack([inter, goal], dim=1).reshape(-1, frames.shape[-1])
-        tokens[frame_pos] = frames
-
-        h = self._run_core_varlen(tokens, cu, max_seqlen)[frame_pos]
-        out = {"pi_logits": self.pi_head(h)}
-        if self.value_head is not None:
-            out["vpred"] = self.value_head(h).squeeze(-1)
-        if self.aux_head is not None:
-            raise NotImplementedError("legacy aux_head is not supported by varlen mode")
         return out
 
     # -- persistence --------------------------------------------------------

@@ -87,20 +87,6 @@ def test_one_advantage_per_episode_not_per_step():
     assert b.advantage.shape == (2,)
 
 
-def test_varlen_batch_concatenates_and_maps_episode_advantages():
-    eps = [_ep(3, 0, 1.0), _ep(7, 0, 0.0)]
-    adv = np.asarray([2.0, -1.0], dtype=np.float32)
-    b = GroupBatch(eps, adv, layout="varlen")
-    assert b.image.shape[0] == 10
-    assert b.seq_len.tolist() == [3, 7]
-    assert b.episode_index.tolist() == [0] * 3 + [1] * 7
-    logits = torch.zeros(10, 21, requires_grad=True)
-    loss, _ = grpo_loss(
-        logits, b, GRPOConfig(kl_coef=0.0, entropy_coef=0.0))
-    loss.backward()
-    assert loss.isfinite() and logits.grad is not None
-
-
 def test_minibatches_never_split_an_episode():
     eps = [_ep(3 + i, i // 4, float(i % 2)) for i in range(12)]
     adv, _ = group_advantages([e.reward for e in eps], [e.group_id for e in eps])

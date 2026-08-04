@@ -26,12 +26,6 @@ seed: 0
 device: cuda
 precision: bf16           # bf16 | fp16 | fp32
 
-# Execution-only switches. They do not change model parameters or checkpoint keys.
-performance:
-  compile_core: false
-  compile_dynamic: true
-  attention_layout: padded  # padded | varlen (Factor B; implemented separately)
-
 # ── policy ────────────────────────────────────────────────────────────────────
 policy:
   # Stage A's trained encoder. Frozen by default and that is the experiment: it makes

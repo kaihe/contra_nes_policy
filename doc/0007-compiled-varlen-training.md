@@ -1,21 +1,18 @@
-# Compile the shared policy core, then gate boundary-safe varlen packing
+# Compile and varlen training experiment — rejected
 
-Status: Implemented (experimental paths retained, defaults rejected)
+Status: Implemented
 Supersedes: —
 
 **Question.** Which training-efficiency changes should the next base-policy run test
 if every optimization must also be useful in on-policy RL, where frame tokens cannot
 be precomputed?
 
-**Answer.** We ran two controlled optimizations in order. First compile the causal core
-with dynamic sequence length while leaving batching unchanged. Then test true packed
-episodes through a variable-length FlashAttention kernel using cumulative sequence
-boundaries. Keep each change only if it improves steady-state end-to-end throughput by
-at least 10% without changing task isolation, checkpoint format, loss, or closed-loop
-behavior. Neither cleared that gate in the 500-step BC measurement, so both remain
-explicitly opt-in and the next base-policy run stays eager/padded. Do not build a
-cached-encoder-token path: it accelerates BC only and therefore optimizes a data path
-RL cannot use.
+**Answer.** We implemented and independently measured dynamic core compilation and
+boundary-safe varlen FlashAttention. Neither improved 500-step end-to-end BC throughput
+by the required 10%, and their combination was slightly slower. Both experimental code
+paths were therefore removed; base-policy and GRPO training remain eager and padded.
+The corrected end-to-end throughput timer stays, because restoring the earlier timer
+would restore a misleading GPU-only number rather than restore performance.
 
 ---
 
@@ -184,42 +181,29 @@ baseline and finishes unchanged.
    either switch a default. Update this doc to `Implemented` only for the optimizations
    that pass their gates; record rejected results here rather than deleting them.
 
-## 6. Implementation and measured result (2026-08-04)
+## 6. Result and rollback
 
-Both execution paths are implemented behind the same keys in BC and GRPO. Compilation
-wraps an unregistered callable, leaving the raw eager core as checkpoint owner; strict
-cross-load and absence of `_orig_mod` keys are tested. Varlen batches concatenate raw
-frames before the encoder, carry `seq_len`/`cu_seqlens`, reset RoPE positions per
-episode and call the autograd-enabled ATen varlen FlashAttention operator. The same
-layout is wired through BC, GRPO minibatches and rollout token histories. PyTorch 2.9
-does not yet expose the public `torch.nn.attention.varlen` API, so the CUDA call is an
-explicit version-sensitive boundary in `causal.py`; CPU uses an independent-segment
-reference implementation for correctness tests.
+The fixed comparison used the same checkpoint, seed and batch schedule on an RTX 4090
+Laptop GPU, with 20 warm-up steps and 500 measured updates. Timing included batch
+acquisition, transfer, encoder, core, backward and optimizer work.
 
-The controlled BC benchmark used the same checkpoint, seed, batch schedule, batch size
-4, BF16, RTX 4090 Laptop GPU, 20 warm-up steps and 500 measured update steps. Every
-timing includes DataLoader acquisition, transfer, encoder, core, backward and optimizer.
+| run | useful tokens/s | versus eager/padded |
+|---|---:|---:|
+| eager + padded | 2,229 | baseline |
+| compiled + padded | 2,271 | +1.9% |
+| eager + varlen | 2,269 | +1.8% |
+| compiled + varlen | 2,206 | -1.0% |
 
-| run | useful tok/s | vs E | median ms | p90 ms | peak GB | padding | graphs |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| E eager/padded | 2,229 | — | 106.9 | 431.1 | 2.747 | 4.19% | — |
-| C compiled/padded | 2,271 | +1.9% | 105.8 | 449.6 | 2.747 | 4.19% | 1 |
-| V eager/varlen | 2,269 | +1.8% | 117.8 | 364.9 | 2.710 | 0% | — |
-| CV compiled/varlen | 2,206 | -1.0% | 113.3 | 392.0 | 2.710 | 0% | 2 |
+All candidates missed the 10% gate. The implementation was subsequently rolled back,
+including its private PyTorch 2.9 varlen-operator dependency, configuration switches,
+packing contracts and benchmark harness. This is a rejected experiment, not unfinished
+work. Raw benchmark JSON remains in the ignored local `tmp/` directory where available.
 
-Compile warm-up cost 14.8 seconds for C and 12.7 seconds for CV. Mean loss stayed
-within 0.001 across variants (0.1840-0.1850); mean gradient norm stayed within 0.04
-(1.76-1.80). The complete test suite passes, including packed-versus-independent core
-and whole-policy equivalence, task-boundary isolation, packed GRPO advantage mapping and
-checkpoint transparency.
-
-**Decision.** Reject both as defaults for the next base-policy run. C and V each gain
-about 2%, far below the 10% maintenance gate, and CV is slightly slower. The 100-step
-exploration misleadingly suggested roughly 20% gains because periodic loader stalls
-dominated such a short wall-clock sample; the planned 500-step result is authoritative.
-The opt-in paths stay available to benchmark GRPO update and rollout phases, but no RL
-speed or closed-loop-quality claim is made yet. GPU utilization was not sampled during
-this run; peak allocation is reported above.
+The two full training runs on 2026-08-04 confirm that the lower post-0007 logged rate is
+a timer correction rather than a real slowdown. The old run completed 20,000 steps in
+about 68 minutes; the new eager/padded run advanced at the same roughly 4.88 steps/s.
+The old ~4,000 tokens/s started timing after the DataLoader yielded, whereas the retained
+timer includes acquisition and exposes bursty loader stalls.
 
 No other repository is blocked on this experiment, so no handoff issue is required.
 
@@ -235,5 +219,5 @@ No other repository is blocked on this experiment, so no handoff issue is requir
 | 7,104 train episodes; 725,635 usable frame positions | `cache/shard_index_v2_856541e18109970a.json`, boss-full-v1 configuration |
 | 4.21% dense padding waste | deterministic `LengthGroupedSampler(batch_size=4, pool_batches=32, seed=0)` epoch: 725,635 valid / 757,500 dense frames |
 | 11.30% padded causal-attention pairs are avoidable | same epoch, `sum(L_i^2)` against `sum(batch_size * max(L)^2)`, including two prefix tokens |
-| current throughput excludes DataLoader latency | timer placement in `src/contra_policy/train_bc.py:226-240` |
+| pre-0007 throughput excluded DataLoader latency | timer placement at `446676b`; corrected by `4a27bcf` |
 | boundary-aware SFT packing uses cumulative lengths and varlen attention | NVIDIA NeMo/Megatron documentation and official FlashAttention repository linked in §2.2 |

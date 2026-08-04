@@ -30,8 +30,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from contra_policy.dataset import (ContraCrossViewDataset, LengthGroupedSampler,
-                                   load_or_build_index, pack_episodes, pad_episodes,
-                                   shard_paths)
+                                   load_or_build_index, pad_episodes, shard_paths)
 from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
 
@@ -75,17 +74,8 @@ def _model_tokens(batch: Dict) -> int:
     tokens followed by the batch-padded frame sequence. ``frames`` remains the useful,
     unpadded counterpart, so the two rates expose padding overhead instead of hiding it.
     """
-    if batch["image"].ndim == 4:
-        return _useful_model_tokens(batch)
     batch_size, padded_frames = batch["image"].shape[:2]
     return int(batch_size) * (int(padded_frames) + PREFIX)
-
-
-def _useful_model_tokens(batch: Dict) -> int:
-    """Non-padding frame positions plus one interaction/goal prefix per episode."""
-    batch_size = (int(batch["seq_len"].numel()) if "seq_len" in batch
-                  else int(batch["mask"].shape[0]))
-    return int(batch["mask"].sum()) + batch_size * PREFIX
 
 
 def _require_family_counts(index: List[dict], expected: Dict, split: str) -> None:
@@ -156,14 +146,6 @@ class BCTrainer:
         # -- model -----------------------------------------------------------
         pcfg = PolicyConfig(**OmegaConf.to_container(args.policy, resolve=True))
         self.policy = build_policy(pcfg).to(self.device)
-        perf = args.get("performance", {})
-        self.attention_layout = str(perf.get("attention_layout", "padded"))
-        if self.attention_layout not in ("padded", "varlen"):
-            raise ValueError(f"unknown attention layout {self.attention_layout!r}")
-        if bool(perf.get("compile_core", False)):
-            self.policy.compile_core(dynamic=bool(perf.get("compile_dynamic", True)))
-            print("[bc] compiled causal core "
-                  f"(dynamic={bool(perf.get('compile_dynamic', True))})", flush=True)
         if longest + 2 > self.policy.context:
             raise ValueError(
                 f"longest episode is {longest} frames + 2 prefix = {longest + 2}, over "
@@ -202,8 +184,7 @@ class BCTrainer:
 
     def _loader(self, ds, lengths, shuffle: bool) -> DataLoader:
         return DataLoader(
-            ds, collate_fn=(pack_episodes if self.attention_layout == "varlen"
-                            else pad_episodes),
+            ds, collate_fn=pad_episodes,
             batch_sampler=LengthGroupedSampler(
                 lengths, int(self.args.loader.batch_size),
                 pool_batches=int(self.args.loader.pool_batches),
@@ -225,13 +206,8 @@ class BCTrainer:
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null())
         with ctx:
-            if self.attention_layout == "varlen":
-                latents = self.policy.forward_varlen(
-                    batch["image"], cv["cross_view_image"], cv["cross_view_obj_id"],
-                    batch["seq_len"])
-            else:
-                latents = self.policy(batch["image"], cv["cross_view_image"],
-                                      cv["cross_view_obj_id"])
+            latents = self.policy(batch["image"], cv["cross_view_image"],
+                                  cv["cross_view_obj_id"])
             loss, metrics = self.objective(latents, batch)
         return loss, metrics
 

@@ -102,46 +102,6 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1).to(x.dtype)
 
 
-def apply_rope_varlen(x: torch.Tensor, cos: torch.Tensor,
-                      sin: torch.Tensor) -> torch.Tensor:
-    """Rotate packed ``(N, H, D)`` tokens; caches are indexed per-token already."""
-    x1, x2 = x.float().chunk(2, dim=-1)
-    c, s = cos[:, None], sin[:, None]
-    return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1).to(x.dtype)
-
-
-def _varlen_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                      cu_seqlens: torch.Tensor, max_seqlen: int,
-                      dropout_p: float) -> torch.Tensor:
-    """True varlen causal attention on CUDA, with an eager reference fallback.
-
-    PyTorch 2.9 ships the autograd-enabled ATen FlashAttention varlen operator but not
-    the public ``torch.nn.attention.varlen`` wrapper (added in 2.10). Keeping the call
-    here makes that version-sensitive boundary explicit and easy to replace on upgrade.
-    """
-    if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
-        return torch.ops.aten._flash_attention_forward(
-            q, k, v, cu_seqlens, cu_seqlens, int(max_seqlen), int(max_seqlen),
-            float(dropout_p), True, False)[0]
-
-    # Correctness/reference path for CPU tests. It computes each segment independently,
-    # so it has the same isolation semantics without pretending to be performant.
-    outs = []
-    bounds = cu_seqlens.detach().cpu().tolist()
-    for start, end in zip(bounds[:-1], bounds[1:]):
-        qs = q[start:end].transpose(0, 1).unsqueeze(0)
-        ks = k[start:end].transpose(0, 1).unsqueeze(0)
-        vs = v[start:end].transpose(0, 1).unsqueeze(0)
-        if qs.shape[1] != ks.shape[1]:
-            rep = qs.shape[1] // ks.shape[1]
-            ks = ks.repeat_interleave(rep, dim=1)
-            vs = vs.repeat_interleave(rep, dim=1)
-        out = F.scaled_dot_product_attention(
-            qs, ks, vs, is_causal=True, dropout_p=dropout_p)
-        outs.append(out.squeeze(0).transpose(0, 1))
-    return torch.cat(outs, dim=0)
-
-
 class Attention(nn.Module):
     """Causal grouped-query attention, optionally block-diagonal over packed sequences."""
 
@@ -175,19 +135,6 @@ class Attention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0)
         return self.o(out.transpose(1, 2).reshape(b, t, -1))
 
-    def forward_varlen(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                       cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
-        n = x.shape[0]
-        q = self.q(x).view(n, self.n_head, self.head_dim)
-        k = self.k(x).view(n, self.n_kv_head, self.head_dim)
-        v = self.v(x).view(n, self.n_kv_head, self.head_dim)
-        q = apply_rope_varlen(q, cos, sin)
-        k = apply_rope_varlen(k, cos, sin)
-        out = _varlen_attention(
-            q, k, v, cu_seqlens, max_seqlen,
-            self.dropout if self.training else 0.0)
-        return self.o(out.reshape(n, -1))
-
 
 class SwiGLU(nn.Module):
     """Llama's MLP. The 2/3 factor keeps the parameter count at a ratio-4 ReLU MLP's."""
@@ -217,11 +164,6 @@ class Block(nn.Module):
 
     def forward(self, x, cos, sin, attn_mask):
         x = x + self.attn(self.norm_attn(x), cos, sin, attn_mask)
-        return x + self.mlp(self.norm_mlp(x))
-
-    def forward_varlen(self, x, cos, sin, cu_seqlens, max_seqlen):
-        x = x + self.attn.forward_varlen(
-            self.norm_attn(x), cos, sin, cu_seqlens, max_seqlen)
         return x + self.mlp(self.norm_mlp(x))
 
 
@@ -297,19 +239,4 @@ class CausalGPT(nn.Module):
         sin = self.rope_sin[:t].to(x.device)
         for blk in self.blocks:
             x = blk(x, cos, sin, attn_mask)
-        return self.norm(x)
-
-    def forward_varlen(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
-                       max_seqlen: int) -> torch.Tensor:
-        """Run concatenated sequences without padding or cross-sequence attention."""
-        if int(max_seqlen) > self.cfg.context:
-            raise ValueError(
-                f"sequence of {int(max_seqlen)} exceeds context {self.cfg.context}")
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        starts = torch.repeat_interleave(cu_seqlens[:-1].long(), lengths.long())
-        positions = torch.arange(x.shape[0], device=x.device) - starts
-        cos = self.rope_cos.to(x.device)[positions]
-        sin = self.rope_sin.to(x.device)[positions]
-        for blk in self.blocks:
-            x = blk.forward_varlen(x, cos, sin, cu_seqlens, int(max_seqlen))
         return self.norm(x)
