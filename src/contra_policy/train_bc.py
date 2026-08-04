@@ -88,6 +88,27 @@ def _require_family_counts(index: List[dict], expected: Dict, split: str) -> Non
                 f"resolved {actual[family]}")
 
 
+def _timed_train_iteration(trainer, batches, loader, clock=time.perf_counter):
+    """Acquire and train one batch, returning end-to-end elapsed time and iterator.
+
+    The clock deliberately starts before ``next(batches)``. Karpathy's throughput
+    includes input acquisition; excluding it hides exactly the loader stalls an
+    efficiency experiment needs to find.
+    """
+    if trainer.device.type == "cuda":
+        torch.cuda.synchronize(trainer.device)
+    t0 = clock()
+    try:
+        batch = next(batches)
+    except StopIteration:
+        batches = iter(loader)
+        batch = next(batches)
+    row, tokens = trainer.train_step(batch)
+    if trainer.device.type == "cuda":
+        torch.cuda.synchronize(trainer.device)
+    return row, tokens, max(1e-9, clock() - t0), batches
+
+
 class BCTrainer:
     def __init__(self, args: DictConfig, run_dir: str):
         self.args, self.run_dir = args, run_dir
@@ -226,26 +247,23 @@ class BCTrainer:
 
     def run(self) -> None:
         total = int(self.args.train.steps)
+        loader = self._loader(self.train_ds, self.train_len, shuffle=True)
+        batches = iter(loader)
         try:
             while self.step < total:
-                for batch in self._loader(self.train_ds, self.train_len, shuffle=True):
-                    if self.step >= total:
-                        break
-                    if self.device.type == "cuda":
-                        torch.cuda.synchronize(self.device)
-                    t0 = time.perf_counter()
-                    row, tokens = self.train_step(batch)
-                    if self.device.type == "cuda":
-                        torch.cuda.synchronize(self.device)
-                    elapsed = max(1e-9, time.perf_counter() - t0)
-                    self.step += 1
-                    if self.step % int(self.args.train.log_every) == 0:
-                        row["step"] = self.step
-                        row["step_ms"] = elapsed * 1000.0
-                        row["tokens_per_sec"] = tokens / elapsed
-                        self._emit(row, "train")
-                    if self.step % int(self.args.train.val_every) == 0:
-                        self._run_val(int(self.args.train.val_batches))
+                # Match build-nanogpt's wall-clock boundary: batch acquisition is part
+                # of the step. Starting after `next()` hid decoder/loader stalls and
+                # made tokens_per_sec a model-only number rather than train throughput.
+                row, tokens, elapsed, batches = _timed_train_iteration(
+                    self, batches, loader)
+                self.step += 1
+                if self.step % int(self.args.train.log_every) == 0:
+                    row["step"] = self.step
+                    row["step_ms"] = elapsed * 1000.0
+                    row["tokens_per_sec"] = tokens / elapsed
+                    self._emit(row, "train")
+                if self.step % int(self.args.train.val_every) == 0:
+                    self._run_val(int(self.args.train.val_batches))
         finally:
             # Whole val set however the run ended — this is the gate.
             self._run_val(0, tag="val_full")
