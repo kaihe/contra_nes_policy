@@ -9,20 +9,22 @@ hydra:
 # episode, so windows are no longer the unit — and padding every episode to the context
 # would be 201 MB of uint8 frames per item.
 shard_dir: ~/code/contra_nes_data/game_trace/hf
-# boss-full-v1 already contains the 466 published boss episodes plus 200 new
-# full-fight wins. Override rather than append, or the baseline would be duplicated.
-shard_overrides:
-  boss: ~/code/contra_nes_data/game_trace/releases/boss-full-v1/hf
-# Pin the release contract so a missing shard or duplicated baseline fails at startup.
-expected_episodes:
-  train: {boss: 666}
-  val: {boss: 57}
+shard_overrides: {}
+# Read exact cumulative membership from the release contract. `shard_count` is the
+# experiment cell (1, 2, 4 or 8); no directory glob is allowed to define it.
+boss_scaling:
+  enabled: true
+  manifest: ~/code/contra_nes_data/game_trace/releases/boss-mixed-v2/manifest.json
+  shard_count: 1
+  validation_sha256: 131835e34c55f75ded04410976730600a866744b40a8525bfc4d7f9ab952ecad
+expected_episodes: {train: {}, val: {}}
 cache_dir: ${hydra:runtime.cwd}/cache
 families: [kill, item, traverse, boss]
 image_size: 256
 sigma_px: 12.0            # must match the export and the prompt renderer
 
 seed: 0
+resume_from: null
 device: cuda
 precision: bf16           # bf16 | fp16 | fp32
 
@@ -63,6 +65,9 @@ loader:
   # Global sorting would put every long episode together, and length correlates with
   # family (traverse long, item short), so a batch would be nearly one family.
   pool_batches: 32
+  # One reference cycle reproduces 0006's family episode counts. Each experiment cell
+  # gets this same number of draws; only the distinct boss pool changes.
+  family_draws: {kill: 2290, item: 455, traverse: 3693, boss: 666}
   num_workers: 2
   prefetch_factor: 2
 
@@ -76,5 +81,6 @@ train:
   max_grad_norm: 1.0
   log_every: 50
   val_every: 1000
+  save_steps: [3000, 10000]
   # Batches per in-run validation. 0 in `val_full` means the whole validation set.
   val_batches: 60

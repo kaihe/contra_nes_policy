@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import random
 import signal
 import time
 from collections import Counter
@@ -29,8 +30,10 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from contra_policy.dataset import (ContraCrossViewDataset, LengthGroupedSampler,
-                                   load_or_build_index, pad_episodes, shard_paths)
+from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset,
+                                   FixedFamilyBatchSampler, LengthGroupedSampler,
+                                   load_or_build_index, pad_episodes, scaling_release,
+                                   shard_paths)
 from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
 
@@ -123,18 +126,39 @@ class BCTrainer:
         fams = list(args.families)
         overrides = {k: os.path.expanduser(str(v))
                      for k, v in dict(args.get("shard_overrides", {})).items()}
-        train_tars = shard_paths(shard_dir, fams, "train", overrides)
-        val_tars = shard_paths(shard_dir, fams, "val", overrides)
+        scaling = args.get("boss_scaling", {})
+        release = None
+        if bool(scaling.get("enabled", False)):
+            if "boss" not in fams:
+                raise ValueError("boss_scaling requires 'boss' in families")
+            release = scaling_release(
+                str(scaling.manifest), int(scaling.shard_count),
+                str(scaling.validation_sha256))
+            other = [f for f in fams if f != "boss"]
+            train_tars = shard_paths(shard_dir, other, "train", overrides) + release["train"]
+            val_tars = shard_paths(shard_dir, other, "val", overrides) + release["val"]
+            print(f"[bc] boss scaling D{int(scaling.shard_count)} · "
+                  f"{release['train_episodes']} episodes / "
+                  f"{release['train_frames']} decisions", flush=True)
+        else:
+            train_tars = shard_paths(shard_dir, fams, "train", overrides)
+            val_tars = shard_paths(shard_dir, fams, "val", overrides)
         train_idx = load_or_build_index(train_tars, args.cache_dir)
         val_idx = load_or_build_index(val_tars, args.cache_dir)
         expected = args.get("expected_episodes", {})
-        _require_family_counts(train_idx, dict(expected.get("train", {})), "train")
-        _require_family_counts(val_idx, dict(expected.get("val", {})), "val")
+        expected_train = dict(expected.get("train", {}))
+        expected_val = dict(expected.get("val", {}))
+        if release is not None:
+            expected_train["boss"] = release["train_episodes"]
+            expected_val["boss"] = release["val_episodes"]
+        _require_family_counts(train_idx, expected_train, "train")
+        _require_family_counts(val_idx, expected_val, "val")
         ds_kw = dict(whole_episode=True, image_size=int(args.image_size),
                      sigma_px=float(args.sigma_px), aux_size=int(args.policy.aux_size),
                      prev_action_keep_prob=0.0, seed=int(args.seed))
         self.train_ds = ContraCrossViewDataset(train_idx, **ds_kw)
         self.val_ds = ContraCrossViewDataset(val_idx, **ds_kw)
+        self.train_index = train_idx
         # -1 because the last frame of an episode has no action taken *from* it.
         self.train_len = [max(1, e["length"] - 1) for e in train_idx]
         self.val_len = [max(1, e["length"] - 1) for e in val_idx]
@@ -170,6 +194,9 @@ class BCTrainer:
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         self.step = 0
         self.best = math.inf
+        self.draw_counts: Counter = Counter()
+        self.token_counts: Counter = Counter()
+        self._resume(str(args.resume_from) if args.get("resume_from") else None)
 
     # -- plumbing -----------------------------------------------------------
 
@@ -183,12 +210,21 @@ class BCTrainer:
         return 1.0
 
     def _loader(self, ds, lengths, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            ds, collate_fn=pad_episodes,
-            batch_sampler=LengthGroupedSampler(
+        family_draws = dict(self.args.loader.get("family_draws", {}))
+        if shuffle and family_draws:
+            batch_sampler = FixedFamilyBatchSampler(
+                self.train_index, lengths, int(self.args.loader.batch_size),
+                family_draws, num_batches=int(self.args.train.steps),
+                pool_batches=int(self.args.loader.pool_batches),
+                seed=int(self.args.seed), start_batch=self.step)
+        else:
+            batch_sampler = LengthGroupedSampler(
                 lengths, int(self.args.loader.batch_size),
                 pool_batches=int(self.args.loader.pool_batches),
-                seed=int(self.args.seed), shuffle=shuffle),
+                seed=int(self.args.seed), shuffle=shuffle)
+        return DataLoader(
+            ds, collate_fn=pad_episodes,
+            batch_sampler=batch_sampler,
             num_workers=int(self.args.loader.num_workers),
             pin_memory=True,
             prefetch_factor=int(self.args.loader.prefetch_factor)
@@ -217,6 +253,7 @@ class BCTrainer:
         self.policy.train()
         if self.policy.cfg.freeze_encoder:
             self.policy.encoder.eval()      # keep frozen norms in inference mode
+        accounting = list(zip(batch["family"].tolist(), batch["seq_len"].tolist()))
         batch = self._to_device(batch)
         loss, metrics = self._forward(batch)
 
@@ -229,6 +266,12 @@ class BCTrainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.scheduler.step()
+        # Count only a completed optimizer step. An exception midway through the
+        # forward/backward path must not make a resumed checkpoint double-count it.
+        for family_id, seq_len in accounting:
+            family = FAMILIES[int(family_id)]
+            self.draw_counts[family] += 1
+            self.token_counts[family] += int(seq_len)
 
         row = {k: float(v) for k, v in metrics.items()}
         row.update({"grad_norm": float(gn), "lr": self.optimizer.param_groups[0]["lr"]})
@@ -261,9 +304,12 @@ class BCTrainer:
                     row["step"] = self.step
                     row["step_ms"] = elapsed * 1000.0
                     row["tokens_per_sec"] = tokens / elapsed
+                    row.update(self._accounting_metrics())
                     self._emit(row, "train")
                 if self.step % int(self.args.train.val_every) == 0:
                     self._run_val(int(self.args.train.val_batches))
+                if self.step in {int(x) for x in self.args.train.get("save_steps", [])}:
+                    self.save()
         finally:
             # Whole val set however the run ended — this is the gate.
             self._run_val(0, tag="val_full")
@@ -272,6 +318,7 @@ class BCTrainer:
     def _run_val(self, batches: int, tag: str = "val") -> None:
         v = self.validate(batches)
         v["step"] = self.step
+        v.update(self._accounting_metrics())
         self._emit(v, tag)
         val_loss = v["loss"]
         if val_loss < self.best:
@@ -288,9 +335,60 @@ class BCTrainer:
     def save(self, final: bool = False, best: bool = False) -> str:
         tag = "final" if final else ("best" if best else f"{self.step:06d}")
         path = os.path.join(self.run_dir, "checkpoints", f"policy-{tag}.pt")
-        self.policy.save(path, step=self.step, best_val_loss=self.best,
-                         train_config=OmegaConf.to_container(self.args, resolve=True))
+        self.policy.save(
+            path, step=self.step, best_val_loss=self.best,
+            train_config=OmegaConf.to_container(self.args, resolve=True),
+            optimizer=self.optimizer.state_dict(), scheduler=self.scheduler.state_dict(),
+            scaler=self.scaler.state_dict(), family_draws=dict(self.draw_counts),
+            family_tokens=dict(self.token_counts), torch_rng=torch.get_rng_state(),
+            cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            numpy_rng=np.random.get_state(), python_rng=random.getstate())
+        print(f"[bc] saved {path}", flush=True)
         return path
+
+    def _accounting_metrics(self) -> Dict[str, float]:
+        return {**{f"draws/{f}": float(self.draw_counts[f]) for f in FAMILIES},
+                **{f"valid_tokens/{f}": float(self.token_counts[f]) for f in FAMILIES}}
+
+    def _resume(self, path: Optional[str]) -> None:
+        """Restore an exact optimizer/schedule/sampling continuation checkpoint."""
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        required = {"policy", "optimizer", "scheduler", "scaler", "step",
+                    "train_config"}
+        missing = sorted(required - set(ckpt))
+        if missing:
+            raise ValueError(f"BC checkpoint cannot resume; missing {missing}")
+        previous = ckpt["train_config"]
+        current = OmegaConf.to_container(self.args, resolve=True)
+        for keys in (("seed",), ("loader", "family_draws"),
+                     ("boss_scaling", "shard_count"), ("train", "steps")):
+            old, new = previous, current
+            for key in keys:
+                old = old.get(key) if isinstance(old, dict) else None
+                new = new.get(key) if isinstance(new, dict) else None
+            if old != new:
+                dotted = ".".join(keys)
+                raise ValueError(f"resume changes {dotted}: {old!r} -> {new!r}")
+        self.policy.load_state_dict(ckpt["policy"], strict=True)
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.scheduler.load_state_dict(ckpt["scheduler"])
+        self.scaler.load_state_dict(ckpt["scaler"])
+        self.step = int(ckpt["step"])
+        self.best = float(ckpt.get("best_val_loss", math.inf))
+        self.draw_counts.update(ckpt.get("family_draws", {}))
+        self.token_counts.update(ckpt.get("family_tokens", {}))
+        if "torch_rng" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng"])
+        if torch.cuda.is_available() and ckpt.get("cuda_rng"):
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+        if "numpy_rng" in ckpt:
+            np.random.set_state(ckpt["numpy_rng"])
+        if "python_rng" in ckpt:
+            random.setstate(ckpt["python_rng"])
+        print(f"[bc] resumed {path} at step {self.step}", flush=True)
 
 
 class _null:

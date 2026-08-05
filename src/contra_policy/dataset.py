@@ -492,6 +492,60 @@ def shard_paths(shard_dir: str, configs: Sequence[str], split: str,
     return paths
 
 
+def scaling_release(manifest_path: str, shard_count: int,
+                    validation_sha256: str) -> dict:
+    """Resolve one exact nested training prefix from a data-release manifest.
+
+    The scaling experiment must not glob a live release directory: a later shard
+    would silently change the cell being trained.  The manifest is therefore the
+    authority for both membership and the frozen validation artifact.  Episode counts
+    are returned for the caller to verify against the decoded tar index.
+    """
+    manifest_path = os.path.abspath(os.path.expanduser(manifest_path))
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+    matches = [p for p in manifest.get("train_scaling_prefixes", [])
+               if int(p.get("shard_count", -1)) == int(shard_count)]
+    if len(matches) != 1:
+        available = [p.get("shard_count")
+                     for p in manifest.get("train_scaling_prefixes", [])]
+        raise ValueError(f"manifest has no unique {shard_count}-shard prefix; "
+                         f"available: {available}")
+
+    root = os.path.dirname(manifest_path)
+
+    def resolve(relative: str) -> str:
+        path = os.path.abspath(os.path.join(root, relative))
+        if os.path.commonpath((root, path)) != root:
+            raise ValueError(f"manifest path escapes release directory: {relative}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"release artifact not found: {path}")
+        return path
+
+    prefix = matches[0]
+    train = [resolve(p) for p in prefix["files"]]
+    if len(train) != int(shard_count):
+        raise ValueError(f"{shard_count}-shard prefix lists {len(train)} files")
+    validation = manifest.get("validation", {})
+    val_path = resolve(validation["file"])
+    declared = str(validation.get("sha256", ""))
+    if declared != validation_sha256:
+        raise ValueError(f"validation SHA contract is {validation_sha256}, "
+                         f"manifest declares {declared}")
+    h = hashlib.sha256()
+    with open(val_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+    if actual != validation_sha256:
+        raise ValueError(f"validation SHA mismatch: expected {validation_sha256}, "
+                         f"resolved {actual}")
+    return {"train": train, "val": [val_path],
+            "train_episodes": int(prefix["episodes"]),
+            "train_frames": int(prefix["frames"]),
+            "val_episodes": int(validation["episodes"])}
+
+
 def family_weights(index: List[dict], alpha: float) -> np.ndarray:
     """Per-episode sampling weight that flattens the family mix by ``alpha``.
 
@@ -795,3 +849,95 @@ class LengthGroupedSampler(Sampler):
         if self.shuffle:
             rng.shuffle(batches)
         yield from batches
+
+
+class FixedFamilyBatchSampler(Sampler):
+    """A deterministic fixed-family schedule followed by local length grouping.
+
+    Each reference cycle contains exactly ``family_draws[family]`` draws.  A family's
+    episode stream is an endless sequence of independently shuffled full passes, so a
+    small prefix cycles as needed while a large prefix is covered without replacement
+    across reference cycles.  ``start_batch`` makes continuation independent of
+    DataLoader worker/prefetch state: reconstructing batch N reconstructs every later
+    draw exactly.
+    """
+
+    def __init__(self, index: Sequence[dict], lengths: Sequence[int], batch_size: int,
+                 family_draws: Dict[str, int], num_batches: int,
+                 pool_batches: int = 32, seed: int = 0, start_batch: int = 0):
+        if len(index) != len(lengths):
+            raise ValueError("index and lengths must have the same size")
+        self.index = list(index)
+        self.lengths = list(lengths)
+        self.batch_size = int(batch_size)
+        self.family_draws = {str(k): int(v) for k, v in family_draws.items()}
+        self.num_batches = int(num_batches)
+        self.pool = self.batch_size * int(pool_batches)
+        self.seed = int(seed)
+        self.start_batch = int(start_batch)
+        if not 0 <= self.start_batch <= self.num_batches:
+            raise ValueError("start_batch must be between zero and num_batches")
+        if sum(self.family_draws.values()) % self.batch_size:
+            raise ValueError("reference-cycle draws must be divisible by batch_size")
+        self.by_family = {
+            family: [i for i, ep in enumerate(self.index) if ep["family"] == family]
+            for family in self.family_draws
+        }
+        missing = [f for f, members in self.by_family.items() if not members]
+        if missing:
+            raise ValueError(f"fixed-family schedule has no episodes for {missing}")
+
+    def __len__(self) -> int:
+        return self.num_batches - self.start_batch
+
+    def __iter__(self):
+        family_names = list(self.family_draws)
+        family_epoch = {f: 0 for f in family_names}
+        family_queue = {f: collections.deque() for f in family_names}
+
+        def take(family: str) -> int:
+            queue = family_queue[family]
+            if not queue:
+                position = family_names.index(family)
+                rng = np.random.default_rng(
+                    np.random.SeedSequence([self.seed, position, family_epoch[family]]))
+                queue.extend(rng.permutation(self.by_family[family]).tolist())
+                family_epoch[family] += 1
+            return queue.popleft()
+
+        produced = 0
+        cycle = 0
+        while produced < self.num_batches:
+            remaining = (self.num_batches - produced) * self.batch_size
+            cycle_size = sum(self.family_draws.values())
+            if remaining >= cycle_size:
+                draws = self.family_draws
+            else:
+                # A 20k-step run ends part-way through its twelfth 7,104-draw cycle.
+                # Allocate that tail up front so every data prefix has identical total
+                # family counts even though length grouping rearranges its batches.
+                exact = {f: remaining * self.family_draws[f] / cycle_size
+                         for f in family_names}
+                draws = {f: int(math.floor(exact[f])) for f in family_names}
+                left = remaining - sum(draws.values())
+                priority = sorted(family_names,
+                                  key=lambda f: (-(exact[f] - draws[f]),
+                                                 family_names.index(f)))
+                for family in priority[:left]:
+                    draws[family] += 1
+            labels = [f for f in family_names for _ in range(draws[f])]
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, 0xBC, cycle]))
+            rng.shuffle(labels)
+            order = [take(f) for f in labels]
+            batches = []
+            for start in range(0, len(order), self.pool):
+                pool = order[start:start + self.pool]
+                pool.sort(key=self.lengths.__getitem__)
+                batches.extend(pool[i:i + self.batch_size]
+                               for i in range(0, len(pool), self.batch_size))
+            rng.shuffle(batches)
+            for batch in batches:
+                if produced >= self.start_batch:
+                    yield batch
+                produced += 1
+            cycle += 1

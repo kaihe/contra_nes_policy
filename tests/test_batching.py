@@ -9,12 +9,15 @@ validation number excluded the largest family, and nothing crashed.
 from __future__ import annotations
 
 import collections
+import hashlib
+import json
 import os
 
 import pytest
 import torch
 
-from contra_policy.dataset import LengthGroupedSampler, pad_episodes
+from contra_policy.dataset import (FixedFamilyBatchSampler, LengthGroupedSampler,
+                                   pad_episodes, scaling_release)
 
 
 def _lengths(n=800, seed=0):
@@ -66,6 +69,111 @@ def test_batches_group_similar_lengths():
         got = [lens[i] for i in b]
         waste.append(1 - sum(got) / (max(got) * len(got)))
     assert sum(waste) / len(waste) < 0.15, "length grouping is not reducing padding"
+
+
+# ── fixed-family scaling schedule ────────────────────────────────────────────
+
+def _family_index(counts):
+    index = []
+    for family, count in counts.items():
+        index.extend({"family": family, "uid": f"{family}-{i}"} for i in range(count))
+    return index
+
+
+def test_fixed_family_schedule_has_exact_reference_cycle_counts():
+    index = _family_index({"kill": 7, "boss": 3})
+    sampler = FixedFamilyBatchSampler(
+        index, list(range(10, 20)), batch_size=2,
+        family_draws={"kill": 6, "boss": 4}, num_batches=5,
+        pool_batches=2, seed=4)
+
+    seen = collections.Counter(index[i]["family"] for batch in sampler for i in batch)
+
+    assert seen == {"kill": 6, "boss": 4}
+
+
+def test_fixed_family_schedule_resume_reconstructs_the_exact_suffix():
+    index = _family_index({"kill": 9, "item": 4, "boss": 6})
+    kwargs = dict(index=index, lengths=list(range(19)), batch_size=2,
+                  family_draws={"kill": 6, "item": 2, "boss": 4},
+                  num_batches=17, pool_batches=3, seed=11)
+    complete = list(FixedFamilyBatchSampler(**kwargs))
+    resumed = list(FixedFamilyBatchSampler(**kwargs, start_batch=7))
+
+    assert resumed == complete[7:]
+
+
+def test_large_family_is_covered_without_replacement_across_cycles():
+    index = _family_index({"boss": 8})
+    sampler = FixedFamilyBatchSampler(
+        index, [10] * 8, batch_size=1, family_draws={"boss": 3},
+        num_batches=6, pool_batches=3, seed=0)
+    picks = [batch[0] for batch in sampler]
+
+    assert len(set(picks)) == 6
+
+
+def test_partial_final_cycle_keeps_total_family_counts_fixed_across_lengths():
+    index = _family_index({"kill": 7, "boss": 5})
+    kwargs = dict(index=index, batch_size=2,
+                  family_draws={"kill": 6, "boss": 4}, num_batches=7,
+                  pool_batches=2, seed=3)
+    schedules = [FixedFamilyBatchSampler(lengths=lengths, **kwargs)
+                 for lengths in (list(range(12)), list(reversed(range(12))))]
+    counts = [collections.Counter(index[i]["family"]
+                                  for batch in sampler for i in batch)
+              for sampler in schedules]
+
+    assert counts[0] == counts[1] == {"kill": 8, "boss": 6}
+
+
+def test_scaling_release_uses_manifest_membership_and_pins_validation(tmp_path):
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    for name in ("boss-train-00000.tar", "boss-train-00001.tar"):
+        (hf / name).write_bytes(b"train")
+    val = hf / "boss-val-00000.tar"
+    val.write_bytes(b"frozen validation")
+    digest = hashlib.sha256(val.read_bytes()).hexdigest()
+    manifest = {
+        "train_scaling_prefixes": [
+            {"shard_count": 1, "episodes": 3, "frames": 30,
+             "files": ["hf/boss-train-00000.tar"]},
+            {"shard_count": 2, "episodes": 6, "frames": 60,
+             "files": ["hf/boss-train-00000.tar", "hf/boss-train-00001.tar"]},
+        ],
+        "validation": {"episodes": 2, "file": "hf/boss-val-00000.tar",
+                       "sha256": digest},
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+
+    got = scaling_release(str(path), 1, digest)
+
+    assert got["train"] == [str(hf / "boss-train-00000.tar")]
+    assert got["train_episodes"] == 3
+    assert got["val"] == [str(val)]
+
+
+def test_scaling_release_rejects_a_changed_validation_tar(tmp_path):
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    train = hf / "boss-train-00000.tar"
+    val = hf / "boss-val-00000.tar"
+    train.write_bytes(b"train")
+    val.write_bytes(b"changed")
+    expected = hashlib.sha256(b"original").hexdigest()
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({
+        "train_scaling_prefixes": [
+            {"shard_count": 1, "episodes": 1, "frames": 1,
+             "files": ["hf/boss-train-00000.tar"]}],
+        "validation": {"episodes": 1, "file": "hf/boss-val-00000.tar",
+                       "sha256": expected},
+    }))
+
+    with pytest.raises(ValueError, match="validation SHA mismatch"):
+        scaling_release(str(path), 1, expected)
 
 
 # ── collate ──────────────────────────────────────────────────────────────────
