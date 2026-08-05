@@ -19,6 +19,13 @@ during the run. Add resumable checkpoints and a wall-clock limit before launch. 
 learning from the fixed probe and held-out closed-loop evaluation across checkpoints,
 not sampled training success and not the final checkpoint by default.
 
+**Execution note (2026-08-04).** The run was intentionally stopped after update 61 to
+reallocate the remaining compute to MC-search data generation. Its fixed probe showed
+an early, noisy gain, but 61 updates do not answer this document's fourteen-hour
+question. The resulting `grpo-final.pt` is a pilot artifact, not evidence for or
+against long-horizon GRPO. The active sequence is now data scale, model scale, then RL
+scale; see [0009](0009-boss-data-scaling.md).
+
 ---
 
 ## 1. Why this experiment

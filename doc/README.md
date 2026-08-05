@@ -13,6 +13,7 @@ Requests to another repo are **issues on that repo**, not docs here — see the
 
 | doc | status | what it decides |
 |---|---|---|
+| [0009 Boss-data scaling](0009-boss-data-scaling.md) | Proposed | measure four nested mixed-v2 boss-data prefixes at fixed 12.86M model size, optimization compute and family exposure across three seeds; use closed-loop boss success to select data before scaling parameters or RL. |
 | [0008 Fourteen-hour GRPO](0008-fourteen-hour-grpo.md) | Proposed | hold the current recipe fixed for a wall-clock-limited ~1,000-update run from the latest action-only BC policy; require true resumption, fixed probes and held-out checkpoint selection before claiming that longer training teaches gameplay. |
 | [0007 Compile and varlen experiment](0007-compiled-varlen-training.md) | Implemented | both optimizations missed the 10% end-to-end gate and were rolled back; eager/padded remains the shared BC/GRPO path, while the corrected loader-inclusive timer stays. |
 | [0006 Action-only base policy](0006-action-only-base-policy.md) | Implemented | train one action-only causal GPT with masked cross-entropy, report only Karpathy's optimisation metrics, and replace the boss slice with all 666 episodes from the full-fight release while preserving old-checkpoint compatibility. |
