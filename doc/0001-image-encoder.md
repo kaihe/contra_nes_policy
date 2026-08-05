@@ -1,33 +1,26 @@
-# One token per frame: the Contra image encoder
+# The image encoder: one token per image
 
-Status: Implemented — §2 (the design) superseded by [0002](0002-symmetric-encoder.md)
+Status: Implemented
 Supersedes: —
 
-> **0002 changes the architecture**: the encoder becomes goal-agnostic and goal matching
-> moves to the policy's temporal attention. Everything below still stands as the record
-> of what was built and measured — in particular §3 (rejected alternatives) and §4 (the
-> `point_err_px` false alarm), which are architecture-independent.
+**Question.** The policy spends 6 tokens per decision
+(`[view×4, interaction, prev_action]`), which makes a task-length context
+unaffordable. Can one token per frame carry as much as four?
 
-**Question.** The policy spends 6 tokens per decision (`[view×4, interaction,
-prev_action]`), which makes a task-length context unaffordable. Can one token per frame
-carry as much as four, and can goal grounding move out of the temporal transformer into
-the encoder?
+**Answer.** Yes. `src/contra_encoder/` is a single symmetric function —
 
-**Answer.** Yes, on every family. A single 512-d token, with occupancy decoded back out
-of it, reaches `peak_hit` **0.982–0.999** and `pck16` **0.983–1.000** across all four
-families on the full val set, and **0.43–2.19 px** point error wherever that statistic
-is well-defined. Entity occupancy is recovered at dice **0.96 player / 0.96 enemies /
-0.91 enemy_bullets**.
+```python
+encode(image) -> token, (entity_heatmap, [reconstruction])
+```
 
-An earlier draft of this doc reported boss "plateauing at 8.8 px" and called the gate
-marginal. **That was a broken metric, not a broken encoder** — see §4. Boss is in fact
-the strongest family.
-
-Built as `src/contra_encoder/`; the policy is not yet retokenised.
+— applied to agent frames and goal frames alike, with 4-class entity occupancy decoded
+back out of the 512-d token. It recovers the entity structure a 4-token encoder held,
+at **16.6M parameters**, and it knows nothing about goals: goal matching belongs to the
+policy's temporal attention.
 
 ---
 
-## 1. Why — the evidence
+## 1. Why
 
 **The context is far too short.** A 32-decision window fully contains **2.1%** of
 training tasks:
@@ -42,9 +35,9 @@ training tasks:
 Boss is the family the wider effort exists to fix (91% death, 8.8% completion) and its
 median task is 281 decisions — 14 seconds against a 1.6 s window.
 
-**A longer window is not free.** Profiling one training update: optimiser 41.7%, rollout
-inference 34.2%, emulator 12.7% — **76% is GPU**. Extending to 1024 decisions naively is
-32× the per-step attention.
+**A longer window is not free.** Profiling one training update: optimiser 41.7%,
+rollout inference 34.2%, emulator 12.7% — **76% is GPU**. Extending to 1024 decisions
+naively is 32× the per-step attention.
 
 **Tokens per decision are the lever.**
 
@@ -57,37 +50,55 @@ A 6× reduction, which turns whole-episode context from a 32× cost into roughly
 
 ## 2. The design
 
+One conv trunk, one projection, one function — whatever image it is given:
+
 ```python
-encode_goal(goal_image, goal_mask, interaction) -> (B, 512)              # once per chunk
-encode_frame(frame, goal_token)                 -> (B, 512), (B, C, 32, 32)
+encode(image)      -> token (512)
+entity_head(token) -> (4, 32, 32)   player / player_bullets / enemies / enemy_bullets
+recon_head(token)  -> (3, 256, 256) optional, see §6
 ```
 
-- **One shared conv trunk** for frame and goal, as the policy does. A second trunk was
-  11.2M duplicated parameters learning the same features from less data.
-- **1×1 channel reduction before flattening.** `Linear(1024×16, 512)` is 8.4M parameters
-  per projection — more than the trunk feeding it. Reducing 1024→256 first costs 0.26M
-  and makes the projection 2.4M. Total **20.3M**, down from 50.5M in the first draft.
-- **The frame encoder stays goal-conditioned**, via FiLM on the single goal token. A
-  per-frame heatmap answers "where is *the goal entity*", which is unanswerable without
-  the goal. What got cheaper is conditioning on one token instead of spatial
-  cross-attention over the goal's whole patch grid.
-- **Two heads, both decoded from the token**: a 1-channel goal map (feeding the pinned
-  `point_err_px`) and a 4-channel entity map (`player`, `player_bullets`, `enemies`,
-  `enemy_bullets`). Decoding from the *token*, not the conv map, is what forces spatial
-  structure to survive the compression — there is a test asserting no gradient path
-  around it.
-- **`prev_action` is deleted, not merged.** It was already a constant
-  (`prev_action_dropout` all zeros), and the ablation on the same checkpoint shows
-  feeding it collapses boss 8.8% → 1.8% and doubles grounding error 5.3 → 12.1 px.
+- **Occupancy is decoded from the token, never from the conv map.** That is what forces
+  spatial structure through the 512-d bottleneck rather than letting it live in a
+  feature map the head could read around. A test asserts no gradient path bypasses the
+  token, *and* that the path exists when it is attached — otherwise it passes vacuously.
+- **Goal frames need no special handling.** `goal.png` is a real episode frame with the
+  target painted into the RGB — sampled at the goal points it reads (225, 110, 18)
+  against an image mean of (56, 70, 14). An image with the answer drawn on it is still
+  an image.
+- **Goal frames are supervised, not merely encoded.** `goal_frame_idx` locates the
+  frame, so `entities[cls][goal_frame_idx]` labels it exactly as any other. Both kinds
+  go through one concatenated forward; the goal frame's dice is reported separately
+  because it is ~1 row per window against ~32 and would otherwise vanish into the mean.
+- **1×1 channel reduction before flattening.** `Linear(1024×16, 512)` is 8.4M
+  parameters per projection, more than the trunk feeding it. Reducing 1024→256 first
+  costs 0.26M and makes the projection 2.4M.
+- **Entity sigma is 6 px, not the goal blob's 12.** At A=32 a 12 px sigma is 1.66 cells,
+  which smears a boss frame's ~4.9 enemy bullets into one blob.
 
-Entity sigma is **6 px, not the goal's 12**: at A=32 a 12 px sigma is 1.66 cells, which
-smears a boss frame's ~4.9 enemy bullets into one blob.
+The policy then builds `[interaction, goal_token, img_token × N]` and computes goal
+grounding on the **temporal** output, where `model.py` already computes it.
 
-## 3. What was rejected, and why
+## 3. What was tried and rejected
+
+**A goal-conditioned encoder.** The first implemented version modulated the frame
+encode by a goal token via FiLM, so the encoder itself could answer "where is the goal
+in this frame". It worked — see §5 — but it was the weaker half of the design. FiLM
+produces one scale and one shift per channel, broadcast over the whole spatial grid: it
+can say "attend to turret-ish features", never "look *there*". Attention between a
+frame token and a goal token expresses the comparison directly, and already exists
+downstream. Removing it deleted `mask_backbone`, `goal_reduce`, `goal_proj` and `film`
+— **3.65M parameters** that existed only to answer a question the policy answers
+better.
+
+What that cost: stage A can no longer measure goal grounding at all, so a grounding
+regression would first surface at stage B tangled with the retokenisation, the BC
+retrain and the unfrozen trunk. Entity dice is the proxy — it measures the same spatial
+content the goal head was reading.
 
 **Migrating to Stable-Baselines3.** Three of four blockers are in SB3's core training
 loop: no recurrent state in `collect_rollouts`, `RolloutBuffer` shuffles *transitions*
-(which hands a recurrent core a memory from another trajectory), and fixed `n_steps`
+(handing a recurrent core a memory from another trajectory), and fixed `n_steps`
 windows bootstrap at the boundary where we need complete unbootstrapped episodes with a
 per-task budget. A migration ends up overriding everything SB3's PPO *is*, keeping only
 `SubprocVecEnv` — whose entire target is the 12.7% of wall the emulator occupies, so
@@ -104,8 +115,11 @@ checkpoint the whole run initialises from.
 RAM would force that knowledge across the boundary. Per-class positions in the existing
 JSON are 20× smaller and consistent with how `centroids` already works.
 
-**Merging `prev_action` into the image token.** Superseded by the ablation — the signal
-is harmful whether or not it is recoverable from pixels.
+**`prev_action`, in any form.** It was already a constant (`prev_action_dropout` all
+zeros), and the ablation on the same checkpoint is decisive: feeding it collapses boss
+**8.8% → 1.8%** and doubles grounding error **5.3 → 12.1 px**. Merging it into the
+image token was considered and dropped for the same reason — the signal is harmful
+whether or not it is recoverable from pixels.
 
 **`exist_acc` as a gate.** Degenerate: the goal is visible on 100.0% of kill and 100.0%
 of boss val frames, so a constant "visible" predictor scores 100% on both families that
@@ -113,75 +127,118 @@ matter.
 
 **Plain MSE as the entity metric.** Not wrong, but unscaled — these maps are 95–98%
 empty, so predicting *nothing* already scores 0.0021 (player) to 0.0065 (enemies), and
-the baseline differs per class. Replaced by `dice` (bounded, comparable) and
-`mse_skill` = `1 − MSE/MSE(zeros)` (the same quantity, referenced to that baseline).
+the baseline differs per class. Replaced by `dice` (bounded, comparable across classes)
+and `mse_skill` = `1 − MSE/MSE(zeros)` — the same quantity, referenced to that
+baseline. They are complementary: dice cannot go negative, so it scores silence and
+confident error identically; `mse_skill` distinguishes them.
 
-## 4. Risks, and the metric that gates each
+## 4. The `point_err_px` false alarm
 
-| risk | why it is plausible | gate | outcome |
-|---|---|---|---|
-| one token cannot hold enough spatial structure | four view tokens do it today; the heatmap needs 32×32 | `peak_hit` and `pck16` per family | **passed — 0.982–0.999 / 0.983–1.000** |
-| per-frame grounding loses temporal smoothing | NES renders ≤8 sprites/scanline and flickers deliberately | same | **no sign of it** — boss scores highest |
-| unfreezing the trunk destabilises BC | it has been frozen for every run to date | `val/bc_acc` vs the 72.8% baseline | not yet tested (stage B) |
-| longer window blows host RAM | 20 GB WSL VM already binds | peak PSS under `tools/rss_guard.py` | **passed — 2.5 GB** |
+Worth keeping because the failure mode is one to recognise again: **a metric that
+degrades as the model improves.**
 
-### The `point_err_px` false alarm
-
-`point_err_px` was the original gate and it was the wrong instrument. `points_to_target`
-collapses a frame's goal centroids to their **mean**. Measured over the val split:
+`point_err_px` was the original gate. `points_to_target` collapses a frame's goal
+centroids to their **mean**:
 
 | family | centroids/frame | % multi-component | spread from their mean |
 |---|---|---|---|
 | kill / item / traverse | 1.00 | 0% | — |
 | **boss** | **4.57** (max 7) | **98.7%** | **34.2 px** |
 
-Boss is the only family where the "target point" names a spot where nothing is. Error
-against it therefore **grows as a predictor gets sharper**: a blurry map's centre of
-mass sits near the cloud's centre, a confident one sits on a component. That is exactly
-what the run did — boss read 2.6 px at step 3000 and 8.8 px at step 20000, while
-`peak_hit` climbed to 0.999 and `pck16` to 1.000.
+Boss is the only family where the target names a spot where nothing is. Error against
+it therefore *grows as a predictor sharpens*: a blurry map's centre of mass sits near
+the cloud's centre, a confident one sits on a component. The first trained encoder read
+2.6 px at step 3000 and 8.8 px at step 20000 on boss, while `peak_hit` climbed to 0.999
+and `pck16` to 1.000. Restricting to `n_goal_points == 1` settled it — on the 128 boss
+frames where `point` is well-defined the error was **0.43 px**, the best of any family.
 
-Restricting the statistic to `n_goal_points == 1` settles it: on the 128 boss frames
-where `point` is well-defined, the error is **0.43 px at pck8 = 1.00** — the best of any
-family.
+`ContraCrossViewDataset` now emits `n_goal_points` so any consumer can mask
+multi-component frames. `point_err_px` itself is untouched: it is a frozen interface
+shared with `contra_nes_evaluation`, and only the aggregation changed.
 
-**Fix:** `ContraCrossViewDataset` now emits `n_goal_points`; point statistics are masked
-to single-centroid frames and `multi_goal_frac` reports what was excluded, so a thin
-sample can never pass as authoritative. `point_err_px` itself is untouched — it is a
-frozen interface shared with `contra_nes_evaluation`; only the aggregation changed.
+## 5. Results
 
-**Full val, corrected gate:**
+**Goal-conditioned encoder** (20,000 steps, full val, 85,054 frames) — the design §3
+rejected, kept as the baseline the current one had to match:
 
-| family | frames | peak_hit | pck16 | point frames | err_px | multi% |
-|---|---|---|---|---|---|---|
-| kill | 16,964 | 0.995 | 0.995 | 16,964 | 0.84 | 0% |
-| item | 2,271 | 0.982 | 0.983 | 2,216 | 2.19 | 0% |
-| traverse | 54,902 | 0.994 | 0.999 | 21,035 | 1.84 | 0% |
-| boss | 10,071 | **0.999** | **1.000** | 128 | **0.43** | 99% |
-
-Entity dice, per family (scored separately — the run's `validate` was dropping the
-objective's metrics, since fixed):
-
-| family | player | player_bullets | enemies | enemy_bullets |
+| family | peak_hit | pck16 | entity `enemies` | entity `enemy_bullets` |
 |---|---|---|---|---|
-| kill | 0.984 | 0.634 | 0.968 | 0.915 |
-| item | 0.972 | 0.632 | 0.919 | 0.854 |
-| traverse | 0.986 | 0.632 | 0.959 | 0.920 |
-| boss | 0.956 | 0.735 | **0.991** | 0.902 |
+| kill | 0.995 | 0.995 | 0.968 | 0.915 |
+| item | 0.982 | 0.983 | 0.919 | 0.854 |
+| traverse | 0.994 | 0.999 | 0.959 | 0.920 |
+| boss | 0.999 | 1.000 | 0.991 | 0.902 |
 
-## 5. Sequencing
+**Goal-agnostic encoder** (20,000 steps, full val) — beats it on every class, and had
+already matched it by step 5,000:
 
-1. **Stage A — encoder pretraining.** Done; `src/contra_encoder/`, 31 tests.
-   Gate marginal on boss.
+| | player | player_bullets | enemies | enemy_bullets |
+|---|---|---|---|---|
+| goal-conditioned baseline | 0.984 | 0.634 | 0.960 | 0.910 |
+| step 5000 | 0.977 | 0.660 | 0.960 | 0.923 |
+| **final (20000)** | **0.99** | **0.70** | **0.98** | **0.97** |
+
+Per family at the end: `kill 0.98/0.96 · item 0.97/0.93 · traverse 0.98/0.97 ·
+boss 0.99/0.97` (enemies / enemy_bullets). **Boss scores highest**, and its
+`enemy_bullets` — ~4.9 sprites of ~2 px per frame, the class most relevant to
+surviving a boss fight — went 0.910 → 0.97.
+
+Goal-frame dice is `0.99 / 0.70 / 0.98 / 0.98`, indistinguishable from the agent-frame
+column. The painted marker did not push goal frames out of distribution, which was the
+open risk when we chose to supervise them.
+
+`player_bullets` is the weak class in both designs (0.70 against ~0.98 for the others).
+Not diagnosed. It is the one class the policy plausibly does not need — the player's own
+bullets are a consequence of its actions, not a thing to react to.
+
+## 6. Open: is reconstruction worth it?
+
+Implemented behind `reconstruct: false`. A decoder is 7M at `recon_depth: 16` (27.97M
+at full width — larger than the entire encoder).
+
+The precedent is thinner than it looks. `contra_agent/dreamer/train_ae.py` trains recon
++ entity together, but its claim is that a **recon-*only*** encoder "goes entity-blind"
+— an argument for adding the entity head, not evidence reconstruction helps once you
+have one. Its decoder also had a second job there (the world model renders).
+
+Settle by ablation: entity-only vs entity+recon, on entity dice and stage-B completion.
+
+## 7. Sequencing
+
+1. **Stage A — encoder pretraining.** Done.
 2. **Stage B — retokenise `contra_policy.model`** to `[interact, goal, img × N]`,
-   delete the `prev_action` machinery, rewire the heads. BC at `seq_len: 32` first, so
-   a grounding regression surfaces in a cheap run. Gate: completion vs 72.8%.
+   delete the `prev_action` machinery, restore the goal heatmap head on the temporal
+   output. BC at `seq_len: 32` first, so a grounding regression surfaces in a cheap
+   run. Gate: completion vs the 72.8% BC baseline. **This is where goal grounding is
+   measured for the first time under the goal-agnostic design.**
 3. **Stage C — `win_len: 256` with a per-chunk goal prefix, `maxlen` toward 1024.**
-   The invariant that makes this safe: `maxlen ≥ chunk token length` means the chunk's
+   The invariant that makes it safe: `maxlen ≥ chunk token length` means the chunk's
    own goal prefix can never be evicted by `clipped_causal`.
-4. **Blocked elsewhere:** confirming any boss result on held-out data needs more boss
-   val tasks — n=57 is ~16× underpowered for the effect sizes in play. Tracked as an
-   issue on `contra_nes_data`.
+4. **Reconstruction ablation** (§6), independent of the above.
+
+### Boss val power — considered and dropped
+
+An earlier draft called the 57-task boss val split a blocker: separating 8.8% from
+12.9% at 80% power needs ~920 tasks per arm, so it is ~16× underpowered, and the first
+RL run's boss gain (4.9% → 12.9% on training rollouts, disjoint CIs) could not be
+confirmed on held-out data.
+
+**Not pursued.** Two reasons, the second stronger:
+
+- **RL manufactures boss experience.** BC is only the initialisation. A 500-update run
+  already generated 2,093 boss episodes from 466 train tasks; at 5,000 updates that is
+  ~21,000. Training data was never the constraint.
+- **Boss is a single label.** All 466 train and 57 val tasks are `boss_level1` — one
+  encounter, different starting states. "Generalising across boss tasks" is a much
+  narrower claim than for `traverse` or `kill`, so held-out tasks carry less
+  information than the count suggests.
+
+With 2,000+ boss episodes on training rollouts against 57 val tasks, the **training
+rollouts are the better-powered estimate**. Val's remaining job is detecting gross
+overfitting.
+
+Revisit if either changes: **a run past ~5,000 updates** (per-task repetition reaches
+45×, and 180× at 20,000, where memorising 466 savestates becomes plausible), or **a
+second boss** (then `boss` stops being one label).
 
 ---
 
@@ -190,14 +247,15 @@ objective's metrics, since fixed):
 | claim | source |
 |---|---|
 | task budget distribution | `len(actions)` over 6,904 train `.npz`, `budget = max(24, ceil(2×n))` |
-| 76% GPU / 12.7% emulator | `tools/profile_collect.py`, applied to the measured 12.7 s collect + 9.1 s optimise split |
+| 76% GPU / 12.7% emulator | `tools/profile_collect.py` over the measured 12.7 s collect + 9.1 s optimise split |
 | token and KV figures | `2 × layers × tokens × hidden × 2 bytes × batch`, at 4 layers / 512 hidden / batch 16 |
+| blob painted into `goal.png` | pixel sample at `ppu_to_norm(goal_points)` |
+| `goal_frame_idx` correctness | matches pixel-matched frame index on 8/8 episodes across all families |
 | `prev_action` ablation | `contra_nes_evaluation/runs/0729-e18` vs `0729-e18-noprev`, same checkpoint |
-| goal visible 100% kill/boss | full val sweep of `visibility` over 85,054 frames |
-| entity target consistency | val sweep: 100.0% of visible kill/item/boss goals appear in `entities.enemies` |
-| MSE baselines per class | 630 real target frames; `mean(target²)` for an all-zero predictor |
-| encoder parameter counts | `sum(p.numel())` per submodule, `EncoderConfig()` defaults |
-| val curve and final gate | `runs/encoder/2026-07-31/11-20-50/`, full val (782 batches, 85,054 frames) |
+| goal visible 100% kill/boss | full val sweep of `visibility`, 85,054 frames |
 | boss centroid counts | val sweep of `len(centroids[j])` where `visibility[j]`, 10,128 boss frames |
-| entity dice per family | `encoder-final.pt` re-scored on 200 val batches with the fixed metric path |
-| peak host RAM 2.5 GB | `tools/rss_guard.py` peak group PSS |
+| MSE baselines per class | 630 real target frames, `mean(target²)` for an all-zero predictor |
+| removed parameter counts | `sum(p.numel())` per submodule |
+| `ConvDecoder` 27.97M | `dreamer.models.ConvDecoder(256, depth=32, feat_dim=1024)` |
+| goal-conditioned results | `runs/encoder/2026-07-31/11-20-50/`, full val (782 batches) |
+| goal-agnostic results | `runs/encoder/2026-07-31/18-00-11/`, `phase=val_full`, whole val set |

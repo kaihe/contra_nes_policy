@@ -51,7 +51,7 @@ import torch
 
 from contra_policy.action_space import ACTION_NAMES, actions_np
 from contra_policy.rl.tasks import GoalPrompt, RLTask, TaskCatalog, TaskSampler, resize_to_input
-from contra_policy.rl.trajectory import Episode
+from contra_policy.rl.buffer import Episode
 
 IDLE_ACTION = ACTION_NAMES.index("_")
 
@@ -133,18 +133,22 @@ class RolloutObservation:
     active: np.ndarray         # (B,) bool
 
 
-class RolloutActor:
-    """Steps :class:`CrossViewContraRocket` one decision at a time, batched over slots.
+class TokenHistoryActor:
+    """Steps :class:`~contra_policy.model.ContraPolicy` one decision at a time.
 
-    Memory handling is the part that is easy to get quietly wrong. The recurrent state
-    is a flat list of tensors sharing a leading batch dimension, so recycling slot *i*
-    onto a new episode means writing a fresh ``initial_state`` row into position *i* of
-    every one of them — :meth:`reset`. Miss it and the new episode attends to the
-    previous one's context, which shows up only as a mildly implausible success rate.
+    The policy has no recurrent state, so "memory" is an explicit per-slot list of frame
+    tokens: encode the new frame once, append, and re-run the causal core over
+    ``[interaction, goal, frames…]``. Frame tokens are cached — the encoder never re-runs
+    on history — but the core does see the whole prefix every step, which is exactly the
+    conditioning it was trained under.
 
-    ``prev_action_dropout`` is always zero: the previous-action token is always the
-    learned "unknown" embedding, which is the configuration the 72.8% baseline was
-    measured in and the one PPO must therefore optimise.
+    Recycling slot *i* means **clearing its history**, or the new episode attends to the
+    previous one's frames. That is the same hazard the recurrent version had, in a form
+    that is at least visible: a list you can see the length of.
+
+    Mirrors ``contra_eval.policies.CheckpointPolicy`` deliberately. Training-time and
+    evaluation-time stepping must agree, and two independent implementations of "run the
+    core over a ragged batch of histories" would be two chances to disagree.
     """
 
     def __init__(self, model, batch_size: int, *, device: torch.device,
@@ -158,79 +162,99 @@ class RolloutActor:
         if device.type != "cuda":
             self.autocast_dtype = None
         self.generator = torch.Generator(device=device).manual_seed(int(seed))
-        self.memory: List[torch.Tensor] = [
-            s.to(device) for s in model.recurrent.initial_state(batch_size)]
+        self.d = model.encoder.cfg.hiddim
+        self.prefix = 2
+        self.frames: List[Optional[torch.Tensor]] = [None] * batch_size
+        self.goal: List[Optional[torch.Tensor]] = [None] * batch_size
+        self.inter: List[Optional[torch.Tensor]] = [None] * batch_size
 
     def reset(self, slots: Sequence[int]) -> None:
-        if not len(slots):
-            return
-        fresh = self.model.recurrent.initial_state(len(slots))
-        idx = torch.as_tensor(list(slots), dtype=torch.long, device=self.device)
-        for tensor, new in zip(self.memory, fresh):
-            tensor[idx] = new.to(device=tensor.device, dtype=tensor.dtype)
+        for i in slots:
+            self.frames[i] = self.goal[i] = self.inter[i] = None
 
     def reset_all(self) -> None:
         self.reset(range(self.batch_size))
 
-    def _model_input(self, obs: RolloutObservation) -> Dict:
-        def to_dev(arr, dtype):
-            return torch.from_numpy(np.ascontiguousarray(arr)).to(self.device, dtype)
-
-        b = len(obs.active)
-        return {
-            "image": to_dev(obs.image, torch.uint8).unsqueeze(1),      # (B, 1, S, S, 3)
-            "cross_view": {
-                "cross_view_image": to_dev(obs.goal_image, torch.uint8),
-                "cross_view_obj_mask": to_dev(obs.goal_mask, torch.uint8),
-                "cross_view_obj_id": to_dev(obs.interaction, torch.long).unsqueeze(1),
-            },
-            "prev_action": to_dev(obs.prev_action, torch.long).unsqueeze(1),
-            "prev_action_dropout": torch.zeros((b, 1), dtype=torch.float32,
-                                               device=self.device),
-        }
+    @torch.no_grad()
+    def begin(self, slot: int, goal_image: np.ndarray, interaction: int) -> None:
+        """Encode the episode-constant prefix once, at episode start."""
+        ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
+               if self.autocast_dtype is not None else _null_context())
+        g = torch.from_numpy(goal_image).to(self.device).unsqueeze(0)
+        with ctx:
+            self.goal[slot] = self.model.encoder.encode(g)                      # (1, d)
+            self.inter[slot] = self.model.interaction(
+                torch.tensor([interaction + 1], device=self.device))            # (1, d)
+        self.frames[slot] = None
 
     @torch.no_grad()
-    def act(self, obs: RolloutObservation) -> Dict[str, np.ndarray]:
-        """Sample one action per slot; also report its log-prob and the critic.
+    def act(self, obs: "RolloutObservation") -> Dict[str, np.ndarray]:
+        """One decision per active slot. Returns ``action`` and its ``logprob``.
 
-        The log-prob is the density of the **sampling** distribution, i.e. it carries
-        the temperature. That makes it the true behaviour-policy density, which is
-        what a PPO ratio has to be taken against. It also means ``temperature != 1``
-        is not a valid PPO configuration — the objective evaluates the untempered
-        policy — and :class:`~contra_policy.rl.trainer.RLTrainer` refuses it.
-        ``temperature = 0`` (greedy) is for deterministic replay, not for training.
+        No value: GRPO has no critic. The advantage arrives later, from the group.
         """
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null_context())
+        active = [i for i, im in enumerate(obs.image) if im is not None]
         with ctx:
-            latents, self.memory = self.model(self._model_input(obs), self.memory)
+            imgs = torch.from_numpy(np.stack([obs.image[i] for i in active])).to(self.device)
+            new = self.model.encoder.encode(imgs)                               # (n, d)
+            for k, i in enumerate(active):
+                tok = new[k:k + 1]
+                self.frames[i] = (tok if self.frames[i] is None
+                                  else torch.cat([self.frames[i], tok], 0))
+            logits = self._core_over_histories(active)
 
-        logits = latents["pi_logits"][:, -1, :].float()
-        value = latents["vpred"][:, -1, 0].float()
+        logits = logits.float()
         if self.temperature <= 0:
-            actions = logits.argmax(dim=-1)
-            sampling_logits = logits
+            action = logits.argmax(-1)
+            logp = torch.log_softmax(logits, -1).gather(-1, action[:, None]).squeeze(-1)
         else:
-            sampling_logits = logits / self.temperature
-            probs = torch.softmax(sampling_logits, dim=-1)
-            actions = torch.multinomial(probs, 1, generator=self.generator).squeeze(-1)
-        logprob = torch.log_softmax(sampling_logits, dim=-1).gather(
-            -1, actions.unsqueeze(-1)).squeeze(-1)
-        return {
-            "action": actions.cpu().numpy().astype(np.int64),
-            "logprob": logprob.cpu().numpy().astype(np.float32),
-            "value": value.cpu().numpy().astype(np.float32),
-            "point": latents["point"][:, -1, :].float().cpu().numpy(),
-            "exist": torch.sigmoid(latents["exist"][:, -1, 0].float()).cpu().numpy(),
-        }
+            scaled = logits / self.temperature
+            probs = torch.softmax(scaled, -1)
+            action = torch.multinomial(probs, 1, generator=self.generator).squeeze(-1)
+            # The log-prob of the *sampling* distribution: that is the behaviour density
+            # a policy-gradient ratio must be taken against.
+            logp = torch.log_softmax(scaled, -1).gather(-1, action[:, None]).squeeze(-1)
+
+        out_a = np.zeros(self.batch_size, dtype=np.int64)
+        out_l = np.zeros(self.batch_size, dtype=np.float32)
+        out_a[active] = action.cpu().numpy()
+        out_l[active] = logp.cpu().numpy()
+        return {"action": out_a, "logprob": out_l}
+
+    def _core_over_histories(self, active: Sequence[int]) -> torch.Tensor:
+        """Left-align each slot's history into a padded batch and read its last step."""
+        lens = [int(self.frames[i].shape[0]) for i in active]
+        max_t = max(lens)
+        L = self.prefix + max_t
+        if L > self.model.context:
+            raise RuntimeError(
+                f"episode reached {max_t} frames + {self.prefix} prefix = {L}, over "
+                f"context {self.model.context}. Raise policy.core.context and retrain; "
+                f"task budgets reach 1038.")
+        b = len(active)
+        x = torch.zeros(b, L, self.d, device=self.device, dtype=self.frames[active[0]].dtype)
+        attn = torch.zeros(b, 1, L, L, dtype=torch.bool, device=self.device)
+        last = torch.zeros(b, dtype=torch.long, device=self.device)
+        idx = torch.arange(L, device=self.device)
+        for k, i in enumerate(active):
+            t = lens[k]
+            x[k, 0:1] = self.inter[i]
+            x[k, 1:2] = self.goal[i]
+            x[k, self.prefix:self.prefix + t] = self.frames[i]
+            n = self.prefix + t
+            attn[k, 0, :n, :n] = idx[:n, None] >= idx[None, :n]
+            last[k] = n - 1
+        h = self.model.core(x, attn_mask=attn)
+        h_last = h.gather(1, last.view(b, 1, 1).expand(b, 1, self.d)).squeeze(1)
+        return self.model.pi_head(h_last)
 
     def state(self) -> dict:
         return {"generator": self.generator.get_state()}
 
     def load_state(self, state: dict) -> None:
-        self.generator.set_state(state["generator"].to("cpu")
-                                 if hasattr(state["generator"], "to")
-                                 else state["generator"])
+        self.generator.set_state(state["generator"])
 
 
 class _null_context:
@@ -271,9 +295,30 @@ class _Slot:
     values: List[float] = field(default_factory=list)
     goal_points: List[List[List[int]]] = field(default_factory=list)
     goal_visible: List[bool] = field(default_factory=list)
+    #: Boss HP for the graded failure reward (doc/0005 §2). ``-1`` means the task's
+    #: maker exposes no progress signal.
+    #:
+    #: The anchor is ``hp_ref``, the task's ``boss_hp_start`` metadata — a **task-level
+    #: constant**, not the value at step 0 and not this episode's peak.
+    #:
+    #: A boss task begins at the reveal, and the boss spawns in stages: the data repo
+    #: measured ``16 -> 48 -> ~64`` (`contra_nes_data/doc/0001-boss-search-curriculum.md`).
+    #: So HP reads 0 initially, then climbs. Anchoring on step 0 scores every episode as
+    #: having dealt no damage; anchoring on the *episode's own* peak is worse than that
+    #: — a rollout that dies mid-spawn normalises 8 damage against 16 rather than 63 and
+    #: scores 0.5 where a rollout that survived to full reveal and did the same damage
+    #: scores 0.13. That rewards dying early, which is precisely the failure mode
+    #: (deaths at 27% of the expert's episode).
+    hp_ref: int = -1
+    hp_peak: int = -1
+    hp_last: int = -1
 
 
 # ── the collector ─────────────────────────────────────────────────────────────
+    #: Which group this rollout belongs to — set by `collect_groups`, and used by
+    #: the buffer to baseline it against its siblings. Nothing else reads it.
+    group_id: int = 0
+
 
 class EpisodeCollector:
     """Runs whole episodes through one emulator and returns complete trajectories.
@@ -303,8 +348,8 @@ class EpisodeCollector:
         self.stop_on_death = stop_on_death
         self.collect_goal_points = collect_goal_points
         self.reward = {"success": 1.0, "death": 0.0, "timeout": 0.0, "step": 0.0,
-                       "truncated": 0.0, **(reward or {})}
-        self.actor = RolloutActor(model, batch_size, device=device,
+                       "truncated": 0.0, "progress_coef": 0.0, **(reward or {})}
+        self.actor = TokenHistoryActor(model, batch_size, device=device,
                                   temperature=temperature, seed=seed, precision=precision)
         self._vectors = actions_np(np.uint8)
         self._die = None
@@ -359,69 +404,58 @@ class EpisodeCollector:
 
     # -- collection --------------------------------------------------------
 
-    def collect(self, min_steps: int, min_episodes: int,
-                tasks: Optional[Sequence[RLTask]] = None) -> List[Episode]:
-        """Roll out until both targets are met, then drain. Returns finished episodes.
+    def collect_groups(self, groups: Sequence[Sequence["RLTask"]],
+                       base_gid: int = 0) -> List[Episode]:
+        """Roll out every task in every group, and return the finished episodes.
 
-        ``tasks``, when given, replaces the sampler with a fixed queue — that is the
-        path the frozen-weights parity check and the deterministic tests use, and it
-        is the only way an episode start is not drawn from :class:`TaskSampler`.
+        The unit is the *group*, not a step budget: GRPO needs all G rollouts of a task
+        so their returns can baseline each other. A partially-collected group is useless,
+        so this drains rather than stopping on a step count.
+
+        Slots are filled from a flat queue across groups, so a group's members run
+        concurrently in different slots rather than serially — each still restores the
+        same savestate, and the emulator is stepped per slot anyway.
+
+        ``base_gid`` offsets the group ids this call hands out. A caller that invokes
+        this repeatedly and pools the results — :meth:`GRPOTrainer.collect_filtered`
+        does — **must** advance it, or ids collide across calls and episodes of
+        different tasks end up sharing a group. That silently destroys GRPO's premise:
+        the baseline stops being same-task. Pinned by
+        ``tests/test_rollout_groups.py::test_group_ids_are_unique_across_calls``.
         """
         self.open()
-        queue = list(tasks) if tasks is not None else None
+        queue = [(gid, t) for gid, g in enumerate(groups, start=base_gid) for t in g]
         slots: List[Optional[_Slot]] = [None] * self.batch_size
         out: List[Episode] = []
-        started = steps = 0
 
-        def want_more() -> bool:
-            if queue is not None:
-                return bool(queue)
-            return started < min_episodes or steps < min_steps
+        while True:
+            fresh = []
+            for i in range(self.batch_size):
+                if slots[i] is None and queue:
+                    gid, task = queue.pop(0)
+                    slots[i] = self._start(task)
+                    slots[i].group_id = gid
+                    self.actor.begin(i, slots[i].prompt.image, slots[i].prompt.interaction)
+                    fresh.append(i)
+            if fresh:
+                self.actor.reset(fresh)
+                for i in fresh:
+                    self.actor.begin(i, slots[i].prompt.image,
+                                     slots[i].prompt.interaction)
+            if all(s is None for s in slots):
+                break
 
-        try:
-            while True:
-                fresh = []
-                for i in range(self.batch_size):
-                    if slots[i] is None and want_more():
-                        task = queue.pop(0) if queue is not None else self.sampler.sample()
-                        slots[i] = self._start(task)
-                        started += 1
-                        fresh.append(i)
-                if fresh:
-                    # Must happen before the next act(): a recycled slot still holds the
-                    # previous episode's attention memory until it is overwritten.
-                    self.actor.reset(fresh)
-                if all(s is None for s in slots):
-                    break
-
-                obs = self._observe(slots)
-                step = self.actor.act(obs)
-                for i, slot in enumerate(slots):
-                    if slot is None:
-                        continue
-                    if slot.awaiting_bootstrap:
-                        slot.bootstrap_value = float(step["value"][i])
-                        out.append(self._finish(slot))
-                        slots[i] = None
-                        continue
-                    self._record(slot, int(step["action"][i]), float(step["logprob"][i]),
-                                 float(step["value"][i]))
-                    self._step(slot, int(step["action"][i]))
-                    steps += 1
-                    if slot.done:
-                        out.append(self._finish(slot))
-                        slots[i] = None
-                    elif self.max_episode_steps and slot.steps >= self.max_episode_steps:
-                        # An *artificial* cut: the episode is neither solved nor lost, so
-                        # its tail value has to come from the critic. One more forward
-                        # pass reads it, then the slot is freed.
-                        slot.outcome = "truncated"
-                        slot.awaiting_bootstrap = True
-        finally:
-            pass
+            obs = self._observe(slots)
+            step = self.actor.act(obs)
+            for i, slot in enumerate(slots):
+                if slot is None:
+                    continue
+                self._record(slot, int(step["action"][i]), float(step["logprob"][i]))
+                self._step(slot, int(step["action"][i]))
+                if slot.done:
+                    out.append(self._finish(slot))
+                    slots[i] = None
         return out
-
-    # -- slot lifecycle ----------------------------------------------------
 
     def _start(self, task: RLTask) -> _Slot:
         from util.replay import rewind_state
@@ -437,8 +471,27 @@ class EpisodeCollector:
         slot.state = self._env.em.get_state()
         slot.prev_ram = self._env.unwrapped.get_ram().copy()
         slot.prev_action = IDLE_ACTION
+        slot.hp_peak = slot.hp_last = self._progress(slot, slot.prev_ram)
+        if slot.hp_peak >= 0:
+            # `boss_hp_start` is the data repo's own anchor: the maximum boss HP over
+            # the source trace, i.e. the value at full reveal. Shared by every rollout
+            # of the task, so members of a group are always compared on one scale.
+            meta = getattr(seg, "meta", None) or {}
+            slot.hp_ref = int(meta.get("boss_hp_start", -1) or -1)
         slot.frame = self._peek(slot)
         return slot
+
+    @staticmethod
+    def _progress(slot: _Slot, ram) -> int:
+        """Interpreted progress for this task's family, or -1 if it has none.
+
+        Read through the maker rather than from RAM: `KillBossMaker.boss_hp` is the data
+        repo's published accessor, so no ``ADDR_*`` knowledge enters this repo
+        (`kaihe/contra_nes_data#2`). Families whose maker exposes nothing keep the
+        binary reward untouched.
+        """
+        fn = getattr(slot.maker, "boss_hp", None)
+        return int(fn(ram)) if fn is not None else -1
 
     def _peek(self, slot: _Slot) -> np.ndarray:
         """Render a frame for a state without advancing that state's clock."""
@@ -473,12 +526,11 @@ class EpisodeCollector:
                                   interaction=interaction, prev_action=prev_action,
                                   active=active)
 
-    def _record(self, slot: _Slot, action: int, logprob: float, value: float) -> None:
+    def _record(self, slot: _Slot, action: int, logprob: float) -> None:
         slot.obs.append(slot.frame)
         slot.actions.append(action)
         slot.prev_actions.append(slot.prev_action)
         slot.logprobs.append(logprob)
-        slot.values.append(value)
         if self.collect_goal_points:
             from task_maker.export_hf import _goal_points
 
@@ -495,6 +547,12 @@ class EpisodeCollector:
             self._env.step(vector)
         cur = self._env.unwrapped.get_ram().copy()
         slot.steps += 1
+        if slot.hp_peak >= 0:
+            # Every step, not just the last: `prev_ram` is deliberately not advanced on
+            # the step that ends the episode, so reading it at `_finish` would miss the
+            # damage dealt by the final action — and the peak would be missed entirely.
+            slot.hp_last = self._progress(slot, cur)
+            slot.hp_peak = max(slot.hp_peak, slot.hp_last)
 
         # Both predicates are always evaluated (they are cheap RAM reads) so that
         # `died` is recorded even on the step the task is completed; `classify_step`
@@ -514,27 +572,55 @@ class EpisodeCollector:
             slot.prev_ram = cur
             slot.prev_action = action
 
+    def _reward_for(self, slot: _Slot) -> float:
+        """Terminal reward: ``reward[outcome]``, plus graded credit on failure.
+
+        **Still one scalar per episode.** ``progress_coef`` grades *failures* by the
+        fraction of boss HP removed, so a group whose members all fail — 43-75% of boss
+        groups at G=8 — has real advantage spread instead of eight identical zeros
+        (doc/0005 §2). It adds no per-step credit: the buffer still broadcasts one
+        number across the episode.
+
+        **Damage is measured against the task's ``boss_hp_start``**, the data repo's
+        full-reveal anchor, falling back to this episode's peak only when the metadata
+        is absent. The boss spawns in stages (16 -> 48 -> ~64), so neither step 0 nor
+        the episode's own peak is a sound denominator — see `_Slot.hp_ref`. An episode
+        that dies before the boss spawns at all has no damage and scores zero, which is
+        the right answer: it made no progress.
+
+        **The ranges must stay disjoint.** At ``progress_coef <= 0.5`` a failure scores
+        at most 0.5 against a success's 1.0, so no amount of damage can outrank a win
+        and the objective is still "kill the boss". Pinned by
+        ``tests/test_reward.py::test_no_failure_can_outscore_a_success``.
+
+        Deliberately *not* a symmetric step penalty. That would score a fast death above
+        a long survival, and the boss failure mode is dying early — at 27% of the
+        expert's episode, measured over 69 deaths. See doc/0005 §8.
+        """
+        base = float(self.reward.get(slot.outcome, 0.0))
+        alpha = float(self.reward.get("progress_coef", 0.0))
+        if slot.outcome == "success" or alpha <= 0:
+            return base
+        ref = slot.hp_ref if slot.hp_ref > 0 else slot.hp_peak
+        if ref <= 0:
+            return base
+        removed = min(ref, max(0, ref - max(0, slot.hp_last)))
+        return base + alpha * (removed / ref)
+
     def _finish(self, slot: _Slot) -> Episode:
+        """A completed rollout, as the buffer wants it."""
         n = len(slot.actions)
-        rewards = np.full(n, self.reward["step"], dtype=np.float32)
-        if n:
-            rewards[-1] += float(self.reward[slot.outcome])
         return Episode(
-            family=slot.task.family, label=slot.task.label, uid=slot.task.uid,
+            task_uid=slot.task.uid,
+            family=slot.task.family,
+            group_id=slot.group_id,
+            frames=(np.stack(slot.obs) if n else
+                    np.zeros((0, self.image_size, self.image_size, 3), np.uint8)),
+            goal_image=slot.prompt.image,
             interaction=slot.prompt.interaction,
-            goal_image=slot.prompt.image, goal_mask=slot.prompt.mask,
-            obs=np.stack(slot.obs) if n else np.zeros((0, self.image_size,
-                                                       self.image_size, 3), np.uint8),
             actions=np.asarray(slot.actions, dtype=np.int64),
-            prev_actions=np.asarray(slot.prev_actions, dtype=np.int64),
             logprobs=np.asarray(slot.logprobs, dtype=np.float32),
-            values=np.asarray(slot.values, dtype=np.float32),
-            rewards=rewards,
+            reward=self._reward_for(slot),
             outcome=slot.outcome,
-            terminal=slot.outcome != "truncated",
-            bootstrap_value=float(slot.bootstrap_value),
-            budget=slot.budget, expert_steps=len(slot.seg.actions), died=slot.died,
-            goal_points=slot.goal_points,
-            goal_visible=(np.asarray(slot.goal_visible, dtype=bool)
-                          if self.collect_goal_points else None),
+            task_label=slot.task.label,
         )

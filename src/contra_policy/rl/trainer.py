@@ -1,730 +1,523 @@
-"""The RL loop: warm the critic, collect, update, log, checkpoint, resume.
+"""The GRPO loop: collect groups, drop the ones that agree, update, measure.
 
-One *update* is: collect a batch of complete episodes, compute undiscounted returns
-and advantages over each whole episode, then run ``ppo_epochs`` passes of clipped PPO
-over that batch — shuffling **episodes**, never transitions.
+Owns neither generation nor the objective — `rollout` produces episodes, `buffer` turns
+them into advantages, `grpo` scores them. This file is the schedule and the bookkeeping.
 
-Recurrent optimisation, and why there is no stored memory
----------------------------------------------------------
-Each minibatch is a handful of whole episodes replayed **in order**, in chunks of
-``seq_len`` steps, with the recurrent memory carried from chunk to chunk and detached
-between them. The initial memory of every optimised sequence is therefore not an
-approximation and not a stale copy saved during collection: chunk 0 starts from the
-model's own ``initial_state`` (exactly what the collector reset to at the episode
-boundary) and every later chunk's memory is *recomputed under the current parameters*,
-which is strictly better than replaying the behaviour policy's saved state.
+**Group filtering, and why it is on by default.** GRPO's advantage is
+``(r_i − mean(r_group)) / std(r_group)``, so a group whose G rollouts all succeed *or*
+all fail has zero advantage everywhere and moves the policy not at all. Keeping such
+groups does not merely waste their rollouts — it rescales the update, because the mean
+over a batch that is 70% zeros is 0.3x the mean over the survivors. The effective step
+size would then track how hard the current task mix happens to be. Filtering makes it
+mean the same thing every update.
 
-The detach between chunks is truncated BPTT: gradient flows across the ``seq_len``
-steps inside a chunk but not backwards past its boundary. It is also the only place
-memory is ever detached — never inside a chunk, and never in a way that clears it,
-which would silently turn a 400-step boss episode into thirteen unrelated 32-step
-ones.
-
-The context each token sees is identical in both regimes. The recurrent core keeps
-``mem_len`` timesteps of keys and values behind a clipped-causal mask, so a step at
-rollout (``T=1`` with carried memory) and the same step during optimisation (inside a
-``T=32`` chunk with carried memory) both attend to exactly the preceding 32 decisions.
-
-``eval()`` throughout
----------------------
-The model stays in eval mode during optimisation as well as collection. The resampler
-carries dropout, and with it on, the log-probability recomputed for a stored action
-would differ from the one the action was sampled under for a reason that has nothing
-to do with the parameter update — every PPO ratio would then carry dropout noise.
-Regularisation in this phase comes from the trust region, not from dropout.
+``collect_filtered`` goes further and *oversamples*: it keeps drawing groups until
+``groups_per_update`` have survived, so the batch size is constant rather than a
+function of the day's difficulty. That is dynamic sampling, and it is capped — a task
+mix where nothing survives should stop the run, not spin.
 """
 
 from __future__ import annotations
 
 import collections
 import csv
+import math
 import os
+import signal
 import time
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
+import hydra
 import numpy as np
 import torch
+from omegaconf import DictConfig, OmegaConf
 
-from contra_policy.model import CrossViewContraRocket
-from contra_policy.rl import checkpoint as ckpt_io
-from contra_policy.rl.ppo import PPOConfig, PPOObjective, explained_variance
+from contra_policy.model import PolicyConfig, build_policy, load_policy
+from contra_policy.rl.buffer import (EpisodeOutcome, filter_groups, group_advantages,
+                                     iter_minibatches)
+from contra_policy.rl.grpo import GRPOConfig, grpo_loss
 from contra_policy.rl.rollout import EpisodeCollector
-from contra_policy.rl.tasks import TaskCatalog, TaskSampler
-from contra_policy.rl.trajectory import (Episode, build_chunk, compute_returns,
-                                         iter_chunks, iter_minibatches,
-                                         normalize_advantages, rollout_stats)
+from contra_policy.rl.tasks import (DifficultyTracker, GroupSampler, TaskCatalog,
+                                    TaskSampler)
+
+FAMILIES = ("kill", "item", "traverse", "boss")
 
 
-class CSVMetricLogger:
-    """Append-only CSV with a growing header — no schema to declare up front.
+def _won(e) -> bool:
+    """Did the episode reach its goal?
 
-    Per-label keys appear and disappear with the sampling draw, so the header is
-    rewritten (and earlier rows re-padded) whenever a new key shows up. That costs a
-    file rewrite a handful of times at the start of a run and never again.
+    Read the **outcome**, never ``reward > 0``. Since doc/0005 §2 a losing boss episode
+    scores ``progress_coef * (HP removed / HP peak)``, so a positive reward means "dealt
+    some damage", not "won". The first run with grading on reported ``boss=0.76`` and
+    ``probe boss=0.90`` against a true rate near 0.10 before this was caught.
     """
+    return e.outcome == "success"
 
+
+def wilson(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson interval — the one that behaves at 0/n and n/n, which per-family
+    counts hit constantly (boss succeeds ~3.5% of the time)."""
+    if n == 0:
+        return (0.0, 1.0)
+    p = successes / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+class CSVLogger:
     def __init__(self, path: str):
-        self.path = path
-        self.rows: List[Dict[str, float]] = []
-        self.keys: List[str] = []
+        self.path, self.keys = path, []
 
     def log(self, row: Dict[str, float]) -> None:
-        self.rows.append(dict(row))
         new = [k for k in row if k not in self.keys]
-        self.keys.extend(new)
-        with open(self.path, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=self.keys, restval="")
-            w.writeheader()
-            w.writerows(self.rows)
+        if new:
+            old = self._read()
+            self.keys += new
+            with open(self.path, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=self.keys, restval="")
+                w.writeheader()
+                w.writerows(old)
+        with open(self.path, "a", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=self.keys, restval="").writerow(row)
+
+    def _read(self) -> List[dict]:
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path) as fh:
+            return list(csv.DictReader(fh))
 
 
-class RLTrainer:
-
-    def __init__(self, args, run_dir: str = "."):
-        self.args = args
-        self.run_dir = run_dir
-        self.device = torch.device(args.device if torch.cuda.is_available()
-                                   or not str(args.device).startswith("cuda") else "cpu")
-        self.config = _resolved(args)
-
-        # -- model ---------------------------------------------------------
-        model_cfg = (ckpt_io.model_config_from_checkpoint(args.init_from)
-                     if args.init_from else
-                     dict(_resolved(args.model) if "model" in args else {}))
-        if not model_cfg:
-            raise ValueError("either init_from (a BC checkpoint) or a model block is "
-                             "required to build the policy")
-        self.model_cfg = model_cfg
-        # The recorded config carries the architecture the weights actually have, so
-        # the evaluator rebuilds exactly this model from a weights-only checkpoint.
-        self.config["model"] = dict(model_cfg)
-
-        self.model = CrossViewContraRocket(**model_cfg).to(self.device)
-        if args.init_from:
-            ckpt_io.load_policy_weights(self.model, args.init_from)
-            print(f"[rl] initialised from {args.init_from}")
-        self.model.eval()
-
-        self.ref_model: Optional[CrossViewContraRocket] = None
-        if float(args.ppo.bc_kl_coef) > 0.0:
-            # A frozen copy of the initialisation, kept only to say what the BC policy
-            # would have done. It never receives a gradient and never updates.
-            self.ref_model = CrossViewContraRocket(**model_cfg).to(self.device).eval()
-            self.ref_model.load_state_dict(self.model.state_dict())
-            for p in self.ref_model.parameters():
-                p.requires_grad_(False)
-            print("[rl] frozen BC reference policy enabled "
-                  f"(bc_kl_coef={float(args.ppo.bc_kl_coef)})")
-
-        self.params = [p for p in self.model.parameters() if p.requires_grad]
-        trainable = sum(p.numel() for p in self.params)
-        frozen = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
-        print(f"[rl] policy: {trainable/1e6:.1f}M trainable + {frozen/1e6:.1f}M frozen · "
-              f"{self.model.num_step_tokens} tokens/timestep")
-
-        # -- optimisation --------------------------------------------------
-        self.ppo_cfg = PPOConfig(**_resolved(args.ppo))
-        self.objective = PPOObjective(self.ppo_cfg)
-        self.optimizer = torch.optim.AdamW(self.params, lr=self.ppo_cfg.learning_rate,
-                                           weight_decay=float(args.weight_decay))
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_scale)
+class GRPOTrainer:
+    def __init__(self, args: DictConfig, run_dir: str):
+        self.args, self.run_dir = args, run_dir
+        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         self.autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
                                "fp32": None}[args.precision]
         if self.device.type != "cuda":
             self.autocast_dtype = None
 
-        # -- tasks and collection -------------------------------------------
+        # -- policy, and a frozen copy of where it started ---------------------
+        self.policy = load_policy(args.init_from, map_location="cpu").to(self.device)
+        self.cfg = GRPOConfig(**OmegaConf.to_container(args.grpo, resolve=True))
+        self.ref = None
+        if self.cfg.kl_coef > 0:
+            # Not optional on measured grounds: the previous PPO run left this at zero
+            # and `item` regressed 76.5% -> 71.1% while boss improved. RL on a verifiable
+            # reward will trade away a family the reward does not mention.
+            self.ref = load_policy(args.init_from, map_location="cpu").to(self.device)
+            for p in self.ref.parameters():
+                p.requires_grad = False
+            self.ref.eval()
+
+        n = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        print(f"[grpo] {n/1e6:.2f}M trainable · G={int(args.rollout.group_size)} · "
+              f"reference KL {'on' if self.ref else 'OFF'} · "
+              f"filtering {'on' if args.rollout.filter_groups else 'OFF'}", flush=True)
+
+        # -- data ------------------------------------------------------------
         self.catalog = TaskCatalog(
             task_root=args.task_root, shard_dir=args.shard_dir,
             families=list(args.families), split="train",
-            image_size=int(model_cfg["image_size"]), sigma_px=float(args.sigma_px),
-            cache_dir=args.cache_dir, prompt_cache=int(args.rollout.prompt_cache),
-            segment_cache=int(args.rollout.segment_cache))
+            image_size=int(args.image_size), sigma_px=float(args.sigma_px),
+            cache_dir=args.cache_dir)
         self.catalog.assert_split("train")
-        self.sampler = TaskSampler(self.catalog, float(args.sampling.natural_fraction),
-                                   float(args.sampling.balanced_family_fraction),
-                                   _resolved(args.sampling.family_multiplier),
-                                   seed=int(args.seed))
-        mix = self.sampler.expected_family_mix()
-        print("[rl] episode-start mix: "
-              + " · ".join(f"{f} {mix[f]:.1%}" for f in sorted(mix)))
-
-        if float(args.rollout.temperature) != 1.0:
-            # The PPO objective evaluates the untempered policy, so a tempered sampler
-            # would make every ratio a ratio between two different distributions.
-            # Explore with `ppo.entropy_coef`, not with temperature.
-            raise ValueError(
-                f"rollout.temperature must be 1.0 for PPO, got "
-                f"{float(args.rollout.temperature)}; temperature is a replay knob "
-                f"(0 = greedy) and belongs to evaluation, not to training")
-
-        self.collector = None
-        self.mp_collector = None
-        self.rng = np.random.default_rng(int(args.seed))
-        preflight_host_memory(args, int(model_cfg["image_size"]))
-        self._build_collector()
-
-        self.bc_loader = None
-        self.bc_iter = None
-        if int(args.bc_mix.batches_per_minibatch) > 0:
-            self._build_bc_loader()
-
-        # -- bookkeeping -----------------------------------------------------
-        self.counters = {"update": 0, "episodes": 0, "steps": 0, "rollouts": 0}
-        self.logger = CSVMetricLogger(os.path.join(run_dir, "metrics.csv"))
-        os.makedirs(os.path.join(run_dir, "weights"), exist_ok=True)
-        os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
-        self.wandb = None
-        if args.logger == "wandb":
-            import wandb
-
-            self.wandb = wandb.init(project=args.project, config=self.config)
-
-        if args.resume_from:
-            self.resume(args.resume_from)
-
-    # -- construction helpers ---------------------------------------------
-
-    def _collector_spec(self) -> Dict:
-        a = self.args
-        return {
-            "task_root": a.task_root, "shard_dir": a.shard_dir,
-            "cache_dir": a.cache_dir, "families": list(a.families),
-            "image_size": int(self.model_cfg["image_size"]), "sigma_px": float(a.sigma_px),
-            "prompt_cache": int(a.rollout.prompt_cache),
-            "segment_cache": int(a.rollout.segment_cache),
-            "batch_size": int(a.rollout.batch_size),
-            "budget_mult": float(a.rollout.budget_mult),
-            "min_budget": int(a.rollout.min_budget),
-            "temperature": float(a.rollout.temperature),
-            "precision": a.precision, "seed": int(a.seed),
-            "reward": _resolved(a.reward),
-            "max_episode_steps": int(a.rollout.max_episode_steps),
-            "collect_goal_points": bool(a.rollout.collect_goal_points),
-            "natural_fraction": float(a.sampling.natural_fraction),
-            "balanced_family_fraction": float(a.sampling.balanced_family_fraction),
-            "family_multiplier": _resolved(a.sampling.family_multiplier),
-            "worker_device": a.rollout.worker_device,
-        }
-
-    def _build_collector(self) -> None:
-        a = self.args
-        if int(a.rollout.num_workers) > 0:
-            from contra_policy.rl.workers import MultiProcessCollector
-
-            self.mp_collector = MultiProcessCollector(
-                self.model, self.model_cfg, self._collector_spec(),
-                int(a.rollout.num_workers))
-            print(f"[rl] {int(a.rollout.num_workers)} collector worker(s), "
-                  f"one emulator each")
-            return
+        sampler = TaskSampler(self.catalog, float(args.sampling.natural_fraction),
+                              float(args.sampling.balanced_family_fraction),
+                              OmegaConf.to_container(args.sampling.family_multiplier,
+                                                     resolve=True),
+                              seed=int(args.seed))
+        bias = args.sampling.get("difficulty_bias", {})
+        tracker = None
+        if bool(bias.get("enabled", False)):
+            tracker = DifficultyTracker(
+                group_size=int(args.rollout.group_size),
+                decay=float(bias.get("decay", 0.9)),
+                prior=float(bias.get("prior", 1.0)),
+                min_weight=float(bias.get("min_weight", 0.05)))
+        self.groups = GroupSampler(
+            sampler, int(args.rollout.group_size), difficulty=tracker,
+            candidates=int(bias.get("candidates", 1)) if tracker else 1,
+            seed=int(args.seed))
+        if tracker is not None:
+            print(f"[grpo] difficulty bias on · tournament of "
+                  f"{int(bias.get('candidates', 1))} · decay {tracker.decay}", flush=True)
         self.collector = EpisodeCollector(
-            self.model, self.catalog, self.sampler,
-            batch_size=int(a.rollout.batch_size), budget_mult=float(a.rollout.budget_mult),
-            min_budget=int(a.rollout.min_budget),
-            image_size=int(self.model_cfg["image_size"]), device=self.device,
-            temperature=float(a.rollout.temperature), precision=a.precision,
-            seed=int(a.seed), reward=_resolved(a.reward),
-            max_episode_steps=int(a.rollout.max_episode_steps),
-            collect_goal_points=bool(a.rollout.collect_goal_points),
-            owner="RLTrainer")
+            self.policy, self.catalog, sampler,
+            batch_size=int(args.rollout.batch_size),
+            budget_mult=float(args.rollout.budget_mult),
+            min_budget=int(args.rollout.min_budget),
+            image_size=int(args.image_size), device=self.device,
+            temperature=float(args.rollout.temperature), precision=args.precision,
+            seed=int(args.seed),
+            reward=OmegaConf.to_container(args.reward, resolve=True),
+            max_episode_steps=int(args.rollout.max_episode_steps),
+            collect_goal_points=False, owner="GRPOTrainer")
 
-    def _build_bc_loader(self) -> None:
-        """Optional BC minibatches mixed into PPO updates, from the existing datamodule."""
-        from contra_policy.dataset import ContraDataModule
+        self.optimizer = torch.optim.AdamW(
+            [p for p in self.policy.parameters() if p.requires_grad],
+            lr=float(args.train.learning_rate),
+            weight_decay=float(args.train.weight_decay))
+        self.rng = np.random.default_rng(int(args.seed))
+        self.logger = CSVLogger(os.path.join(run_dir, "metrics.csv"))
+        os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+        self.update = 0
 
-        a = self.args
-        data = ContraDataModule(
-            shard_dir=a.shard_dir, configs=list(a.families),
-            win_len=int(self.ppo_cfg.seq_len), image_size=int(self.model_cfg["image_size"]),
-            sigma_px=float(a.sigma_px), prev_action_keep_prob=0.0,
-            aux_size=int(self.model_cfg["aux_size"]), batch_size=int(a.bc_mix.batch_size),
-            num_workers=int(a.bc_mix.num_workers), cache_dir=a.cache_dir, seed=int(a.seed))
-        self.bc_loader = data.train_dataloader()
-        self.bc_iter = iter(self.bc_loader)
-        from contra_policy.loss import ContraObjective
-
-        self.bc_objective = ContraObjective(
-            bc_weight=1.0, heatmap_weight=float(a.bc_mix.heatmap_weight),
-            heatmap_pos_weight=self.ppo_cfg.heatmap_pos_weight).to(self.device)
-        print(f"[rl] mixing {int(a.bc_mix.batches_per_minibatch)} BC batch(es) into "
-              f"each PPO minibatch (weight {float(a.bc_mix.weight)})")
-
-    def _lr_scale(self, step: int) -> float:
-        warmup = int(self.args.train.lr_warmup_updates)
-        scale = 1.0 if warmup <= 0 else min(1.0, (step + 1) / warmup)
-        if self.args.train.lr_decay == "linear":
-            total = max(1, int(self.args.train.updates))
-            scale *= max(0.0, 1.0 - step / total)
-        return scale
+        self.probe_tasks = self._build_probe()
+        self._probe_gid = 10 ** 9      # keep probe ids far from any training group id
+        if self.probe_tasks:
+            byfam = collections.Counter(t.family for t in self.probe_tasks)
+            print(f"[grpo] probe: {len(self.probe_tasks)} fixed train tasks "
+                  f"({' '.join(f'{k} {v}' for k, v in sorted(byfam.items()))}) "
+                  f"every {int(self.args.probe.get('every', 10))} updates", flush=True)
 
     # -- collection ---------------------------------------------------------
 
-    def collect(self, min_steps: int, min_episodes: int) -> List[Episode]:
-        t0 = time.time()
-        if self.mp_collector is not None:
-            episodes = self.mp_collector.collect(min_steps, min_episodes)
-        else:
-            episodes = self.collector.collect(min_steps, min_episodes)
-        steps = sum(len(e) for e in episodes)
-        dt = max(1e-9, time.time() - t0)
-        self.counters["rollouts"] += 1
-        self.counters["episodes"] += len(episodes)
-        self.counters["steps"] += steps
-        self._last_collect = {
-            "collect_s": dt, "collect_steps_per_s": steps / dt,
-            "collect_episodes_per_s": len(episodes) / dt,
-            "rollout_mb": sum(e.nbytes() for e in episodes) / 1e6,
-        }
-        return episodes
+    def _check_memory(self) -> None:
+        """Abort cleanly before the VM starts swapping.
 
-    # -- optimisation -------------------------------------------------------
-
-    @torch.no_grad()
-    def refresh_behaviour_stats(self, episodes: Sequence[Episode]) -> float:
-        """Recompute stored log-probs and values in the *optimisation* shape.
-
-        Collection runs ``T=1`` forwards over 16 emulator slots; optimisation runs
-        ``T=seq_len`` forwards over a handful of episodes. The parameters are identical
-        and, because the clipped-causal memory gives both the same context window, so
-        is the distribution — but not bit for bit under bf16, and a ratio that starts
-        at 1.02 instead of 1.00 eats a fifth of a ``clip_ratio`` of 0.1 before the
-        first gradient step.
-
-        Rewriting the references here makes the first epoch's ratio exactly 1 and
-        removes the mismatch entirely. Returns the mean absolute log-ratio it
-        corrected, which is worth watching: if it is large, something more than
-        numerics differs between the two paths.
+        ``tools/rss_guard.py`` does this from outside with a SIGKILL, which loses the
+        checkpoint. This is the in-process half: it raises, so ``run``'s ``finally``
+        still saves. The number watched is system-wide ``MemTotal - MemAvailable``,
+        because on a 20 GB WSL2 guest nothing is ever technically out of memory — it
+        swaps, and the VM stops responding before any OOM killer fires.
         """
-        drift, n = 0.0, 0
-        for start in range(0, len(episodes), self.ppo_cfg.minibatch_episodes):
-            mb = list(episodes[start:start + self.ppo_cfg.minibatch_episodes])
-            memory = None
-            for ci, (lo, hi) in enumerate(iter_chunks(mb, self.ppo_cfg.seq_len)):
-                batch = build_chunk(mb, lo, hi, device=self.device, first=ci == 0)
-                latents, memory = self._forward(self.model, batch["model"], memory)
-                memory = [m.detach() for m in memory]
-                logits = latents["pi_logits"].float()
-                logprob = torch.log_softmax(logits, -1).gather(
-                    -1, batch["action"].unsqueeze(-1)).squeeze(-1).cpu().numpy()
-                value = latents["vpred"].squeeze(-1).float().cpu().numpy()
-                for i, ep in enumerate(mb):
-                    n_valid = max(0, min(hi, len(ep)) - lo)
-                    if n_valid <= 0:
-                        continue
-                    sl = slice(lo, lo + n_valid)
-                    drift += float(np.abs(ep.logprobs[sl] - logprob[i, :n_valid]).sum())
-                    n += n_valid
-                    ep.logprobs[sl] = logprob[i, :n_valid]
-                    ep.values[sl] = value[i, :n_valid]
-        return drift / max(1, n)
-
-    def _forward(self, model, model_input: Dict, memory):
-        ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
-               if self.autocast_dtype is not None else _null_context())
-        with ctx:
-            return model(model_input, memory)
-
-    def update(self, episodes: List[Episode]) -> Dict[str, float]:
-        cfg = self.ppo_cfg
-        metrics: Dict[str, float] = {}
-
-        if bool(self.args.train.recompute_old_logprobs):
-            metrics["behaviour_logprob_drift"] = self.refresh_behaviour_stats(episodes)
-
-        compute_returns(episodes, cfg.gamma, cfg.gae_lambda)
-        metrics["explained_variance"] = explained_variance(
-            np.concatenate([e.values for e in episodes]),
-            np.concatenate([e.returns for e in episodes]))
-        if cfg.normalize_advantages:
-            mean, std = normalize_advantages(episodes)
-            metrics["advantage_mean"], metrics["advantage_std"] = mean, std
-
-        aux_size = int(self.model_cfg["aux_size"]) if cfg.heatmap_coef > 0 else 0
-        acc: Dict[str, float] = collections.defaultdict(float)
-        total_count = 0.0
-        n_minibatches = 0
-        stopped = False
-
-        for epoch in range(cfg.ppo_epochs):
-            for mb in iter_minibatches(episodes, cfg.minibatch_episodes, self.rng):
-                valid = float(sum(len(e) for e in mb))
-                if valid == 0:
-                    continue
-                self.optimizer.zero_grad(set_to_none=True)
-                memory = ref_memory = None
-                mb_acc: Dict[str, float] = collections.defaultdict(float)
-                for ci, (lo, hi) in enumerate(iter_chunks(mb, cfg.seq_len)):
-                    batch = build_chunk(mb, lo, hi, device=self.device,
-                                        aux_size=aux_size, sigma_px=float(self.args.sigma_px),
-                                        first=ci == 0)
-                    latents, memory = self._forward(self.model, batch["model"], memory)
-                    ref_logits = None
-                    if self.ref_model is not None:
-                        with torch.no_grad():
-                            ref_latents, ref_memory = self._forward(
-                                self.ref_model, batch["model"], ref_memory)
-                        ref_logits = ref_latents["pi_logits"]
-                        ref_memory = [m.detach() for m in ref_memory]
-                    loss_sum, chunk_metrics, count = self.objective(
-                        latents, batch, ref_logits)
-                    if float(count) > 0:
-                        (loss_sum / valid).backward()
-                    # Truncated BPTT: the memory continues the episode, the graph does
-                    # not. Detaching here — and only here — is what keeps a long
-                    # episode one trajectory rather than a chain of unrelated windows.
-                    memory = [m.detach() for m in memory]
-                    for k, v in chunk_metrics.items():
-                        mb_acc[k] += float(v)
-                    mb_acc["_count"] += float(count)
-
-                if self.bc_iter is not None:
-                    mb_acc["bc_mix_loss"] += self._bc_mix_backward()
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.params, cfg.max_grad_norm)
-                self.optimizer.step()
-                n_minibatches += 1
-
-                c = max(1.0, mb_acc.pop("_count"))
-                total_count += c
-                for k, v in mb_acc.items():
-                    acc[k] += v
-                acc["grad_norm"] += float(grad_norm) * c
-                acc["_count"] += c
-
-                if cfg.target_kl > 0 and (mb_acc["approx_kl"] / c) > cfg.target_kl:
-                    # Early termination of the *update*, not of training: the batch has
-                    # already moved the policy as far as the trust region allows, and
-                    # further epochs over the same data would move it further off the
-                    # distribution the data was collected under.
-                    stopped = True
-                    break
-            if stopped:
-                break
-
-        c = max(1.0, acc.pop("_count"))
-        for k, v in acc.items():
-            metrics[k] = v / c
-        metrics["ppo_epochs_run"] = (epoch + (0 if stopped else 1))
-        metrics["ppo_minibatches"] = float(n_minibatches)
-        metrics["kl_early_stop"] = float(stopped)
-        metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-        self.scheduler.step()
-        return metrics
-
-    def _bc_mix_backward(self) -> float:
-        """One or more BC minibatches, accumulated into the current PPO gradient."""
-        from contra_policy.lit import _to_model_input
-
-        total = 0.0
-        weight = float(self.args.bc_mix.weight)
-        for _ in range(int(self.args.bc_mix.batches_per_minibatch)):
-            try:
-                batch = next(self.bc_iter)
-            except StopIteration:
-                self.bc_iter = iter(self.bc_loader)
-                batch = next(self.bc_iter)
-            batch = {k: (v.to(self.device) if torch.is_tensor(v)
-                         else {kk: vv.to(self.device) for kk, vv in v.items()})
-                     for k, v in batch.items()}
-            model_input = _to_model_input(batch)
-            # prev_action_keep_prob is 0 for this loader, so the dropout mask it ships
-            # is already all-zero — the same "unknown" branch the rollout uses.
-            latents, _ = self._forward(self.model, model_input, None)
-            loss, _m = self.bc_objective(latents, batch)
-            (weight * loss).backward()
-            total += float(loss.detach())
-        return total
-
-    # -- critic warmup ------------------------------------------------------
-
-    def critic_warmup(self) -> None:
-        """Fit the value head on fixed-policy episodes before any policy update.
-
-        The value head received **no gradient during behaviour cloning** — the BC
-        objective never reads ``vpred`` — so at update 0 the critic is an untrained
-        linear readout of the trunk. Every advantage would then be
-        ``return - noise``, and the first policy gradient would be driven by that
-        noise. Warmup collects with the policy frozen and fits only the critic, so PPO
-        starts from advantages that mean something.
-
-        ``params: value_head`` (the default) trains the ``Linear(hiddim, 1)`` alone,
-        which cannot damage the BC trunk it reads from. ``params: all`` lets the value
-        loss reshape the trunk too, which is faster to fit and riskier.
-        """
-        rounds = int(self.args.critic_warmup.rounds)
-        if rounds <= 0:
+        limit = float(self.args.train.get("memory_limit_gb", 0.0) or 0.0)
+        if limit <= 0:
             return
-        which = str(self.args.critic_warmup.params)
-        params = (list(self.model.value_head.parameters()) if which == "value_head"
-                  else self.params)
-        if which not in ("value_head", "all"):
-            raise ValueError(f"critic_warmup.params must be 'value_head' or 'all', "
-                             f"got {which!r}")
-        opt = torch.optim.AdamW(params, lr=float(self.args.critic_warmup.learning_rate))
-        print(f"[rl] critic warmup: {rounds} round(s), optimising {which}")
-        for r in range(rounds):
-            episodes = self.collect(int(self.args.critic_warmup.steps),
-                                    int(self.args.critic_warmup.episodes))
-            compute_returns(episodes, self.ppo_cfg.gamma, self.ppo_cfg.gae_lambda)
-            stats = rollout_stats(episodes)
-            losses = []
-            for _epoch in range(int(self.args.critic_warmup.epochs)):
-                for mb in iter_minibatches(episodes, self.ppo_cfg.minibatch_episodes,
-                                           self.rng):
-                    valid = float(sum(len(e) for e in mb))
-                    if valid == 0:
-                        continue
-                    opt.zero_grad(set_to_none=True)
-                    memory = None
-                    for ci, (lo, hi) in enumerate(iter_chunks(mb, self.ppo_cfg.seq_len)):
-                        batch = build_chunk(mb, lo, hi, device=self.device, first=ci == 0)
-                        latents, memory = self._forward(self.model, batch["model"], memory)
-                        memory = [m.detach() for m in memory]
-                        vpred = latents["vpred"].squeeze(-1).float()
-                        loss = 0.5 * (((vpred - batch["returns"]) ** 2)
-                                      * batch["mask"]).sum() / valid
-                        loss.backward()
-                        losses.append(float(loss.detach()))
-                    torch.nn.utils.clip_grad_norm_(params, self.ppo_cfg.max_grad_norm)
-                    opt.step()
-            ev = explained_variance(np.concatenate([e.values for e in episodes]),
-                                    np.concatenate([e.returns for e in episodes]))
-            row = {"phase": "critic_warmup", "warmup_round": r,
-                   "value_loss": float(np.mean(losses)) if losses else float("nan"),
-                   "explained_variance_before": ev,
-                   **{f"rollout/{k}": v for k, v in stats.items()},
-                   **self._last_collect}
-            self._emit(row, prefix=f"[warmup {r+1}/{rounds}]")
+        total = avail = 0.0
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total = float(line.split()[1]) / 1e6
+                elif line.startswith("MemAvailable:"):
+                    avail = float(line.split()[1]) / 1e6
+                    break
+        used = total - avail
+        if used > limit:
+            raise MemoryError(
+                f"host memory at {used:.2f} GB > train.memory_limit_gb={limit:.1f} "
+                f"(total {total:.1f} GB). Aborting before the guest swaps; the final "
+                f"checkpoint is still written. Lower rollout.groups_per_update or "
+                f"rollout.max_oversample_factor.")
+
+    def collect_filtered(self):
+        """Draw groups until ``groups_per_update`` survive filtering.
+
+        Dynamic sampling: a constant number of *usable* groups per update, rather than a
+        constant number of rollouts of unknown usefulness. Capped by
+        ``max_oversample_factor`` — if a task mix cannot produce enough surviving groups,
+        that is a finding to stop on, not a loop to spin in.
+        """
+        want = int(self.args.rollout.groups_per_update)
+        batch_groups = int(self.args.rollout.collect_groups_at_once)
+        cap = int(want * float(self.args.rollout.max_oversample_factor))
+
+        kept, outcomes, drawn = [], [], 0
+        stats: Dict[str, float] = {}
+        while True:
+            groups = self.groups.sample_groups(batch_groups)
+            # `base_gid=drawn` keeps ids unique across iterations. Without it every call
+            # restarts at 0, `n_kept` saturates at `batch_groups`, and the loop can never
+            # reach `want` — it ran to the cap every update in 2026-08-02/11-48-03.
+            eps = self.collector.collect_groups(groups, base_gid=drawn)
+            drawn += batch_groups
+            # Feed *everything* back, especially the groups about to be filtered out:
+            # an all-success group is the strongest evidence a task is too easy, and it
+            # is exactly what gets discarded next.
+            self.groups.observe(eps)
+            # Keep only what reporting needs from the discarded episodes; the frames of
+            # a full oversampled draw are gigabytes.
+            outcomes.extend(EpisodeOutcome.of(e) for e in eps)
+            if self.args.rollout.filter_groups:
+                surv, st = filter_groups(eps)
+            else:
+                surv, st = list(eps), {"groups_collected": float(batch_groups),
+                                       "groups_kept": float(batch_groups),
+                                       "zero_variance_group_frac": 0.0}
+            kept.extend(surv)
+            del eps
+            n_kept = len({e.group_id for e in kept})
+            self._check_memory()
+            if n_kept >= want or drawn >= cap:
+                stats = {
+                    "groups_drawn": float(drawn),
+                    "groups_kept": float(n_kept),
+                    "oversample_factor": drawn / max(1, want),
+                    # Namespaced: `group_advantages` also emits
+                    # `zero_variance_group_frac`, and it is merged into the same row.
+                    # Sharing the key let the post-filter value (0 by construction)
+                    # overwrite this one, hiding a real 0.59 behind a logged 0.0.
+                    "collect/zero_variance_group_frac": 1.0 - n_kept / max(1, drawn),
+                    "episodes_rolled": float(len(outcomes)),
+                    "episodes_used": float(len(kept)),
+                }
+                if drawn >= cap and n_kept < want:
+                    print(f"[grpo] WARNING oversample cap hit: {n_kept}/{want} groups "
+                          f"survived from {drawn} drawn. The task mix is saturated or "
+                          f"impossible — see doc/0004 §5.", flush=True)
+                break
+        return kept, outcomes, stats
+
+    # -- update -------------------------------------------------------------
+
+    def _forward_logits(self, batch, model):
+        ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
+               if self.autocast_dtype is not None else _null())
+        with ctx:
+            return model(batch.image, batch.goal_image, batch.interaction)["pi_logits"]
+
+    def train_on(self, episodes, advantages) -> Dict[str, float]:
+        agg: Dict[str, List[float]] = {}
+        for _ in range(int(self.args.train.epochs)):
+            for batch in iter_minibatches(
+                    episodes, advantages,
+                    int(self.args.train.minibatch_episodes), self.rng, self.device):
+                logits = self._forward_logits(batch, self.policy)
+                ref_logits = None
+                if self.ref is not None:
+                    with torch.no_grad():
+                        ref_logits = self._forward_logits(batch, self.ref)
+                loss, m = grpo_loss(logits, batch, self.cfg, ref_logits)
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                gn = torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.policy.parameters() if p.requires_grad],
+                    self.cfg.max_grad_norm)
+                self.optimizer.step()
+
+                for k, v in m.items():
+                    agg.setdefault(k, []).append(float(v))
+                agg.setdefault("grad_norm", []).append(float(gn))
+                if float(m["approx_kl"]) > self.cfg.target_kl:
+                    # Early stop on the *behaviour* KL: the batch has drifted far enough
+                    # that its stored log-probs no longer describe this policy.
+                    agg.setdefault("early_stopped", []).append(1.0)
+                    return {k: float(np.mean(v)) for k, v in agg.items()}
+        return {k: float(np.mean(v)) for k, v in agg.items()}
+
+    # -- the probe ----------------------------------------------------------
+
+    def _build_probe(self) -> List:
+        """A fixed, family-stratified sample of train tasks, drawn once.
+
+        **Why this exists.** Every per-family number in `metrics.csv` is measured on
+        whatever the sampler chose to roll, and the sampler is *deliberately* biased:
+        the difficulty tournament picks tasks whose success rate is near 0.5, tracking
+        that frontier upward as the policy improves. So the logged rate is an estimate
+        over a self-selected subset, not over the task population — it rises partly
+        because the selection moves.
+
+        That is not hypothetical. Run ``2026-08-03/09-23-22`` logged boss climbing
+        0.093 -> 0.338 on train while the same checkpoints scored 0.035 -> 0.105 on the
+        held-out val set. Boss has the widest per-task spread of any family (expert
+        lengths 78-305, four weapons), so the selection effect is largest exactly where
+        the headline number was read.
+
+        The probe removes both moving parts: the *same* tasks every time, drawn
+        uniformly within each family, with no filtering and no difficulty weighting.
+        Paired across updates, so task-selection variance cancels and a trend means
+        something even at modest n.
+
+        **What it is not.** These tasks stay in the training pool, so this is an
+        unbiased estimate of *train* success — not of generalisation. The val harness in
+        `contra_nes_evaluation` remains the only thing that measures that.
+        """
+        cfg = self.args.get("probe", {})
+        per = int(cfg.get("tasks_per_family", 0))
+        if not per:
+            return []
+        rng = np.random.default_rng(int(cfg.get("seed", 12345)))
+        out = []
+        for fam in sorted(self.catalog.by_family):
+            tasks = [t for lab in sorted(self.catalog.by_family[fam])
+                     for t in self.catalog.by_family[fam][lab]]
+            idx = rng.permutation(len(tasks))[:min(per, len(tasks))]
+            out.extend(tasks[int(i)] for i in idx)
+        return out
+
+    def run_probe(self) -> Dict[str, float]:
+        """Roll every probe task once and report success, unweighted.
+
+        Groups of size 1: the probe is a measurement, not a gradient source, so it
+        needs no baseline. Results are deliberately **not** fed to the
+        :class:`DifficultyTracker` — the probe must not perturb the sampler it exists
+        to measure around.
+        """
+        if not self.probe_tasks:
+            return {}
+        reps = int(self.args.probe.get("repeats", 1))
+        groups = [[t] for t in self.probe_tasks for _ in range(reps)]
+        eps = self.collector.collect_groups(groups, base_gid=self._probe_gid)
+        self._probe_gid += len(groups)
+
+        out: Dict[str, float] = {}
+        out["probe/success"] = float(np.mean([_won(e) for e in eps]))
+        out["probe/reward_mean"] = float(np.mean([e.reward for e in eps]))
+        out["probe/episodes"] = float(len(eps))
+        out["probe/mean_len"] = float(np.mean([len(e) for e in eps]))
+        macro = []
+        for fam in FAMILIES:
+            sel = [e for e in eps if e.family == fam]
+            if not sel:
+                continue
+            s = int(sum(_won(e) for e in sel))
+            lo, hi = wilson(s, len(sel))
+            out[f"probe/{fam}/success"] = s / len(sel)
+            out[f"probe/{fam}/ci_lo"], out[f"probe/{fam}/ci_hi"] = lo, hi
+            macro.append(s / len(sel))
+        if macro:
+            # Macro average, because the probe is family-balanced by construction while
+            # the training mix is not — pooling would hide a family behind the others.
+            out["probe/macro"] = float(np.mean(macro))
+        return out
+
+    # -- metrics ------------------------------------------------------------
+
+    def outcome_stats(self, episodes) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if not episodes:
+            return out
+        out["success"] = float(np.mean([_won(e) for e in episodes]))
+        out["reward_mean"] = float(np.mean([e.reward for e in episodes]))
+        out["episodes"] = float(len(episodes))
+        out["mean_len"] = float(np.mean([len(e) for e in episodes]))
+        for fam in FAMILIES:
+            sel = [e for e in episodes if e.family == fam]
+            if not sel:
+                continue
+            s = int(sum(_won(e) for e in sel))
+            lo, hi = wilson(s, len(sel))
+            out[f"{fam}/success"] = s / len(sel)
+            out[f"{fam}/episodes"] = float(len(sel))
+            out[f"{fam}/ci_lo"], out[f"{fam}/ci_hi"] = lo, hi
+        return out
 
     # -- the loop -----------------------------------------------------------
 
     def run(self) -> None:
+        total = int(self.args.train.updates)
         try:
-            if self.counters["update"] == 0:
-                self.critic_warmup()
-            total = int(self.args.train.updates)
-            while self.counters["update"] < total:
-                update = self.counters["update"]
-                episodes = self.collect(int(self.args.rollout.steps),
-                                        int(self.args.rollout.episodes))
-                if not episodes:
-                    raise RuntimeError("the collector returned no episodes")
-                stats = rollout_stats(episodes)
-                metrics = self.update(episodes)
-                self.counters["update"] = update + 1
+            while self.update < total:
+                t0 = time.time()
+                kept, outcomes, cstats = self.collect_filtered()
+                if not kept:
+                    raise RuntimeError(
+                        "no groups survived filtering; nothing to learn from")
+                self._check_memory()
+                adv, astats = group_advantages(
+                    [e.reward for e in kept], [e.group_id for e in kept],
+                    normalise=bool(self.args.rollout.normalise_advantages))
+                m = self.train_on(kept, adv)
+                self.update += 1
+                # Release the training batch before anything else allocates. `kept` holds
+                # groups_per_update x G episodes of raw frames — ~128 at the defaults —
+                # and the probe below rolls another 192. Holding both put ~320 episodes
+                # of frames live at once, for no reason: nothing after this point reads
+                # `kept`, and `outcomes` carries what the row needs at ~100 bytes each.
+                kept = adv = None
 
-                row = {"phase": "ppo", "update": self.counters["update"],
-                       "total_episodes": self.counters["episodes"],
-                       "total_steps": self.counters["steps"],
-                       **{f"rollout/{k}": v for k, v in stats.items()},
-                       **{f"ppo/{k}": v for k, v in metrics.items()},
-                       **self._last_collect, **_resource_usage()}
-                self._emit(row, prefix=f"[update {self.counters['update']}/{total}]")
-                self._check_finite(metrics)
-
-                every = int(self.args.train.save_every)
-                if every > 0 and self.counters["update"] % every == 0:
+                row = {"update": self.update, **cstats, **astats, **m,
+                       # Outcome stats over EVERYTHING rolled, not just what survived —
+                       # filtering is an update-side decision and must not flatter the
+                       # success rate it reports.
+                       **self.outcome_stats(outcomes), **self.groups.stats()}
+                every = int(self.args.get("probe", {}).get("every", 0) or 0)
+                # Probed *after* the update, so the number describes the weights this
+                # row's checkpoint would contain. Update 1 is probed too, giving the
+                # init's baseline on the same tasks.
+                if every and (self.update == 1 or self.update % every == 0):
+                    row.update(self.run_probe())
+                    self._check_memory()
+                row["seconds"] = time.time() - t0
+                self._emit(row)
+                if int(self.args.train.save_every) and \
+                        self.update % int(self.args.train.save_every) == 0:
                     self.save()
         finally:
             self.save(final=True)
-            self.close()
-
-    def _check_finite(self, metrics: Dict[str, float]) -> None:
-        bad = [k for k, v in metrics.items()
-               if isinstance(v, float) and not np.isfinite(v) and k != "explained_variance"]
-        if bad:
-            raise FloatingPointError(
-                f"non-finite PPO metrics at update {self.counters['update']}: {bad}")
-
-    # -- output -------------------------------------------------------------
-
-    def _emit(self, row: Dict, prefix: str) -> None:
-        self.logger.log({k: v for k, v in row.items() if not isinstance(v, str)}
-                        | {"phase": row.get("phase", "")})
-        if self.wandb is not None:
-            self.wandb.log({k: v for k, v in row.items() if not isinstance(v, str)})
-        keys = ["rollout/completion", "rollout/macro_completion", "rollout/death",
-                "rollout/timeout", "rollout/episodes", "rollout/mean_episode_len",
-                "ppo/policy_loss", "ppo/value_loss", "ppo/entropy", "ppo/approx_kl",
-                "ppo/clip_frac", "ppo/explained_variance", "value_loss",
-                "collect_steps_per_s"]
-        parts = [f"{k.split('/')[-1]}={row[k]:.4g}" for k in keys if k in row]
-        print(f"{prefix} " + " ".join(parts), flush=True)
-        # Completion only. The episode and step counts behind each rate stay in
-        # metrics.csv, where `tools/rl_progress.py` pools them across updates — which
-        # is the only shape they are readable in anyway, since one update gives boss
-        # about four episodes.
-        fam = [f"{f}({_trim(row[f'rollout/{f}/completion'])})"
-               for f in ("kill", "item", "traverse", "boss")
-               if f"rollout/{f}/completion" in row]
-        if fam:
-            print("    families: " + " ".join(fam), flush=True)
-
-    def save(self, final: bool = False) -> Dict[str, str]:
-        tag = "final" if final else f"{self.counters['update']:06d}"
-        weights = ckpt_io.save_weights_only(
-            os.path.join(self.run_dir, "weights", f"weight-update={tag}.ckpt"),
-            self.model, self.config)
-        resumable = ckpt_io.save_resumable(
-            os.path.join(self.run_dir, "checkpoints", f"rl-{tag}.pt"),
-            model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
-            counters=self.counters, config=self.config,
-            sampler=self.sampler,
-            actor=self.collector.actor if self.collector is not None else None)
-        print(f"[rl] saved {weights} and {resumable}", flush=True)
-        return {"weights": weights, "checkpoint": resumable}
-
-    def resume(self, path: str) -> None:
-        counters = ckpt_io.load_resumable(
-            path, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
-            sampler=self.sampler,
-            actor=self.collector.actor if self.collector is not None else None,
-            map_location=str(self.device))
-        self.counters.update(counters)
-        self.model.to(self.device).eval()
-        print(f"[rl] resumed {path} at update {self.counters['update']} "
-              f"({self.counters['steps']} steps collected so far)")
-
-    def close(self) -> None:
-        if self.collector is not None:
             self.collector.close()
-        if self.mp_collector is not None:
-            self.mp_collector.close()
-        self.catalog.close()
-        if self.wandb is not None:
-            self.wandb.finish()
+
+    def _emit(self, row: Dict[str, float]) -> None:
+        self.logger.log(row)
+        # `zero_var` must be the *collection*-side fraction. The post-filter one is zero
+        # by construction — the groups with no spread have already been removed — so
+        # printing that is printing a constant, which is how a real 0.59 went unnoticed
+        # for 8 updates in 2026-08-02/11-48-03. doc/0004 §2 stops the run above 0.3.
+        head = " ".join(f"{label}={row[k]:.4g}" for k, label in
+                        (("success", "success"), ("policy_loss", "policy_loss"),
+                         ("kl_ref", "kl_ref"), ("approx_kl", "approx_kl"),
+                         ("entropy", "entropy"),
+                         ("collect/zero_variance_group_frac", "zero_var"),
+                         ("oversample_factor", "oversample_factor"))
+                        if k in row)
+        print(f"[update {self.update}/{int(self.args.train.updates)}] {head} "
+              f"({row.get('seconds', 0):.0f}s)", flush=True)
+        fam = [f"{f}={row[f'{f}/success']:.2f}[{row[f'{f}/ci_lo']:.2f},"
+               f"{row[f'{f}/ci_hi']:.2f}]({int(row[f'{f}/episodes'])})"
+               for f in FAMILIES if f"{f}/success" in row]
+        if fam:
+            print("    " + " ".join(fam), flush=True)
+        # The probe is the line to read. The one above it is measured on whatever the
+        # difficulty sampler chose, which is a moving target by design.
+        pf = [f"{f}={row[f'probe/{f}/success']:.2f}"
+              for f in FAMILIES if f"probe/{f}/success" in row]
+        if pf:
+            print(f"    PROBE macro={row['probe/macro']:.3f} " + " ".join(pf) +
+                  f"  (n={int(row['probe/episodes'])}, fixed tasks)", flush=True)
+
+    def save(self, final: bool = False) -> str:
+        tag = "final" if final else f"{self.update:06d}"
+        path = os.path.join(self.run_dir, "checkpoints", f"grpo-{tag}.pt")
+        self.policy.save(path, update=self.update,
+                         train_config=OmegaConf.to_container(self.args, resolve=True))
+        print(f"[grpo] saved {path}", flush=True)
+        return path
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-class _null_context:
+class _null:
     def __enter__(self):
         return None
 
-    def __exit__(self, *exc):
+    def __exit__(self, *a):
         return False
 
 
-def _resolved(node):
-    from omegaconf import DictConfig, OmegaConf
+@hydra.main(config_path=".", config_name="config_grpo", version_base=None)
+def main(args: DictConfig) -> None:
+    torch.set_float32_matmul_precision("high")
+    _install_signal_handlers()
+    _seed(int(args.seed))
+    run_dir = os.getcwd()
+    with open(os.path.join(run_dir, "resolved_config.yaml"), "w") as fh:
+        fh.write(OmegaConf.to_yaml(args, resolve=True))
+    GRPOTrainer(args, run_dir=run_dir).run()
 
-    if isinstance(node, DictConfig):
-        return OmegaConf.to_container(node, resolve=True)
-    return dict(node) if node is not None else {}
 
+def _install_signal_handlers() -> None:
+    """SIGTERM as a normal exit so `run`'s `finally` saves and closes the emulator.
 
-def _trim(value: float) -> str:
-    """Two decimals, minus a trailing zero: 0.7, 1.0, 0.89, 0.0.
-
-    Keeping one decimal on the round numbers is what makes the family list read as a
-    column of rates rather than a mix of integers and fractions.
+    Python's default disposition skips both, which loses the checkpoint and leaves an
+    emulator open in a worker that `PR_SET_PDEATHSIG` would otherwise have reaped.
     """
-    s = f"{float(value):.2f}"
-    return s[:-1] if s.endswith("0") else s
+    def _exit(signum, _frame):
+        print(f"\n[grpo] {signal.Signals(signum).name} — saving and stopping", flush=True)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _exit)
+    signal.signal(signal.SIGINT, _exit)
 
 
-# ── host memory preflight ─────────────────────────────────────────────────────
-# Calibrated on this box (WSL2, `memory=20GB`, 16 GB GPU) by running the two-update
-# smoke under `tools/rss_guard.py` and reading peak group PSS:
-#
-#     num_workers=0, steps=2048, batch_size=16   ->  3.54 GB
-#     num_workers=2, steps=2048, batch_size=16   ->  8.83 GB
-#
-# which gives a ~2.9 GB parent, ~2.4 GB per worker, and a frame buffer that scales
-# with `rollout.steps`. Re-measure these if the model, the image size or the machine
-# changes; they are a fit to two points, not a derivation.
-_PARENT_BASE_GB = 2.9      # torch + CUDA context + policy + optimiser + task catalog
-_WORKER_BASE_GB = 2.4      # torch + CUDA context + policy replica + emulator + caches
-# Collection stops once BOTH `steps` and `episodes` targets are met and then drains
-# what is in flight, so the batch overshoots its step target. Measured 3.1k steps
-# against a 2048 target at batch_size=16.
-_OVERSHOOT = 1.55
-
-
-def estimate_peak_host_gb(args, image_size: int) -> float:
-    """Projected peak host RAM for this configuration, in GB.
-
-    The frame buffer is counted once in the parent and once more across the workers
-    when there are any: a worker holds its episodes until it puts them on the queue,
-    the queue pickles them, and the parent holds the assembled batch.
-    """
-    workers = int(args.rollout.num_workers)
-    frame_bytes = image_size * image_size * 3
-    steps = max(int(args.rollout.steps), int(args.critic_warmup.steps))
-    frames_gb = _OVERSHOOT * steps * frame_bytes / 1e9
-    est = _PARENT_BASE_GB + workers * _WORKER_BASE_GB
-    est += frames_gb * (2.0 if workers > 0 else 1.0)
-    if float(args.ppo.bc_kl_coef) > 0:
-        est += 0.5             # a second frozen policy, host side
-    return est
-
-
-def preflight_host_memory(args, image_size: int) -> float:
-    """Refuse to start a run that will not fit in host RAM.
-
-    This exists because the failure it prevents is not a crash. A run that exceeds
-    the VM's memory does not get OOM-killed — it swaps, and a swapping WSL2 VM takes
-    the editor, the terminal and everything else down with it, with no traceback and
-    nothing saved. Checking a multiplication up front is cheap; the alternative costs
-    a reboot.
-    """
-    budget = float(args.host_ram_budget_gb)
-    est = estimate_peak_host_gb(args, image_size)
-    workers = int(args.rollout.num_workers)
-    free = _system_available_gb()
-
-    print(f"[rl] host-RAM preflight: ~{est:.1f} GB projected "
-          f"({workers} worker(s), {int(args.rollout.steps)} steps/update) · "
-          f"budget {budget:.1f} GB · {free:.1f} GB available now", flush=True)
-
-    if budget <= 0:                                          # explicitly disabled
-        return est
-    if est > budget:
-        raise MemoryError(
-            f"this configuration projects ~{est:.1f} GB of host RAM, over the "
-            f"{budget:.1f} GB in `host_ram_budget_gb`. Going over does not raise — it "
-            f"swaps, and the VM stops responding. Lower `rollout.num_workers` "
-            f"(~{_WORKER_BASE_GB} GB each) or `rollout.steps`, or raise the budget if "
-            f"the machine really has the room.")
-    # Reserve headroom on top of the projection rather than spending every free byte.
-    # The other tenants of this VM are an editor server and an agent, and they grow
-    # over a session — measured drifting from 3.4 GB to 8 GB inside a few hours. A run
-    # that exactly fits at startup is a run that swaps by hour three.
-    reserve = 2.0
-    if free > 0 and est > free - reserve:
-        raise MemoryError(
-            f"this configuration projects ~{est:.1f} GB but only {free:.1f} GB is "
-            f"available right now, and {reserve:.0f} GB is reserved for the rest of "
-            f"the machine (an editor server grows over a long run). Free something "
-            f"up, or lower `rollout.num_workers`/`rollout.steps`.")
-    return est
-
-
-def _system_available_gb() -> float:
-    """``MemAvailable`` — what can be had without swapping. 0 if unknown."""
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    return float(line.split()[1]) / 1e6
-    except OSError:                                          # pragma: no cover
-        pass
-    return 0.0
-
-
-def _resource_usage() -> Dict[str, float]:
-    """GPU peak allocation and host RSS — the two numbers that end a run early."""
-    out: Dict[str, float] = {}
+def _seed(seed: int) -> None:
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        out["gpu_alloc_gb"] = torch.cuda.memory_allocated() / 1e9
-        out["gpu_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
-    try:
-        with open("/proc/self/status") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    out["host_rss_gb"] = float(line.split()[1]) / 1e6
-                    break
-    except OSError:                                          # pragma: no cover
-        pass
-    return out
+        torch.cuda.manual_seed_all(seed)
+
+
+if __name__ == "__main__":
+    main()

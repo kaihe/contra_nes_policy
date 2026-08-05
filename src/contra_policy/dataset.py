@@ -40,6 +40,7 @@ window and no sampling (or its retry logic) is needed.
 from __future__ import annotations
 
 import collections
+import glob
 import hashlib
 import io
 import json
@@ -159,8 +160,8 @@ class ContraCrossViewDataset(Dataset):
     ``prev_action``             (T,) int64            action that produced this frame
     ``prev_action_dropout``     (T,) float32          1 = use it, 0 = "unknown" embedding
     ``action``                  (T,) int64            BC target: action taken *from* it
-    ``goal_heatmap``            (T, A, A) float32     aux target the head trains on
-    ``exist`` / ``point``       (T,) (T,2) float32    aux *metrics* only, [0,1] screen
+    ``goal_heatmap``            (T, A, A) float32     optional when ``aux_size > 0``
+    ``exist`` / ``point``       (T,) (T,2) float32    optional with the heatmap target
     ``mask``                    (T,) float32          1 on real steps, 0 on tail padding
     ``first``                   (T,) bool             True at t=0 of an episode's first
                                                       window — resets attention memory
@@ -183,8 +184,13 @@ class ContraCrossViewDataset(Dataset):
     def __init__(self, index: List[dict], win_len: int = 32, image_size: int = 256,
                  sigma_px: float = 12.0, prev_action_keep_prob: float = 0.25,
                  aux_size: int = 32, seed: int = 0, want_entities: bool = False,
-                 entity_sigma_px: float = 6.0):
+                 entity_sigma_px: float = 6.0, whole_episode: bool = False):
         self.index = index
+        # One item = one whole episode at its natural length, unpadded. The policy's
+        # context holds an entire episode, so windows are no longer the unit — and
+        # padding every episode to 1024 would be 201 MB of uint8 frames per item.
+        # Callers must collate with `pad_episodes`, which pads to the batch maximum.
+        self.whole_episode = whole_episode
         self.want_entities = want_entities
         # Tighter than the goal's 12 px on purpose. At A=32 a 12 px sigma is 1.66 cells,
         # which smears a boss frame's ~4.9 enemy bullets into one blob; 6 px is 0.83
@@ -214,7 +220,8 @@ class ContraCrossViewDataset(Dataset):
                 self.episode_windows.append([])
                 continue                       # degenerate single-step episode
             flat = []
-            for r in range(math.ceil(usable / win_len)):
+            n_win = 1 if whole_episode else math.ceil(usable / win_len)
+            for r in range(n_win):
                 flat.append(len(self.windows))
                 self.windows.append((i, r))
             self.episode_windows.append(flat)
@@ -300,8 +307,10 @@ class ContraCrossViewDataset(Dataset):
         meta = json.loads(self._read(ep, "json"))
         actions = vectors_to_indices(np.load(io.BytesIO(self._read(ep, "actions.npy"))))
 
-        T = self.win_len
-        start = rel * T
+        # Whole-episode mode sizes T to this episode rather than to a fixed window.
+        # `usable` is length-1 because the last frame has no action taken *from* it.
+        T = max(1, int(ep["length"]) - 1) if self.whole_episode else self.win_len
+        start = 0 if self.whole_episode else rel * T
         frames = self._frames(ep, start, T)
         # -1 because frames[j] is the state AFTER actions[j]: the action taken FROM
         # the last frame of an episode was never recorded, so that frame has no target.
@@ -367,42 +376,54 @@ class ContraCrossViewDataset(Dataset):
         # `boss` (100.0% goal-visible) literally no negative examples; a heatmap makes
         # every pixel outside the blob a negative on every frame.
         A = self.aux_size
-        exist = np.zeros(T, dtype=np.float32)
-        point = np.zeros((T, 2), dtype=np.float32)
-        heatmap = np.zeros((T, A, A), dtype=np.float32)
-        # How many centroids the goal has on this frame. `points_to_target` collapses
-        # them to their *mean*, which is a well-defined target only when there is one.
-        # Boss goals span all live components — 4.6 on average, spread ~34 px — so on
-        # those frames `point` names a spot where nothing is, and any error measured
-        # against it grows as a predictor gets sharper. Consumers must gate on this.
-        n_goal_points = np.zeros(T, dtype=np.int64)
-        centroids, visibility = meta["centroids"], meta["visibility"]
-        for k in range(n):
-            j = start + k
-            if j >= len(centroids) or not visibility[j] or not centroids[j]:
-                continue
-            exist[k] = 1.0
-            point[k], _bbox = points_to_target(centroids[j])
-            n_goal_points[k] = len(centroids[j])
-            heatmap[k] = goal_mask(centroids[j], A, self.sigma_px)
+        exist = point = heatmap = n_goal_points = None
+        if A > 0:
+            exist = np.zeros(T, dtype=np.float32)
+            point = np.zeros((T, 2), dtype=np.float32)
+            heatmap = np.zeros((T, A, A), dtype=np.float32)
+            # How many centroids the goal has on this frame. `points_to_target`
+            # collapses them to their mean, which is well-defined only for one target.
+            n_goal_points = np.zeros(T, dtype=np.int64)
+            centroids, visibility = meta["centroids"], meta["visibility"]
+            for k in range(n):
+                j = start + k
+                if j >= len(centroids) or not visibility[j] or not centroids[j]:
+                    continue
+                exist[k] = 1.0
+                point[k], _bbox = points_to_target(centroids[j])
+                n_goal_points[k] = len(centroids[j])
+                heatmap[k] = goal_mask(centroids[j], A, self.sigma_px)
 
         # Per-class entity occupancy, off by default so the BC path pays nothing for it.
         # `entities` is absent from shards exported before 2026-07-30; an all-zero target
         # is the honest fallback (no entities known), and `want_entities` callers should
         # check `entities_available` rather than train on silence.
-        entity = None
+        entity = goal_entity = None
         if self.want_entities:
+            if A <= 0:
+                raise ValueError("want_entities requires aux_size > 0")
             C = len(self.ENTITY_CLASSES)
             entity = np.zeros((T, C, A, A), dtype=np.float32)
             ent = meta.get("entities")
+
+            def render(frame_idx: int, into: np.ndarray) -> None:
+                for c, name in enumerate(self.ENTITY_CLASSES):
+                    col = ent.get(name)
+                    if col is None or frame_idx >= len(col) or not col[frame_idx]:
+                        continue
+                    into[c] = goal_mask(col[frame_idx], A, self.entity_sigma_px)
+
             if ent is not None:
                 for k in range(n):
-                    j = start + k
-                    for c, name in enumerate(self.ENTITY_CLASSES):
-                        col = ent.get(name)
-                        if col is None or j >= len(col) or not col[j]:
-                            continue
-                        entity[k, c] = goal_mask(col[j], A, self.entity_sigma_px)
+                    render(start + k, entity[k])
+                # The goal frame's own entity target. `goal.png` IS an episode frame
+                # with the target painted into it, and `goal_frame_idx` says which —
+                # so a goal-agnostic encoder can supervise goal frames with exactly the
+                # same signal as any other frame, rather than leaving them unlabelled.
+                gi = meta.get("goal_frame_idx")
+                if gi is not None:
+                    goal_entity = np.zeros((C, A, A), dtype=np.float32)
+                    render(int(gi), goal_entity)
 
         mask = np.zeros(T, dtype=np.float32)
         mask[:n] = 1.0
@@ -423,16 +444,21 @@ class ContraCrossViewDataset(Dataset):
             "prev_action": torch.from_numpy(prev),
             "prev_action_dropout": torch.from_numpy(keep),
             "action": torch.from_numpy(act),
-            "exist": torch.from_numpy(exist),
-            "point": torch.from_numpy(point),
-            "goal_heatmap": torch.from_numpy(heatmap),
-            "n_goal_points": torch.from_numpy(n_goal_points),
             "mask": torch.from_numpy(mask),
             "first": torch.from_numpy(first),
             "family": torch.tensor(FAMILIES.index(ep["family"]), dtype=torch.int64),
         }
+        if heatmap is not None:
+            out.update({
+                "exist": torch.from_numpy(exist),
+                "point": torch.from_numpy(point),
+                "goal_heatmap": torch.from_numpy(heatmap),
+                "n_goal_points": torch.from_numpy(n_goal_points),
+            })
         if entity is not None:
             out["entity_heatmap"] = torch.from_numpy(entity)
+        if goal_entity is not None:
+            out["goal_entity_heatmap"] = torch.from_numpy(goal_entity)
         return out
 
 
@@ -450,9 +476,74 @@ def _worker_init(worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
-def shard_paths(shard_dir: str, configs: Sequence[str], split: str) -> List[str]:
-    """``<shard_dir>/<config>-<split>-00000.tar`` for each config."""
-    return [os.path.join(shard_dir, f"{c}-{split}-00000.tar") for c in configs]
+def shard_paths(shard_dir: str, configs: Sequence[str], split: str,
+                overrides: Dict[str, str] | None = None) -> List[str]:
+    """Resolve every family shard, with optional family-specific directories.
+
+    Missing families retain the old deterministic ``00000`` path so the caller raises
+    a useful ``FileNotFoundError`` instead of silently training without that family.
+    """
+    overrides = overrides or {}
+    paths: List[str] = []
+    for family in configs:
+        root = os.path.expanduser(overrides.get(family, shard_dir))
+        matches = sorted(glob.glob(os.path.join(root, f"{family}-{split}-*.tar")))
+        paths.extend(matches or [os.path.join(root, f"{family}-{split}-00000.tar")])
+    return paths
+
+
+def scaling_release(manifest_path: str, shard_count: int,
+                    validation_sha256: str) -> dict:
+    """Resolve one exact nested training prefix from a data-release manifest.
+
+    The scaling experiment must not glob a live release directory: a later shard
+    would silently change the cell being trained.  The manifest is therefore the
+    authority for both membership and the frozen validation artifact.  Episode counts
+    are returned for the caller to verify against the decoded tar index.
+    """
+    manifest_path = os.path.abspath(os.path.expanduser(manifest_path))
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+    matches = [p for p in manifest.get("train_scaling_prefixes", [])
+               if int(p.get("shard_count", -1)) == int(shard_count)]
+    if len(matches) != 1:
+        available = [p.get("shard_count")
+                     for p in manifest.get("train_scaling_prefixes", [])]
+        raise ValueError(f"manifest has no unique {shard_count}-shard prefix; "
+                         f"available: {available}")
+
+    root = os.path.dirname(manifest_path)
+
+    def resolve(relative: str) -> str:
+        path = os.path.abspath(os.path.join(root, relative))
+        if os.path.commonpath((root, path)) != root:
+            raise ValueError(f"manifest path escapes release directory: {relative}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"release artifact not found: {path}")
+        return path
+
+    prefix = matches[0]
+    train = [resolve(p) for p in prefix["files"]]
+    if len(train) != int(shard_count):
+        raise ValueError(f"{shard_count}-shard prefix lists {len(train)} files")
+    validation = manifest.get("validation", {})
+    val_path = resolve(validation["file"])
+    declared = str(validation.get("sha256", ""))
+    if declared != validation_sha256:
+        raise ValueError(f"validation SHA contract is {validation_sha256}, "
+                         f"manifest declares {declared}")
+    h = hashlib.sha256()
+    with open(val_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+    if actual != validation_sha256:
+        raise ValueError(f"validation SHA mismatch: expected {validation_sha256}, "
+                         f"resolved {actual}")
+    return {"train": train, "val": [val_path],
+            "train_episodes": int(prefix["episodes"]),
+            "train_frames": int(prefix["frames"]),
+            "val_episodes": int(validation["episodes"])}
 
 
 def family_weights(index: List[dict], alpha: float) -> np.ndarray:
@@ -665,3 +756,188 @@ class ContraDataModule:
         # stops meaning what the evaluator's pooled number means.
         return self._loader(self.val_dataset, shuffle=False,
                             num_workers=min(2, self.num_workers), persistent=False)
+
+
+# ── whole-episode batching ────────────────────────────────────────────────────
+
+def pad_episodes(items: List[Dict]) -> Dict:
+    """Collate variable-length episodes, padding to the batch maximum.
+
+    Not to the model's context: episodes average 100 frames against a 1024 context, so
+    padding to the context would make ~90% of every batch mask. Padding to the batch
+    maximum and grouping similar lengths together (:class:`LengthGroupedSampler`) brings
+    that to roughly 1%.
+
+    ``mask`` marks real steps and is what every loss must reduce over — a padded step
+    has a fabricated action target of 0 and must never reach a gradient.
+    """
+    t = max(int(x["image"].shape[0]) for x in items)
+    out: Dict = {}
+
+    def stack(key, fill=0):
+        ref = items[0][key]
+        buf = torch.full((len(items), t, *ref.shape[1:]), fill, dtype=ref.dtype)
+        for i, x in enumerate(items):
+            n = x[key].shape[0]
+            buf[i, :n] = x[key]
+        return buf
+
+    for key in ("image", "action", "mask", "goal_heatmap", "exist", "point",
+                "n_goal_points", "prev_action", "prev_action_dropout", "first"):
+        if key in items[0]:
+            out[key] = stack(key)
+    if "entity_heatmap" in items[0]:
+        out["entity_heatmap"] = stack("entity_heatmap")
+
+    # Per-episode members carry no time axis.
+    out["cross_view"] = {
+        "cross_view_image": torch.stack([x["cross_view"]["cross_view_image"] for x in items]),
+        "cross_view_obj_mask": torch.stack(
+            [x["cross_view"]["cross_view_obj_mask"] for x in items]),
+        # One interaction id per episode. The windowed loader emitted it per timestep;
+        # the policy takes a single id, so collapse it here rather than in the model.
+        "cross_view_obj_id": torch.stack(
+            [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
+    }
+    out["family"] = torch.stack([x["family"] for x in items])
+    out["seq_len"] = torch.tensor([int(x["image"].shape[0]) for x in items])
+    return out
+
+
+class LengthGroupedSampler(Sampler):
+    """Batches of similar-length episodes, shuffled.
+
+    Sorting globally would put every long episode in one batch and, because length
+    correlates with family (traverse long, item short), make a batch nearly one family —
+    which changes the gradient's family mix step to step. So sort within a *pool* of
+    ``pool_batches`` batches, then shuffle the batch order: length is close enough for
+    padding, and families still mix.
+
+    **The order is always permuted, including when ``shuffle=False``.** The index is
+    ordered by tar path, so walking it directly groups every family together: a caller
+    scoring only the first N batches would miss whole families. That is not
+    hypothetical — a 60-batch validation covered 240 of 846 episodes and contained zero
+    `traverse`, which is 65% of all decision steps, because `traverse` starts at index
+    392. ``shuffle`` therefore controls only whether the permutation *varies between
+    epochs*: ``True`` for training, ``False`` for validation, where the subset must stay
+    representative **and** identical across calls or the trend is unreadable.
+    """
+
+    def __init__(self, lengths: Sequence[int], batch_size: int,
+                 pool_batches: int = 32, seed: int = 0, shuffle: bool = True):
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.pool = batch_size * pool_batches
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.lengths) / self.batch_size)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + (self.epoch if self.shuffle else 0))
+        if self.shuffle:
+            self.epoch += 1
+        order = rng.permutation(len(self.lengths))
+        batches = []
+        for start in range(0, len(order), self.pool):
+            pool = order[start:start + self.pool]
+            pool = pool[np.argsort([self.lengths[i] for i in pool], kind="stable")]
+            batches += [pool[i:i + self.batch_size].tolist()
+                        for i in range(0, len(pool), self.batch_size)]
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
+
+
+class FixedFamilyBatchSampler(Sampler):
+    """A deterministic fixed-family schedule followed by local length grouping.
+
+    Each reference cycle contains exactly ``family_draws[family]`` draws.  A family's
+    episode stream is an endless sequence of independently shuffled full passes, so a
+    small prefix cycles as needed while a large prefix is covered without replacement
+    across reference cycles.  ``start_batch`` makes continuation independent of
+    DataLoader worker/prefetch state: reconstructing batch N reconstructs every later
+    draw exactly.
+    """
+
+    def __init__(self, index: Sequence[dict], lengths: Sequence[int], batch_size: int,
+                 family_draws: Dict[str, int], num_batches: int,
+                 pool_batches: int = 32, seed: int = 0, start_batch: int = 0):
+        if len(index) != len(lengths):
+            raise ValueError("index and lengths must have the same size")
+        self.index = list(index)
+        self.lengths = list(lengths)
+        self.batch_size = int(batch_size)
+        self.family_draws = {str(k): int(v) for k, v in family_draws.items()}
+        self.num_batches = int(num_batches)
+        self.pool = self.batch_size * int(pool_batches)
+        self.seed = int(seed)
+        self.start_batch = int(start_batch)
+        if not 0 <= self.start_batch <= self.num_batches:
+            raise ValueError("start_batch must be between zero and num_batches")
+        if sum(self.family_draws.values()) % self.batch_size:
+            raise ValueError("reference-cycle draws must be divisible by batch_size")
+        self.by_family = {
+            family: [i for i, ep in enumerate(self.index) if ep["family"] == family]
+            for family in self.family_draws
+        }
+        missing = [f for f, members in self.by_family.items() if not members]
+        if missing:
+            raise ValueError(f"fixed-family schedule has no episodes for {missing}")
+
+    def __len__(self) -> int:
+        return self.num_batches - self.start_batch
+
+    def __iter__(self):
+        family_names = list(self.family_draws)
+        family_epoch = {f: 0 for f in family_names}
+        family_queue = {f: collections.deque() for f in family_names}
+
+        def take(family: str) -> int:
+            queue = family_queue[family]
+            if not queue:
+                position = family_names.index(family)
+                rng = np.random.default_rng(
+                    np.random.SeedSequence([self.seed, position, family_epoch[family]]))
+                queue.extend(rng.permutation(self.by_family[family]).tolist())
+                family_epoch[family] += 1
+            return queue.popleft()
+
+        produced = 0
+        cycle = 0
+        while produced < self.num_batches:
+            remaining = (self.num_batches - produced) * self.batch_size
+            cycle_size = sum(self.family_draws.values())
+            if remaining >= cycle_size:
+                draws = self.family_draws
+            else:
+                # A 20k-step run ends part-way through its twelfth 7,104-draw cycle.
+                # Allocate that tail up front so every data prefix has identical total
+                # family counts even though length grouping rearranges its batches.
+                exact = {f: remaining * self.family_draws[f] / cycle_size
+                         for f in family_names}
+                draws = {f: int(math.floor(exact[f])) for f in family_names}
+                left = remaining - sum(draws.values())
+                priority = sorted(family_names,
+                                  key=lambda f: (-(exact[f] - draws[f]),
+                                                 family_names.index(f)))
+                for family in priority[:left]:
+                    draws[family] += 1
+            labels = [f for f in family_names for _ in range(draws[f])]
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, 0xBC, cycle]))
+            rng.shuffle(labels)
+            order = [take(f) for f in labels]
+            batches = []
+            for start in range(0, len(order), self.pool):
+                pool = order[start:start + self.pool]
+                pool.sort(key=self.lengths.__getitem__)
+                batches.extend(pool[i:i + self.batch_size]
+                               for i in range(0, len(pool), self.batch_size))
+            rng.shuffle(batches)
+            for batch in batches:
+                if produced >= self.start_batch:
+                    yield batch
+                produced += 1
+            cycle += 1

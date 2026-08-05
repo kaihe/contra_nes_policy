@@ -353,3 +353,230 @@ class TaskSampler:
             out[f] = (self.natural_fraction * natural
                       + (1.0 - self.natural_fraction) * float(self.family_weights[i]))
         return out
+
+
+class DifficultyTracker:
+    """Per-task success estimate, used to sample tasks whose groups will carry signal.
+
+    **The problem it solves.** A group only produces gradient when its G rollouts
+    disagree. Measured on run ``2026-08-02/11-48-03``: the policy scores ~83% on *train*
+    tasks (against 67-76% on val, which is where G was chosen from), so 59% of groups
+    came back all-success and 58% of the rollout budget bought nothing.
+
+    **The weight is the thing we actually want to maximise**, not a proxy: the
+    probability that a group of size G is *not* all-agreeing,
+
+        p_useful = 1 - p**G - (1-p)**G
+
+    which is exactly the chance the group survives :func:`filter_groups`. It peaks at
+    p=0.5 and falls off at both ends — a task solved 95% of the time is nearly as
+    useless as one solved 3.5% of the time, which is the two-sidedness doc/0004 §5
+    records. Using survival probability rather than the Bernoulli variance ``4p(1-p)``
+    matters at the tails: at G=8 it downweights boss 3.1x relative to a 83% task, where
+    ``4p(1-p)`` would downweight it 4.2x.
+
+    **The estimate is hierarchical, and it has to be.** There are 6438 train tasks and
+    an update draws ~32 of them, so after 100 updates most tasks have been seen once or
+    never — a per-task estimate alone would still be at its prior when the run ends, and
+    measured exactly that: 43 tasks tracked after 4 updates. But there are only **13
+    labels** (495 tasks each), so a label's rate is well estimated within a few updates.
+    A task therefore shrinks toward *its label's* observed rate rather than toward 0.5:
+
+        p(label) = (s_label + w0/2) / (n_label + w0)
+        p(task)  = (s_task + prior * p(label)) / (n_task + prior)
+
+    An unseen task inherits a real measurement instead of an uninformative 0.5, so the
+    bias is worth something from update ~3 rather than never. Task-level counts then
+    refine it wherever they exist. ``traverse`` has a single label, so there it degrades
+    to a family-level prior — still far better than 0.5.
+
+    **Estimates must stay fresh**, because the policy is what makes a task easy and the
+    policy is moving. Counts decay geometrically on each observation, so the effective
+    window is the last ``G/(1-decay)`` rollouts — 80 at the defaults, and bounded, so an
+    old estimate cannot outvote a new one.
+
+    **Nothing is ever excluded.** ``min_weight`` floors the weight, so a task the policy
+    currently always fails is sampled rarely rather than never. Without that floor a
+    task could not be rediscovered once it became learnable — which for boss is the
+    entire hope.
+    """
+
+    def __init__(self, group_size: int, decay: float = 0.9, prior: float = 1.0,
+                 min_weight: float = 0.05, label_prior: float = 2.0):
+        if not 0.0 < decay <= 1.0:
+            raise ValueError(f"decay must be in (0, 1], got {decay}")
+        self.group_size, self.decay = int(group_size), float(decay)
+        self.prior, self.min_weight = float(prior), float(min_weight)
+        self.label_prior = float(label_prior)
+        self.s: Dict[str, float] = {}
+        self.n: Dict[str, float] = {}
+        self.ls: Dict[str, float] = {}
+        self.ln: Dict[str, float] = {}
+
+    def observe(self, uid: str, label: str, successes: float,
+                attempts: float) -> None:
+        d = self.decay
+        self.s[uid] = self.s.get(uid, 0.0) * d + float(successes)
+        self.n[uid] = self.n.get(uid, 0.0) * d + float(attempts)
+        self.ls[label] = self.ls.get(label, 0.0) * d + float(successes)
+        self.ln[label] = self.ln.get(label, 0.0) * d + float(attempts)
+
+    def observe_episodes(self, episodes) -> None:
+        """One update's rollouts, grouped by task. A group of G gives G attempts at
+        once, which is a far better estimate than one rollout would be."""
+        agg: Dict[tuple, list] = {}
+        for e in episodes:
+            a = agg.setdefault((e.task_uid, e.task_label), [0.0, 0.0])
+            a[0] += float(e.reward > 0)
+            a[1] += 1.0
+        for (uid, label), (s, n) in agg.items():
+            self.observe(uid, label, s, n)
+
+    def p_label(self, label: str) -> float:
+        """The label's success rate; 0.5 until anything of that label has been rolled.
+        Decays with the same window, so it tracks the policy rather than its history."""
+        s, n = self.ls.get(label, 0.0), self.ln.get(label, 0.0)
+        w0 = self.label_prior
+        return (s + 0.5 * w0) / (n + w0)
+
+    def p_hat(self, uid: str, label: str = "") -> float:
+        """Task rate shrunk toward its label's rate — see the class docstring."""
+        s, n = self.s.get(uid, 0.0), self.n.get(uid, 0.0)
+        return (s + self.prior * self.p_label(label)) / (n + self.prior)
+
+    def weight(self, task) -> float:
+        """P(a group of this task survives filtering), floored by ``min_weight``.
+
+        Takes the task rather than a uid because the label is half the estimate.
+        """
+        uid = getattr(task, "uid", task)
+        label = getattr(task, "label", "")
+        p, g = self.p_hat(uid, label), self.group_size
+        return max(self.min_weight, 1.0 - p ** g - (1.0 - p) ** g)
+
+    def state(self) -> dict:
+        return {"s": dict(self.s), "n": dict(self.n),
+                "ls": dict(self.ls), "ln": dict(self.ln)}
+
+    def load_state(self, state: dict) -> None:
+        self.s, self.n = dict(state.get("s", {})), dict(state.get("n", {}))
+        self.ls, self.ln = dict(state.get("ls", {})), dict(state.get("ln", {}))
+
+    def stats(self) -> Dict[str, float]:
+        out: Dict[str, float] = {"sampler/tracked_tasks": float(len(self.n)),
+                                 "sampler/tracked_labels": float(len(self.ln))}
+        for label in sorted(self.ln):
+            out[f"sampler/p_label/{label}"] = self.p_label(label)
+        return out
+
+
+class GroupSampler:
+    """Draws one task and yields it ``group_size`` times — GRPO's premise.
+
+    GRPO replaces a learned critic with the *group* mean: sample G rollouts of the same
+    prompt, and each one's advantage is its return minus what its siblings got. That
+    only works if "the same prompt" is reproducible, which here it is — a task is a
+    savestate, so every rollout in a group starts from bit-identical emulator state and
+    differs only in the policy's sampling.
+
+    Why this beats the critic we had: with ``gamma=1.0`` and a binary episodic reward,
+    ``V(s)`` *is* P(success from here). The previous PPO run's critic reached
+    ``explained_variance`` ~0.33 after starting negative — it explained a third of the
+    return variance, and the rest went into the advantages as noise. A group mean
+    estimates the same quantity directly, with no second network to train, no GAE, and
+    no critic-warmup phase.
+
+    **The known failure**: a group whose members all fail has zero advantage spread and
+    contributes no gradient. Boss succeeds ~3.5% of the time, so at G=8 roughly
+    ``0.965**8 = 75%`` of boss groups are all-failure. ``group_stats`` reports the
+    degenerate fraction so this is visible rather than inferred — it is the central open
+    question for GRPO on this task (doc/0003 §6).
+    """
+
+    def __init__(self, sampler: "TaskSampler", group_size: int,
+                 difficulty: Optional["DifficultyTracker"] = None,
+                 candidates: int = 1, seed: int = 0):
+        if group_size < 2:
+            raise ValueError(f"group_size must be at least 2 to have a baseline, "
+                             f"got {group_size}")
+        if candidates < 1:
+            raise ValueError(f"candidates must be at least 1, got {candidates}")
+        self.sampler = sampler
+        self.group_size = group_size
+        self.difficulty = difficulty
+        self.candidates = int(candidates)
+        self.rng = np.random.default_rng(seed)
+
+    #: Cap on rejection draws when filling a tournament pool from one family. At the
+    #: rarest configured share (~7%) the expected cost is ~14 draws, and `sample()` is a
+    #: few RNG calls, so this only guards against a family that cannot be drawn at all.
+    _POOL_TRIES = 200
+
+    def _draw_in_family(self, family: str) -> "RLTask":
+        """Another task from ``family``, distributed as the mixture is *within* it.
+
+        Rejection sampling on :meth:`TaskSampler.sample` rather than a bespoke
+        within-family draw, because the mixture is two branches (natural and balanced)
+        that weight labels differently; rejecting on the real thing keeps the
+        family-conditional exact instead of approximating it with one branch's shape.
+        """
+        for _ in range(self._POOL_TRIES):
+            t = self.sampler.sample()
+            if t.family == family:
+                return t
+        return self.sampler.sample()   # pathological mixture; do not spin
+
+    def sample_group(self) -> List["RLTask"]:
+        """``group_size`` references to one task. Identical objects on purpose: the
+        rollout layer restores the same savestate for each.
+
+        With a :class:`DifficultyTracker` and ``candidates > 1`` this is *tournament
+        selection*: the first draw fixes the **family** through the configured mixture,
+        the rest of the pool is drawn from that same family, and difficulty then picks
+        among them by how likely each one's group is to survive filtering.
+
+        **The tournament must not choose the family.** Difficulty weight is
+        ``1 - p^G - (1-p)^G``, which is near its minimum for a family the policy almost
+        never solves — so a pool spanning families would systematically discard exactly
+        the hard family an upsampling config was written to emphasise. Measured: a pool
+        that is 50% boss yields 25.4% boss picks at G=8, halving the configured share.
+        Fixing the family first makes the two knobs independent — ``family_multiplier``
+        decides *which* family, difficulty decides *which task within* it.
+
+        ``candidates`` remains the single dial for bias strength: 1 disables it, larger
+        values concentrate harder on p~0.5 without ever becoming a deterministic argmax.
+        """
+        if self.difficulty is None or self.candidates == 1:
+            return [self.sampler.sample()] * self.group_size
+        first = self.sampler.sample()
+        pool = [first] + [self._draw_in_family(first.family)
+                          for _ in range(self.candidates - 1)]
+        w = np.array([self.difficulty.weight(t) for t in pool], dtype=np.float64)
+        task = pool[int(self.rng.choice(len(pool), p=w / w.sum()))]
+        return [task] * self.group_size
+
+    def sample_groups(self, n_groups: int) -> List[List["RLTask"]]:
+        return [self.sample_group() for _ in range(n_groups)]
+
+    def observe(self, episodes) -> None:
+        """Feed an update's rollouts back into the difficulty estimate. No-op without
+        a tracker, so the trainer calls it unconditionally."""
+        if self.difficulty is not None:
+            self.difficulty.observe_episodes(episodes)
+
+    def stats(self) -> Dict[str, float]:
+        return self.difficulty.stats() if self.difficulty is not None else {}
+
+    def state(self) -> dict:
+        st = {"sampler": self.sampler.state(), "rng": self.rng.bit_generator.state}
+        if self.difficulty is not None:
+            st["difficulty"] = self.difficulty.state()
+        return st
+
+    def load_state(self, state: dict) -> None:
+        # Tolerates checkpoints written before difficulty tracking existed.
+        self.sampler.load_state(state.get("sampler", state))
+        if "rng" in state:
+            self.rng.bit_generator.state = state["rng"]
+        if self.difficulty is not None and "difficulty" in state:
+            self.difficulty.load_state(state["difficulty"])

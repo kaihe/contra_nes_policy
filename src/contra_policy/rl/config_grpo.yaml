@@ -1,0 +1,147 @@
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
+
+# Completed action-only GPT base policy trained on boss-full-v1. This initializes both
+# the trainable policy and the frozen reference used by the KL term.
+init_from: ${hydra:runtime.cwd}/runs/bc/2026-08-04/15-19-58/checkpoints/policy-final.pt
+
+task_root: ~/code/contra_nes_data/game_trace/tasks
+shard_dir: ~/code/contra_nes_data/game_trace/hf
+cache_dir: ${hydra:runtime.cwd}/cache
+# Phase 1 (doc/0004 §2): boss excluded for iteration speed — long episodes, ~75%
+# all-failure groups. Not an isolation argument; phase 2 adds it from this same
+# checkpoint.
+families: [kill, item, traverse, boss]
+image_size: 256
+sigma_px: 12.0
+
+seed: 0
+device: cuda
+precision: bf16
+
+# ── rollout ───────────────────────────────────────────────────────────────────
+rollout:
+  # G. A group is the unit: one task, G rollouts from a bit-identical savestate, and
+  # each one's advantage is its return minus its siblings'.
+  #
+  # P(zero variance) = p^G + (1-p)^G, so groups die when their members AGREE — at both
+  # ends. A first rollout on train `kill` measured ~92% success, which is 66% dead
+  # groups at G=4. G=8 halves that to 43%. Raise it if oversample_factor stays high.
+  group_size: 8
+  # Usable groups the update is computed on, after filtering.
+  groups_per_update: 16
+  # Groups drawn per collection round while oversampling toward that target.
+  collect_groups_at_once: 8
+  # Stop drawing at this multiple of groups_per_update. Hitting it means the task mix
+  # cannot produce signal — a finding, not a loop to spin in.
+  max_oversample_factor: 4.0
+  # Drop groups whose G rollouts all agree. On by default: keeping them rescales the
+  # update, because the mean over a batch that is 70% zeros is 0.3x the mean over the
+  # survivors, so the effective step size would track task difficulty.
+  filter_groups: true
+  # GRPO as published. Switching this off looked right on paper — with a graded reward,
+  # standardising a group of eight hopeless rollouts differing by ~2 boss HP inflates it
+  # to +2.31 against +1.26 for a group containing a real win — but the run that tried it
+  # (2026-08-03/18-54-05) went flat on boss where the control climbed 0.128 -> 0.309, and
+  # drifted only half as far from BC (kl_ref 0.016 vs 0.030). Unnormalised advantages
+  # also down-weight boss specifically: an all-failure group contributes ~0.05-scale
+  # deviations against ~0.5 for one containing wins. doc/0005 §2.
+  normalise_advantages: true
+  batch_size: 16                  # emulator slots in flight
+  budget_mult: 2.0                # must stay bit-identical to contra_nes_evaluation
+  min_budget: 24
+  temperature: 1.0                # the ratio is taken against the sampling density
+  max_episode_steps: 0            # 0 = only success, death and budget end an episode
+
+# ── reward ────────────────────────────────────────────────────────────────────
+# The evaluation objective, unshaped. No step penalty: the group baseline compares
+# returns *within* a task, and a per-step cost would make a long survival score worse
+# than a fast death.
+reward:
+  success: 1.0
+  death: 0.0
+  timeout: 0.0
+  truncated: 0.0
+  step: 0.0            # dead key: `_finish` looks up only the outcome name
+  # Graded failure credit: a losing episode scores `progress_coef * (boss HP removed /
+  # HP at start)`. Turns a boss group of eight identical zeros — 43-75% of boss groups
+  # at G=8 — into one with real advantage spread. Must stay <= 0.5 so no failure can
+  # ever outrank a success. 0 reproduces the pure binary reward. doc/0005 §2.
+  progress_coef: 0.5
+
+# ── task sampling ─────────────────────────────────────────────────────────────
+sampling:
+  # Solved for **50% boss rollouts**, not hand-tuned. Boss is only 6.75% of the 6904
+  # train tasks, and the balanced component can contribute at most
+  # `balanced_family_fraction`, so at the old 0.7/0.3 split boss caps at
+  # 0.7*0.0675 + 0.3*1.0 = 34.7% — 50% is unreachable however large the multiplier.
+  # Inverting `natural*share + balanced*w` for boss=0.50 at a 0.3/0.7 split gives
+  # w_boss = 0.685, i.e. multiplier 0.685*3/(1-0.685) = 6.53.
+  #
+  # Resulting mix: boss 0.500  traverse 0.234  kill 0.173  item 0.093
+  natural_fraction: 0.3
+  balanced_family_fraction: 0.7
+  family_multiplier: {kill: 1.0, item: 1.0, traverse: 1.0, boss: 6.53}
+  # Prefer tasks whose groups will actually carry gradient. Measured need: at ~83%
+  # success on TRAIN tasks, 59% of groups came back all-success and 58% of the rollout
+  # budget bought nothing (runs/grpo/2026-08-02/11-48-03).
+  difficulty_bias:
+    enabled: true
+    # Tournament size: draw this many tasks from the mixture above, keep one with
+    # probability proportional to P(its group survives filtering). 1 disables.
+    candidates: 4
+    decay: 0.9        # geometric forgetting; effective window ~G/(1-decay) rollouts
+    prior: 1.0        # Laplace — an unseen task reads p=0.5 and is explored first
+    min_weight: 0.05  # never exclude a task outright; boss must stay rediscoverable
+
+# ── unbiased train probe ──────────────────────────────────────────────────────
+# Every per-family number above is measured on whatever the difficulty sampler chose,
+# and that sampler deliberately tracks tasks near p=0.5 — so the logged rate rises
+# partly because the selection moves. Run 2026-08-03/09-23-22 logged boss 0.093 -> 0.338
+# on train while the same checkpoints scored 0.035 -> 0.105 on val.
+#
+# The probe fixes both: the same tasks every time, uniform within family, no filtering,
+# no difficulty weighting, results not fed back to the sampler. It measures *train*
+# success without selection bias — not generalisation; val remains the only gate.
+probe:
+  every: 10              # updates between probes; 0 disables. Update 1 is always probed.
+  tasks_per_family: 48   # 4 families x 48 = 192 episodes, ~40s, ~6% overhead at every=10
+  repeats: 1             # rollouts per task; >1 tightens the estimate at linear cost
+  seed: 12345            # fixed, so the task set is identical across runs and resumes
+
+# ── GRPO ──────────────────────────────────────────────────────────────────────
+grpo:
+  clip_ratio: 0.2
+  # KL to the frozen BC policy. NOT optional: the previous PPO run left the equivalent
+  # at zero and `item` regressed 76.5% -> 71.1% while boss improved.
+  kl_coef: 0.02
+  entropy_coef: 0.01
+  # Early-stops the update once the batch's KL to the BEHAVIOUR policy exceeds this —
+  # distinct from kl_coef, which pulls towards the frozen reference.
+  target_kl: 0.02
+  max_grad_norm: 1.0
+
+# ── loop ──────────────────────────────────────────────────────────────────────
+train:
+  updates: 500
+  epochs: 1               # passes over one collection; >1 makes the data more off-policy
+  minibatch_episodes: 8
+  # Calibrated, not guessed. At 1e-6 the first run held approx_kl at 2.13e-4 — 100x
+  # under target_kl, so it spent rollouts on steps too small to measure. grad_norm was
+  # above max_grad_norm on every update, so clipping always fires and the effective step
+  # is exactly `lr`; KL then scales as lr^2, giving lr = 1e-6*sqrt(0.005/2.13e-4) ~ 5e-6
+  # to sit at a quarter of target_kl and leave the guard room to guard.
+  learning_rate: 5.0e-6
+  weight_decay: 0.0
+  save_every: 25
+  # Abort (saving a checkpoint) once system-wide used memory crosses this. The guest is
+  # a 20 GB WSL2 VM with ~19.5 GB usable; past that it swaps and stops responding rather
+  # than OOM-killing anything, so this must fire *before* the ceiling, not at it.
+  #
+  # Measured at the settings above: the trainer peaks at 8.65 GB. VS Code's server adds
+  # ~7 GB when it is open, which is most of the remaining margin — close it for a long
+  # run, or expect this guard to be what stops you. 0 disables.
+  memory_limit_gb: 17.0
