@@ -163,6 +163,11 @@ class GRPOTrainer:
         self.logger = CSVLogger(os.path.join(run_dir, "metrics.csv"))
         os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
         self.update = 0
+        # Cumulative across resumes, so `train.max_hours` is a budget for the experiment
+        # rather than for one invocation of it.
+        self.elapsed = 0.0
+
+        self._resume(str(args.resume_from) if args.get("resume_from") else None)
 
         self.probe_tasks = self._build_probe()
         self._probe_gid = 10 ** 9      # keep probe ids far from any training group id
@@ -399,8 +404,18 @@ class GRPOTrainer:
 
     def run(self) -> None:
         total = int(self.args.train.updates)
+        # Wall clock, not update count, is the honest budget for a long run: boss episodes
+        # are ~1.8x the average length, so the same update count costs very different
+        # hours depending on the family mix (doc/0011 §2). Cumulative across resumes.
+        budget = float(self.args.train.get("max_hours", 0.0) or 0.0) * 3600.0
         try:
             while self.update < total:
+                if budget and self.elapsed >= budget:
+                    print(f"[grpo] wall-clock budget reached: {self.elapsed / 3600:.2f} h "
+                          f">= train.max_hours={budget / 3600:.1f} at update "
+                          f"{self.update}. Stopping cleanly; the final checkpoint resumes.",
+                          flush=True)
+                    break
                 t0 = time.time()
                 kept, outcomes, cstats = self.collect_filtered()
                 if not kept:
@@ -432,6 +447,8 @@ class GRPOTrainer:
                     row.update(self.run_probe())
                     self._check_memory()
                 row["seconds"] = time.time() - t0
+                self.elapsed += row["seconds"]
+                row["elapsed_hours"] = self.elapsed / 3600.0
                 self._emit(row)
                 if int(self.args.train.save_every) and \
                         self.update % int(self.args.train.save_every) == 0:
@@ -469,12 +486,61 @@ class GRPOTrainer:
                   f"  (n={int(row['probe/episodes'])}, fixed tasks)", flush=True)
 
     def save(self, final: bool = False) -> str:
+        """Weights **plus** everything needed to continue the run exactly.
+
+        A weights-only checkpoint is a warm restart, not a resumption: the optimizer
+        moments, the sampling stream and the difficulty tracker's per-task history all
+        reset to update 0. Over a 10-hour run that history *is* the task curriculum
+        (doc/0011 §2), so losing it discards most of what the run had learned about which
+        tasks carry gradient. Both prior long runs died mid-flight; this is what makes the
+        next one survivable.
+        """
         tag = "final" if final else f"{self.update:06d}"
         path = os.path.join(self.run_dir, "checkpoints", f"grpo-{tag}.pt")
+        tracker = getattr(self.groups, "difficulty", None)
         self.policy.save(path, update=self.update,
-                         train_config=OmegaConf.to_container(self.args, resolve=True))
+                         train_config=OmegaConf.to_container(self.args, resolve=True),
+                         optimizer=self.optimizer.state_dict(),
+                         difficulty=tracker.state() if tracker is not None else None,
+                         sampler_rng=self.rng.bit_generator.state,
+                         elapsed_seconds=self.elapsed,
+                         torch_rng=torch.get_rng_state(),
+                         cuda_rng=torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else [])
         print(f"[grpo] saved {path}", flush=True)
         return path
+
+    def _resume(self, path: Optional[str]) -> None:
+        """Restore an exact continuation, or fail loudly rather than restart silently.
+
+        ``init_from`` and ``resume_from`` are different operations: the first starts a new
+        run from a BC policy, the second continues this one. Passing a GRPO checkpoint to
+        ``init_from`` would quietly reset the update counter and the curriculum, which is
+        the failure this method exists to prevent.
+        """
+        if not path:
+            return
+        path = os.path.abspath(os.path.expanduser(path))
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        missing = {"optimizer", "update"} - set(ckpt)
+        if missing:
+            raise ValueError(
+                f"{path} has no {sorted(missing)} — it predates resumable checkpoints and "
+                f"can only be used as `init_from`, which restarts at update 0.")
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.update = int(ckpt["update"])
+        self.elapsed = float(ckpt.get("elapsed_seconds", 0.0))
+        tracker = getattr(self.groups, "difficulty", None)
+        if tracker is not None and ckpt.get("difficulty"):
+            tracker.load_state(ckpt["difficulty"])
+        if ckpt.get("sampler_rng"):
+            self.rng.bit_generator.state = ckpt["sampler_rng"]
+        if ckpt.get("torch_rng") is not None:
+            torch.set_rng_state(ckpt["torch_rng"].cpu().to(torch.uint8))
+        if ckpt.get("cuda_rng") and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+        print(f"[grpo] resumed {path} at update {self.update} "
+              f"({self.elapsed / 3600:.2f} h already spent)", flush=True)
 
 
 class _null:

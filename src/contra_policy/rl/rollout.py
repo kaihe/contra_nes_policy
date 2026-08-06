@@ -195,7 +195,13 @@ class TokenHistoryActor:
         """
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null_context())
-        active = [i for i, im in enumerate(obs.image) if im is not None]
+        # `obs.active` is the authority, not a None-test on `obs.image`: `_observe` returns
+        # a dense (B, S, S, 3) array whose empty rows are zeros, so `im is not None` was
+        # true for *every* slot and this ran the core over slots holding no episode. It
+        # crashed only when a slot had never been begun at all — fewer queued tasks than
+        # batch slots, i.e. groups_per_update * G < rollout.batch_size — and otherwise
+        # silently spent compute on drained slots at the tail of every collection round.
+        active = [i for i, on in enumerate(obs.active) if on]
         with ctx:
             imgs = torch.from_numpy(np.stack([obs.image[i] for i in active])).to(self.device)
             new = self.model.encoder.encode(imgs)                               # (n, d)

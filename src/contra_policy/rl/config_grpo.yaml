@@ -7,6 +7,11 @@ hydra:
 # Completed action-only GPT base policy trained on boss-full-v1. This initializes both
 # the trainable policy and the frozen reference used by the KL term.
 init_from: ${hydra:runtime.cwd}/runs/bc/2026-08-04/15-19-58/checkpoints/policy-final.pt
+# Continue a previous GRPO run *exactly* — optimizer moments, sampling stream, difficulty
+# history, update counter and cumulative wall clock. Distinct from `init_from`, which
+# starts a new run from a BC policy at update 0. A 10-hour run needs this; both prior long
+# runs died mid-flight (doc/0011 §5).
+resume_from: null
 
 task_root: ~/code/contra_nes_data/game_trace/tasks
 shard_dir: ~/code/contra_nes_data/game_trace/hf
@@ -127,6 +132,11 @@ grpo:
 # ── loop ──────────────────────────────────────────────────────────────────────
 train:
   updates: 500
+  # Stop cleanly once cumulative wall clock (across resumes) crosses this. 0 disables, and
+  # then `updates` is the only bound. Wall clock is the honest budget for a long run: boss
+  # episodes run ~1.8x the average length, so the hours a given update count costs depend
+  # on the family mix. doc/0011 §2.
+  max_hours: 0.0
   epochs: 1               # passes over one collection; >1 makes the data more off-policy
   minibatch_episodes: 8
   # Calibrated, not guessed. At 1e-6 the first run held approx_kl at 2.13e-4 — 100x
