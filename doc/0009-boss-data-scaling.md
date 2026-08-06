@@ -1,6 +1,6 @@
 # Measure boss-data scaling before increasing the policy or RL budget
 
-Status: Proposed
+Status: Implemented
 Supersedes: —
 Depends on: [0006](0006-action-only-base-policy.md) (fixed model and BC recipe)
 
@@ -17,6 +17,18 @@ the prefix grows, confounding unique data with simple boss upsampling. Evaluate 
 steps on the byte-identical 57-task boss validation split, and evaluate every final
 checkpoint on the unchanged 846-task suite. Only choose a model-size sweep after this
 curve says which data scale is worth carrying forward.
+
+**Measured outcome (2026-08-05).** Ran as a reduced matrix — **seed 0 only**, four cells,
+not the 12 predeclared here. The curve is flat: pooled 846 finals are 65.2 / 64.5 / 67.1 /
+65.5% (D1/D2/D4/D8), D1→D8 paired +0.2 pp (p = 0.95); boss stays in a 0–15% band at ~90%
+death at every scale. This is §3's predeclared row *"all four remain near 3.5% boss
+success → do not scale model or RL compute on this premise"*, and that decision stands.
+D4 final (67.1%) is the best base checkpoint the sweep produced. Full results:
+[evaluation 0011](../../contra_nes_evaluation/doc/0011-boss-data-scaling.md). One caveat
+that doc gets wrong: the offline CE gain it reports (2.13 → 1.76) is measured at step
+20,000, but **at the CE minimum D1 and D8 are 0.713 and 0.703** — the data bought no
+generalization at all, only a slower approach to overfitting. See
+[0010](0010-dropout-regularization.md) §1.
 
 Use `boss-mixed-v2`, not `boss-pure-v1`, for the primary result. Both contain the new
 search wins, but pure-v1 derives all 2,034 examples from four fixed emulator states and
