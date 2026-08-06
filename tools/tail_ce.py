@@ -93,7 +93,10 @@ def score(path: str, device: torch.device, batch_size: int, max_batches: int) ->
     out = _weighted_tail(
         {k: float(np.mean([r[k] for r in rows if k in r])) for k in keys}, rows)
     out["step"] = int(ckpt.get("step", -1))
-    out["checkpoint"] = os.path.basename(path)
+    # Qualified by run directory: every cell names its checkpoints identically, so a
+    # bare basename collides the moment more than one run is scored in a table.
+    run = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(path))))
+    out["checkpoint"] = f"{run}/{os.path.basename(path)}"
     return out
 
 
@@ -106,10 +109,10 @@ def main() -> None:
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"{'checkpoint':22s} {'step':>7s} {'val CE':>9s} {'tail CE':>9s} {'tail n':>10s}")
+    print(f"{'checkpoint':34s} {'step':>7s} {'val CE':>9s} {'tail CE':>9s} {'tail n':>10s}")
     for path in args.checkpoints:
         r = score(os.path.expanduser(path), device, args.batch_size, args.max_batches)
-        print(f"{r['checkpoint']:22s} {r['step']:7d} {r['loss']:9.4f} "
+        print(f"{r['checkpoint']:34s} {r['step']:7d} {r['loss']:9.4f} "
               f"{r.get('tail_ce', float('nan')):9.4f} {r.get('tail_n', 0):10.0f}",
               flush=True)
 

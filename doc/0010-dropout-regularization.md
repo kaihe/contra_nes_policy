@@ -1,22 +1,24 @@
-# Regularize with dropout only as a gated probe; replace val CE with tail CE
+# No reweighting of validation CE proxies closed-loop play — close the branch
 
-Status: Proposed
+Status: Implemented
 Supersedes: —
-Depends on: [0009](0009-boss-data-scaling.md) (D8 run and its curve), [0006](0006-action-only-base-policy.md) (fixed recipe)
+Depends on: [0009](0009-boss-data-scaling.md) (the D1–D8 runs this measures), [0006](0006-action-only-base-policy.md) (fixed recipe)
 
-**Question.** Validation CE bottoms at step 3,000 and then triples by step 20,000, so
-the action-only policy is plainly overfitting. Does regularizing that away — dropout
-0.1/0.2/0.3 on the D8 cell — improve closed-loop play?
+**Question.** Validation CE bottoms at step 3,000 and then triples by step 20,000, so the
+action-only policy is plainly overfitting. Does regularizing that away improve closed-loop
+play — and can a reweighted CE be made into an offline proxy that tracks play, so the
+project stops steering by a number that disagrees with its own evaluation?
 
-**Answer.** Probably not, and the doc says so before the runs: the checkpoint at the CE
-minimum plays **12.9 pp worse** on the full 846 suite than the fully overfit final one
-(52.6% vs 65.5%, non-overlapping CIs), so validation CE is *anti-correlated* with
-closed-loop success across this range. Run the three cells anyway — it is two hours and
-the prediction is falsifiable — but gate every cell on whether the overfit rise actually
-shrank, and treat the real deliverable as the **replacement offline proxy**: validation
-CE restricted to frames where the expert action is not the modal `R`. Total val CE is
-frequency-weighted by a 78%-`R` action distribution and therefore measures the wrong
-thing.
+**Answer.** **No to both, and the second is measured.** The checkpoint at the CE minimum
+plays **12.9 pp worse** than the fully overfit final (52.6% vs 65.5% pooled on 846,
+non-overlapping CIs). The proposed fix — *tail CE*, the same cross-entropy restricted to
+the ~22% of steps whose target is not the modal `R` — **is a constant multiple of total
+CE**: the ratio sits at 2.10–2.29 across both ends of training and a 4× data range, so it
+carries no independent information whatsoever. Held-out imitation loss degrades
+*uniformly* across the action distribution while play improves. That kills not just tail CE
+but every reweighting of CE over the expert distribution. The dropout sweep this doc was
+written to gate is therefore **deferred, not run** — its runbook is preserved in §5 — and
+BC budget should not be spent on the offline-CE axis.
 
 ---
 
@@ -24,7 +26,8 @@ thing.
 
 ### The model overfits, hard
 
-Validation CE by step, from `metrics.csv` of the 0009 cells (`val_every: 1000`):
+Validation CE by step, from `metrics.csv` of the 0009 cells (`val_every: 1000`, 60-batch
+subset):
 
 | step | D1 | D8 |
 |---:|---:|---:|
@@ -35,38 +38,26 @@ Validation CE by step, from `metrics.csv` of the 0009 cells (`val_every: 1000`):
 
 Train CE at step 20,000 is **0.051** (D1) and **0.078** (D8) with `dropout: 0.0`. The
 12.86M core memorizes the training set and val CE rises to 3× its minimum. This is a
-variance problem, not a capacity problem.
-
-### Correcting 0009 and evaluation 0011
-
-Evaluation [0011](../../contra_nes_evaluation/doc/0011-boss-data-scaling.md) §4 cites
-"offline full-val CE falls D1→D8 (2.13 → 1.76)" and calls it a proxy that improved
-without translating. **At the CE minimum the two runs are 0.713 and 0.703** — a 0.01 nat
-difference. Eight times the boss data bought essentially *no* generalization; what it
-changed was the *rate* of memorization, so the runs differ at step 20,000 only because
-they sit at different points on their own overfitting curves. The proxy never improved,
-so "proxy improved, completion did not" does not describe this experiment.
+variance problem, not a capacity problem — which is why §4 rejects scaling the model up.
 
 ### Less overfitting plays worse
 
-D8 step 3,000 (`policy-003000.pt`, `= policy-best.pt`, the run's CE minimum) evaluated
-against D8 final on the frozen 846 suite:
+D8 step 3,000 (`policy-003000.pt` = `policy-best.pt`, the run's CE minimum) against D8
+final on the frozen 846 suite:
 
 | checkpoint | val CE | pooled 846 | 95% CI | death | timeout | progress |
 |---|---:|---:|---|---:|---:|---:|
 | D8 3k (CE-optimal) | **0.703** | **52.6%** | [49.2, 55.9] | 37% | 11% | 0.849 |
 | D8 final (overfit) | 1.754 | **65.5%** | [62.2, 68.6] | 23% | 12% | 0.910 |
 
-−12.9 pp on n = 846 with non-overlapping intervals. The CE-optimal checkpoint is not
-marginally worse; it is a different quality of policy. `steps_vs_expert` is unchanged
-(1.021 vs 1.024) — it is not slower, it dies partway.
+−12.9 pp on n = 846 with non-overlapping intervals. `steps_vs_expert` is unchanged
+(1.021 vs 1.024) — the CE-optimal policy is not slower, it dies partway.
 
 ### It is not a sampling-sharpness artifact
 
-The 3k model is measurably less decisive (rollout action entropy 1.061 vs 0.893 nats;
-2.89 vs 2.44 effective actions), which invites the explanation "hedging at 20 Hz is
-jitter, and jitter dies." Temperature 0 is the causal test of that — same weights, only
-sampling changed:
+The 3k model is less decisive (rollout action entropy 1.061 vs 0.893 nats; 2.89 vs 2.44
+effective actions), which invites "hedging at 20 Hz is jitter, and jitter dies."
+Temperature 0 is the causal test — same weights, only sampling changed:
 
 | policy | T | entropy | pooled 846 | death |
 |---|---:|---:|---:|---:|
@@ -75,159 +66,175 @@ sampling changed:
 | GRPO u075 | 1.0 | 0.954 | 71.6% | 20% |
 | GRPO u075 | 0.0 | 0.720 | 69.4% | 21% |
 
-Sharpening a fixed model is worth **−1.5 to −2.2 pp**, not −12.9. So entropy is a
-symptom, not the cause, and "make the policy more confident" is not the lever.
+Sharpening a fixed model is worth **−1.5 to −2.2 pp**, not −12.9. Entropy is a symptom,
+not the cause.
 
-### The mechanism that fits
+### The proposed mechanism, and its refutation
 
-Validation CE is a frequency-weighted average over held-out expert frames, and **78% of
-those frames are `R`** (`action_distribution` of the 846 run). By step 3,000 the model
-predicts common frames well — that is the CE minimum. Continued training memorizes
-training episodes, so total val CE rises, while the model keeps improving on the *rare*
-decision points: jump timing, dodges, the frame where holding `R` kills you. Survival
-depends almost entirely on those. The model gets worse on the average frame and better
-at staying alive.
+The hypothesis was: validation CE is a frequency-weighted average and **78% of steps are
+`R`**, so it is dominated by frames every policy handles. Continued training memorizes,
+raising total CE, while the model keeps improving on the *rare* decisions survival depends
+on. If true, CE restricted to non-`R` targets would keep falling where total CE rises.
 
-This predicts the outcome of the sweep: dropout regularizes toward the frequency-weighted
-average, and the average is not what is failing.
+Measured on the whole validation set (28,273 non-modal steps per checkpoint,
+`tools/tail_ce.py`):
 
-## 2. The design
+| cell | val CE | tail CE | **tail / total** | pooled 846 |
+|---|---:|---:|---:|---:|
+| D8 3k | 0.7091 | 1.6244 | **2.291** | 52.6% |
+| D8 10k | 0.8995 | 2.0582 | **2.288** | — |
+| D8 final | 1.7615 | 3.7041 | **2.103** | 65.5% |
+| D1 final | 2.1305 | 4.8529 | **2.278** | 65.2% |
+| D2 final | 1.9294 | 4.1376 | **2.145** | 64.5% |
+| D4 final | 1.8223 | 3.8406 | **2.108** | 67.1% |
 
-### Cells
+**The hypothesis is false, twice over.**
 
-Three new runs on **D8** (`boss_scaling.shard_count: 8`), so no dropout effect is
-confounded with data starvation. Only `model.core.dropout` changes.
+1. **Tail CE rises with total CE**, 1.62 → 2.06 → 3.70 over the D8 run — it more than
+   doubles where it was predicted to fall.
+2. **The ratio is constant at 2.10–2.29** across both ends of training and a 4× data
+   range. Tail CE is total CE times a constant; it carries no independent information.
+   The rare frames degrade at essentially the same rate as the common ones.
 
-| cell | dropout | steps | run |
-|---|---:|---:|---|
-| control | 0.0 | 20 000 | existing `runs/bc/2026-08-05/15-49-28` |
-| R1 | 0.1 | 20 000 | new |
-| R2 | 0.2 | 20 000 | new |
-| R3 | 0.3 | 20 000 | new |
+At matched training compute — the four finals, all 20,000 steps, all fully annealed — tail
+CE spans 1.15 nats while pooled spans 2.6 pp with no ordering (r = −0.41 on n = 4, and the
+pooled spread is itself inside evaluation noise).
 
-Everything else is bit-identical to 0009: seed 0, `lr 3e-4`, cosine over 20,000 with 500
-warmup, `weight_decay 0.01`, `batch_size 4`, `family_draws` (kill 2290 / item 455 /
-traverse 3693 / boss 666), `save_steps [3000, 10000]`. At ~103 ms/step that is ~34 min
-of training and 5.5 min of evaluation per cell — **~2 hours total**.
+### What that generalizes to
 
-### Metrics, per cell
+The model does not get worse on average frames while improving on rare ones. It gets worse
+at predicting held-out expert actions **uniformly across the action distribution** while
+closed-loop play improves 12.9 pp.
 
-1. **Minimum val CE** and the step it occurred at.
-2. **Final val CE** at step 20,000.
-3. **Overfit rise `Δ = CE(20k) − CE(min)`.** Control is Δ = 1.051 (D8), 1.387 (D1).
-4. **Pooled success on the full 846 suite** at the final checkpoint, plus death.
-5. **Tail CE** (below) at every `val_every` tick.
+So the problem is not *which* frames the loss emphasises. **No reweighting of
+cross-entropy over the expert distribution can yield a proxy that tracks play**, because
+every slice of it moves the same wrong way. That retires the whole family at once: class
+weights (`action_class_weights`, already in `loss.py`), focal-style weighting, label
+smoothing, per-family CE — each is a reweighting of a quantity measured to be uniformly
+uninformative here. Fitting held-out expert actions is simply not what closed-loop
+survival measures.
 
-### The engagement gate
+This is also the general form of the failure [0003](0003-grpo-code-layout.md),
+[0005](0005-graded-reward.md) and evaluation 0011 §4 each hit separately.
 
-A cell is interpretable only if the regularizer did what regularizers do. Read Δ before
-reading anything else:
+### Correcting evaluation 0011
 
-| Δ at 20k | reading |
+Evaluation [0011](../../contra_nes_evaluation/doc/0011-boss-data-scaling.md) §4 cites
+"offline full-val CE falls D1→D8 (2.13 → 1.76)" and calls it a proxy that improved without
+translating. **At the CE minimum the two runs are 0.713 and 0.703** — a 0.01 nat
+difference. Eight times the boss data bought essentially no generalization; it changed the
+*rate* of memorization, so the runs differ at step 20,000 only because they sit at
+different points on their own overfitting curves. The proxy never improved, so "proxy
+improved, completion did not" does not describe that experiment. A handoff issue on the
+evaluation repo is owed.
+
+## 2. What was built
+
+`tail_ce` ships despite the negative result, because the negative result is what it
+measured and re-deriving it later would cost another six validation passes.
+
+| piece | where |
 |---|---|
-| ≤ 0.4 | engaged; its pooled 846 number is a real test of "less overfitting → better play" |
-| 0.4 – 0.8 | partial; report, do not conclude from it alone |
-| ≥ 0.8 | **void cell** — dropout did not bite at this rate. Raise the rate; do not record "dropout does not help" |
+| `tail_ce_metrics(ce, target, mask, modal_action)` | `src/contra_policy/loss.py` |
+| `MODAL_ACTION`, derived from `ACTION_NAMES.index("R")` | `src/contra_policy/train_bc.py` |
+| `_weighted_tail` — aggregates by non-modal step count, not by batch | `src/contra_policy/train_bc.py` |
+| `tools/tail_ce.py` — scores existing checkpoints, no retraining | `tools/` |
+| 7 tests, incl. one pinning that logging it leaves the loss bit-identical | `tests/test_tail_ce.py` |
 
-Without this gate a flat pooled result is ambiguous between "regularization does not help
-closed-loop" (interesting) and "dropout 0.1 on a four-layer core does nothing"
-(not interesting).
+Two properties worth keeping:
 
-### Decision rule
+- It is computed under `no_grad` and never enters the returned loss, so a run that logs it
+  optimizes bit-identically to one that does not. Cells stay comparable to the existing
+  dropout-0.0 control.
+- It aggregates weighted by non-modal step count. Those counts cluster by family, so the
+  unweighted batch mean `_mean_of` produces is not the tail CE of the validation set.
 
-Primary comparison is pooled 846 at final versus the control's 65.5%, paired McNemar on
-the 846 shared `uid`s. n = 846 resolves roughly ±3–4 pp; the 57-task boss subset resolves
-nothing (±5 pp of pure RNG noise — see 0011 §2), so read boss off the full-suite run and
-never from a separate `--kinds boss` eval.
+`tools/tail_ce.py` takes shard selection from each checkpoint's own stored `train_config`,
+so a checkpoint is always scored on the validation set its run actually used. It reproduces
+the D8 run's own `val_full` at step 20,000 exactly (1.7615), which is what validates the
+measurement.
 
-| observation | decision |
-|---|---|
-| an engaged cell beats control by ≥ 3 pp, p < 0.05 | overfitting *was* binding; adopt that rate and re-examine the CE proxy |
-| all engaged cells within ±3 pp | regularization is not the lever; close this branch and do not revisit dropout, weight decay or augmentation on the CE axis |
-| engaged cells regress ≥ 3 pp | confirms the anti-correlation; the CE axis is actively misleading and 0006's recipe should keep `dropout: 0.0` |
-| no cell reaches Δ ≤ 0.4 | inconclusive on regularization; report as a null instrumentation result |
-
-### Tail CE — the durable deliverable
-
-Define **tail CE** as validation cross-entropy restricted to frames whose expert action is
-not the modal action `R`, computed on the same frozen full-val shard alongside total val
-CE, at every `val_every` tick.
-
-If the mechanism in §1 is right, tail CE keeps *falling* from 3k to 20k while total val CE
-triples. Compute it first on the **existing** D8 checkpoints (3k / 10k / final) — a few
-minutes of forward passes, no training — because those three already have closed-loop
-numbers to correlate against (52.6% / — / 65.5%).
-
-A proxy that tracks closed-loop where total CE inverts replaces a 5.5-minute evaluation
-with a validation pass, and every experiment after this one gets cheaper to steer. That is
-a larger payoff than the dropout answer itself, and the three sweep cells supply further
-points to validate it against.
-
-### Registered predictions
+## 3. How the registered predictions resolved
 
 Recorded before the runs, in the style of [0004](0004-grpo-experiment-plan.md) §4:
 
-| prediction | resolves against |
+| prediction | outcome |
 |---|---|
-| R1/R2 land within ±3 pp of control; R3 is flat or negative | pooled 846 |
-| dropout 0.1 fails the Δ ≤ 0.4 gate | Δ per cell |
-| tail CE falls monotonically 3k → 20k on the existing D8 checkpoints | tail CE table |
-| no cell exceeds GRPO u075's 71.6% | pooled 846 |
+| tail CE falls monotonically 3k → 20k on the existing D8 checkpoints | **falsified** — it rises 1.62 → 2.06 → 3.70 |
+| R1/R2 land within ±3 pp of control; R3 flat or negative | **unresolved** — sweep deferred by the §5 step-1 gate |
+| dropout 0.1 fails the Δ ≤ 0.4 gate | **unresolved** — same |
+| no cell exceeds GRPO u075's 71.6% | **unresolved** — same |
 
-## 3. What was rejected, and why
+The one prediction that could resolve without spending the two hours is the one that
+failed, and it was the load-bearing one.
+
+## 4. What was rejected, and why
+
+**Tail CE as an offline proxy.** Measured dead: constant 2.1–2.3× ratio to total CE. Do not
+propose "weight the loss toward the decisions that matter" again without first explaining
+why every slice of held-out CE degraded together here.
 
 **Scaling the model up.** The obvious next step after 0009, and wrong: train CE is already
 0.051. Capacity reduces bias, and there is no bias left to reduce — more parameters at
 fixed data widen the gap. If the capacity question needs closing, the cheap decisive test
-is the *opposite* direction: one ~3M-parameter cell (`n_layer: 2` or half `d_model`) on
-D4. If a 4× smaller model matches closed-loop, capacity is ruled out for ~40 minutes.
+is the *opposite* direction: one ~3M-parameter cell (`n_layer: 2` or half `d_model`) on D4.
+If a 4× smaller model matches closed-loop, capacity is ruled out for ~40 minutes.
 
-**More boss data.** Answered by 0009 / evaluation 0011: pooled D1→D8 is +0.2 pp (p = 0.95)
-and boss stays in a 0–15% band at ~90% death. §1 above strengthens that null — the data
-did not even improve generalization at the CE minimum.
+**More boss data.** Answered by 0009 / evaluation 0011: pooled D1→D8 is +0.2 pp (p = 0.95),
+boss stays in a 0–15% band at ~90% death. §1 strengthens that null — the data did not even
+improve generalization at the CE minimum.
 
-**Shorter training / early stopping.** Measured, not argued: 52.6% pooled. Note the
-existing 3k checkpoint is also snapshotted at 96% of peak LR (cosine is only 12.8% through
-decay at step 3,000), so a properly annealed 3,000-step run is a *different* model and
-would score higher. It is not worth running: it would have to recover 12.9 pp to reach
-parity with a checkpoint already in hand.
+**Shorter training / early stopping.** Measured, not argued: 52.6% pooled. The existing 3k
+checkpoint is also snapshotted at 96% of peak LR (cosine is only 12.8% through decay at
+step 3,000), so a properly annealed 3,000-step run is a *different* model and would score
+higher — but it would have to recover 12.9 pp to reach a checkpoint already in hand.
 
 **Temperature sharpening.** Measured: −1.5 to −2.2 pp at T = 0 for both BC and GRPO.
 
-**Dropout 0.4.** On a four-layer core it will mostly underfit, and an underfit cell cannot
-distinguish the two hypotheses this sweep exists to separate. Add it only if 0.3 trends
-positive.
+**Boss-only evaluation of any of this.** 57 tasks, 2–4 successes, ±5 pp RNG noise. Read
+boss off the full-suite runs.
 
-**Boss-only evaluation of the sweep.** 57 tasks, 2–4 successes, ±5 pp RNG noise. It would
-reproduce exactly the uninterpretable table 0011 §2 already produced.
+## 5. The dropout sweep — deferred, with its runbook
 
-## 4. Risks, and the metric that gates each
+The sweep was always gated on step 1 inverting tail CE. It did not, so the sweep is
+**deferred rather than run**: dropout acts on held-out CE, and held-out CE is now measured
+uninformative at matched compute and inverted over training, so there is no route from
+dropout to better play through this proxy. It is two hours and the code is ready, so it
+remains a defensible spend if the alternative is idle GPU — but it is not the next lever.
 
-| risk | why it is plausible | gate |
-|---|---|---|
-| dropout does not engage at any tested rate | four layers, `d_model` small, weight decay already 0.01 | Δ ≤ 0.4; if unmet, escalate the rate rather than conclude |
-| a cell wins on noise | single seed, ±3–4 pp resolution at n = 846 | paired McNemar p < 0.05, not point estimates |
-| tail CE is dominated by one rare action | `URJ`, `LF` are < 0.3% of frames | report tail CE per action bucket as well as pooled |
-| conclusions leak into checkpoint choice | 0011 §6 forbids selecting on closed-loop | cells, rates and the Δ gate are fixed by this doc before any run |
-| the whole CE axis is a dead end | already 12.9 pp of evidence for that | this doc's predictions table; if all four resolve as written, close the branch |
+```bash
+for d in 0.1 0.2 0.3; do
+  python -m contra_policy.train_bc \
+    boss_scaling.shard_count=8 policy.core.dropout=$d \
+    hydra.run.dir=runs/bc/<date>/dropout-$d
+done
+```
 
-## 5. Sequencing
+Sequentially — 20 GB WSL ceiling, `num_workers: 2` already. ~34 min train + 5.5 min eval
+per cell. Evaluate finals on the **full 846**, paired McNemar against the control's 65.5%.
 
-1. Compute **tail CE** on the existing D8 3k / 10k / final checkpoints. No training. If it
-   does not invert relative to total val CE, the §1 mechanism is wrong and this doc's
-   framing needs revision before spending the two hours.
-2. Add `tail_ce` to the BC validation loop next to the existing val CE, with a test that
-   masks a known frame set and checks the restricted mean.
-3. Run R1/R2/R3. Record min val CE, final val CE, Δ.
-4. Evaluate the three finals on the full 846 suite; apply the Δ gate, then the decision
-   rule.
-5. Update this doc's `Status` and resolve the predictions table. If the outcome is the
-   predicted null, say so plainly and close the regularization branch.
+Read `Δ = CE(20k) − CE(min)` before pooled success. Control is Δ = 1.051 (D8), 1.387 (D1).
+Δ ≥ 0.8 means dropout never bit at that rate — a **void cell**; raise the rate rather than
+recording "dropout does not help". Only Δ ≤ 0.4 makes the pooled number a real test.
 
-**Not blocked on another repo.** The independent boss lever — graded boss-HP reward — is
-already unblocked at `kaihe/contra_nes_policy#1` (data side done: `KillBossMaker.boss_hp`,
-`boss_hp_start` in boss JSON) and belongs in its own doc, not this one. Nothing here
-addresses the 91% boss death rate; this sweep is about the offline proxy.
+## 6. What would reopen this
+
+| finding | what it would overturn |
+|---|---|
+| an offline metric correlating with pooled across ≥ 6 checkpoints spanning ≥ 10 pp | §1's claim that no offline proxy works; would restore cheap steering |
+| a properly annealed short run beating 65.5% | the "early stopping is measured dead" line in §4 |
+| a ~3M cell matching D4 closed-loop | closes the capacity question; makes the rejected model-size sweep formally dead rather than argued |
+| dropout at Δ ≤ 0.4 beating control by ≥ 3 pp | the deferral in §5 |
+
+## 7. What is next, and it is not this
+
+Nothing in this doc addresses the **91% boss death rate**, which survives every
+intervention tried: BC at four data scales, all three checkpoint positions, both
+temperatures, and GRPO. The lever with an actual mechanism is the graded boss-HP reward —
+data side is done (`KillBossMaker.boss_hp`, `boss_hp_start` in boss JSON) and the request
+is open at `kaihe/contra_nes_policy#1`, with the design already in
+[0005](0005-graded-reward.md). It converts ~91% of boss rollouts from a zero into a graded
+signal, and it needs its own doc.
 
 ---
 
@@ -237,9 +244,10 @@ addresses the 91% boss death rate; this sweep is about the offline proxy.
 |---|---|
 | val CE curves, train CE, Δ | `runs/bc/2026-08-05/{12-03-04,15-49-28}/metrics.csv`, rows with `phase=val` |
 | fixed recipe, `dropout: 0.0`, family draws, save steps | `runs/bc/2026-08-05/15-49-28/resolved_config.yaml` |
+| tail CE, all six checkpoints, 28,273 non-modal steps | `python -m tools.tail_ce runs/bc/2026-08-05/{12-03-04,13-19-43,14-36-21,15-49-28}/checkpoints/policy-*.pt` (2026-08-06) |
 | D8 3k pooled 52.6%, death 37%, entropy, `progress` | `contra_nes_evaluation/runs/0805-boss-scale-D8-003000-full/report.json` |
-| D8 final pooled 65.5% | `contra_nes_evaluation/runs/0805-boss-scale-D8-final-full/report.json` |
-| 78% `R` action share; 846 = 454 traverse / 281 kill / 57 boss / 54 item | `contra_nes_evaluation/runs/0805-boss-scale-D4-final-full/report.json` (`overall.action_distribution`, `kinds`) |
+| D8 final pooled 65.5%; D1/D2/D4 finals 65.2/64.5/67.1% | `contra_nes_evaluation/runs/0805-boss-scale-D{1,2,4,8}-final-full/report.json` |
+| 78% `R` action share | same reports, `overall.action_distribution` |
 | T = 0 vs T = 1 for BC and GRPO | `contra_nes_evaluation/runs/{0801-gpt-bc-final,0802-gpt-bc-final-t0,0803-grpo-000075,0802-grpo-000075-t0}/report.json` |
 | boss-only 57 is ±5 pp noise; D1→D8 pooled +0.2 pp p = 0.95 | `contra_nes_evaluation/doc/0011-boss-data-scaling.md` §2, §3 |
 | step time ~103 ms, eval wall clock 5.5 min | `metrics.csv` `step_ms`; `report.json` `meta.wall_clock` |
