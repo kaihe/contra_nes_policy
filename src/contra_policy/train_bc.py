@@ -34,8 +34,14 @@ from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset,
                                    FixedFamilyBatchSampler, LengthGroupedSampler,
                                    load_or_build_index, pad_episodes, scaling_release,
                                    shard_paths)
+from contra_policy.action_space import ACTION_NAMES
 from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
+
+# The dataset's most common action, and the one `tail_ce` excludes. Derived from the
+# frozen action space rather than written as an integer, so a reordering there cannot
+# silently redefine the metric.
+MODAL_ACTION = ACTION_NAMES.index("R")
 
 
 class CSVLogger:
@@ -66,6 +72,21 @@ class CSVLogger:
 def _mean_of(rows: List[Dict[str, float]]) -> Dict[str, float]:
     keys = {k for r in rows for k in r}
     return {k: float(np.mean([r[k] for r in rows if k in r])) for k in sorted(keys)}
+
+
+def _weighted_tail(out: Dict[str, float], rows: List[Dict[str, float]]) -> Dict[str, float]:
+    """Re-aggregate ``tail_ce`` over the dataset rather than over batches.
+
+    Non-modal steps are ~22% of frames and cluster by family — a `traverse` batch and a
+    `boss` batch contribute very different counts — so the unweighted batch mean that
+    ``_mean_of`` produces is not the tail CE of the validation set. Weight each batch by
+    its own non-modal step count, and report the total rather than a mean of counts.
+    """
+    w = np.array([r.get("tail_n", 0.0) for r in rows], dtype=float)
+    if w.sum() <= 0:
+        return out
+    v = np.array([r.get("tail_ce", 0.0) for r in rows], dtype=float)
+    return {**out, "tail_ce": float((v * w).sum() / w.sum()), "tail_n": float(w.sum())}
 
 
 def _model_tokens(batch: Dict) -> int:
@@ -181,7 +202,8 @@ class BCTrainer:
               f"({'frozen' if pcfg.freeze_encoder else 'TRAINABLE'} encoder) · "
               f"context {self.policy.context}", flush=True)
 
-        self.objective = BehaviorCloneLoss(diagnostics=False).to(self.device)
+        self.objective = BehaviorCloneLoss(
+            diagnostics=False, modal_action=MODAL_ACTION).to(self.device)
 
         self.optimizer = torch.optim.AdamW(
             [p for p in self.policy.parameters() if p.requires_grad],
@@ -286,7 +308,7 @@ class BCTrainer:
                 break
             _loss, metrics = self._forward(self._to_device(batch))
             rows.append({k: float(v) for k, v in metrics.items()})
-        return _mean_of(rows)
+        return _weighted_tail(_mean_of(rows), rows)
 
     def run(self) -> None:
         total = int(self.args.train.steps)
@@ -328,7 +350,8 @@ class BCTrainer:
     def _emit(self, row: Dict[str, float], phase: str) -> None:
         self.logger.log({**row, "phase": phase})
         head = [f"{k}={row[k]:.4g}" for k in
-                ("loss", "lr", "grad_norm", "step_ms", "tokens_per_sec") if k in row]
+                ("loss", "tail_ce", "lr", "grad_norm", "step_ms", "tokens_per_sec")
+                if k in row]
         line = f"[{phase} {self.step}/{int(self.args.train.steps)}] " + " ".join(head)
         print(line, flush=True)
 

@@ -70,6 +70,27 @@ def action_class_weights(counts, alpha: float = 0.0, max_ratio: float = 10.0,
     return w.clamp(max=max_ratio).to(torch.float32)
 
 
+@torch.no_grad()
+def tail_ce_metrics(ce: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                    modal_action: int) -> Dict[str, torch.Tensor]:
+    """Cross-entropy restricted to valid steps whose *target* is not the modal action.
+
+    Total validation CE is a frequency-weighted average, and 78% of rollout steps are
+    ``R``, so it is dominated by the frames where any policy does well. It is not merely
+    uninformative here — it is anti-correlated with play: the D8 checkpoint at the CE
+    minimum (0.703 at step 3,000) scores 52.6% pooled on the 846 suite against 65.5% for
+    the fully overfit final at CE 1.754. Survival depends on the rare frames — the jump
+    timing, the dodge, the step where holding ``R`` kills you — and this restricts the
+    average to them. See ``doc/0010-dropout-regularization.md``.
+
+    ``tail_n`` rides along because callers average over batches: the non-modal step count
+    varies far more between batches than the valid-step count does, so an unweighted mean
+    of per-batch means is not the dataset's tail CE. Weight by this.
+    """
+    tail = mask * (target != modal_action).float()
+    return {"tail_ce": _masked_mean(ce, tail), "tail_n": tail.sum()}
+
+
 class BehaviorCloneLoss(nn.Module):
     """Cross-entropy of the 21-way action head against the recorded action."""
 
@@ -102,12 +123,18 @@ class BehaviorCloneLoss(nn.Module):
         # masked mean here divides by valid-step count, so the weighting shifts the
         # relative pull between classes without rescaling the loss.
         loss = _masked_mean(ce, mask)
+        # Reported always, including under `diagnostics=False`: it is one extra masked
+        # mean over the `ce` already computed, and it is the offline proxy 0010 exists to
+        # build. It is computed under no_grad and never enters the returned loss, so a run
+        # that logs it optimizes bit-identically to one that does not.
+        tail = (tail_ce_metrics(ce, target, mask, int(self.modal_action))
+                if self.modal_action is not None else {})
         if not self.diagnostics:
-            return self.weight * loss, {"loss": loss.detach()}
+            return self.weight * loss, {"loss": loss.detach(), **tail}
         with torch.no_grad():
             pred = logits.argmax(-1)
             metrics = {"bc_loss": loss.detach(),
-                       "bc_acc": _masked_mean((pred == target).float(), mask)}
+                       "bc_acc": _masked_mean((pred == target).float(), mask), **tail}
             metrics.update(prior_collapse_metrics(
                 pred, target, mask, logits.shape[-1], self.modal_action))
         return self.weight * loss, metrics
