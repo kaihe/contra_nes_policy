@@ -1,6 +1,6 @@
 # Graded rewards: recovering the half of every rollout budget that teaches nothing
 
-Status: Proposed
+Status: Accepted
 Supersedes: —
 Depends on: [0004](0004-grpo-experiment-plan.md) (the runs this is measured against),
 `kaihe/contra_nes_data#2` (the HP accessor phase 1 needs)
@@ -17,6 +17,26 @@ fast they finished, rescuing all-success groups. Both keep one scalar per episod
 nothing in the GRPO stack changes. A **symmetric** step penalty — the obvious version —
 is rejected: it scores a fast death above a long survival, which inverts the exact
 signal boss needs.
+
+**Status as of 2026-08-06.** Phase 1 is **built** — `reward.progress_coef` in
+`rollout.py:_reward_for`, anchored on the data repo's `boss_hp_start` — and it works on
+the metric it exists to fix: `collect/zero_variance_group_frac` falls from **0.514** in
+the control (`2026-08-03/09-23-22`, 100 updates) to **0.278 / 0.270** in the two graded
+runs. Half the dead rollout budget recovered.
+
+**Its confirmation run in §2 is still owed.** That run is specified as a *matched* repeat
+— same 50% boss sampling, 100 updates, `progress_coef` the only change — and confirmation
+requires boss `zero_var` below 0.2 **and** val boss above 10.5%. Neither condition has
+been tested: the two graded runs stopped at updates **77** and **61** (0009 §4: "stopped
+at update 61 to fund data generation") and were never evaluated closed-loop. The measured
+0.27 is also pooled across families, not boss-specific.
+
+[0011](0011-boss-grpo.md) does **not** substitute for it — that run is boss-only and
+wall-clock-bounded, and answers a feasibility question rather than attributing an effect
+against a matched control. The matched confirmation is ~100 minutes at 60 s/update if
+someone wants the attribution cleanly.
+
+**Phase 2 (the speed term) is not built.** §4 sequences it behind phase 1 settling.
 
 ---
 

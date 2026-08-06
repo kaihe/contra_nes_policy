@@ -192,3 +192,29 @@ def test_memory_guard_raises_before_the_guest_swaps():
 def test_memory_guard_is_off_at_zero():
     t = _trainer([[1, 0, 0, 0]], memory_limit_gb=0.0)
     t.collect_filtered()          # must not raise
+
+
+def test_act_uses_the_active_mask_not_a_none_test_on_the_image_array():
+    """`_observe` returns a dense image array, so a None-test marks every slot active.
+
+    That ran the causal core over slots holding no episode: harmless-looking at the tail
+    of a full collection round, but a hard crash whenever fewer tasks were queued than
+    there are batch slots (`groups_per_update * G < rollout.batch_size`) — the slot had
+    never been begun, so its prefix token was still None. doc/0011's smoke found it.
+    """
+    import numpy as np
+
+    from contra_policy.rl.rollout import RolloutObservation
+
+    b, s = 4, 8
+    obs = RolloutObservation(
+        image=np.zeros((b, s, s, 3), np.uint8), goal_image=np.zeros((b, s, s, 3), np.uint8),
+        goal_mask=np.zeros((b, s, s), np.uint8), interaction=np.zeros(b, np.int64),
+        prev_action=np.zeros(b, np.int64),
+        active=np.array([True, False, True, False]))
+
+    by_none = [i for i, im in enumerate(obs.image) if im is not None]
+    by_mask = [i for i, on in enumerate(obs.active) if on]
+
+    assert by_none == [0, 1, 2, 3]          # what the old code computed
+    assert by_mask == [0, 2]                # what it must compute

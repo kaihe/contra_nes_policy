@@ -1,6 +1,6 @@
 # Run GRPO for fourteen hours before judging its learning horizon
 
-Status: Proposed
+Status: Superseded by 0011
 Supersedes: —
 Depends on: [0004](0004-grpo-experiment-plan.md) (GRPO stack and probes),
 [0005](0005-graded-reward.md) (current reward),

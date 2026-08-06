@@ -16,9 +16,15 @@ the ~22% of steps whose target is not the modal `R` — **is a constant multiple
 CE**: the ratio sits at 2.10–2.29 across both ends of training and a 4× data range, so it
 carries no independent information whatsoever. Held-out imitation loss degrades
 *uniformly* across the action distribution while play improves. That kills not just tail CE
-but every reweighting of CE over the expert distribution. The dropout sweep this doc was
-written to gate is therefore **deferred, not run** — its runbook is preserved in §5 — and
-BC budget should not be spent on the offline-CE axis.
+but every reweighting of CE over the expert distribution, and BC budget should not be spent
+on the offline-CE axis.
+
+**The dropout sweep ran anyway** (§5). Best cell is **0.2 at 69.0% pooled**, +3.5 pp over
+the control — a soft positive that this doc predicted would not happen, so the prediction
+is recorded as failed in §3. It does not rescue the offline proxy: no cell cleared the
+`Δ ≤ 0.4` gate, the dose response is incoherent (0.3 has the lowest Δ *and* the worst
+play), the p-value is uncorrected across three comparisons, and all three new runs
+reproduce the constant tail/total ratio to three significant figures.
 
 ---
 
@@ -100,6 +106,18 @@ At matched training compute — the four finals, all 20,000 steps, all fully ann
 CE spans 1.15 nats while pooled spans 2.6 pp with no ordering (r = −0.41 on n = 4, and the
 pooled spread is itself inside evaluation noise).
 
+**Independently replicated by the dropout sweep.** The three regularized runs were trained
+after this finding and reproduce the ratio without being fitted to it:
+
+| cell | tail/total at the CE minimum | tail/total at step 20,000 |
+|---|---:|---:|
+| dropout 0.1 | 2.384 | **2.254** |
+| dropout 0.2 | 2.438 | **2.240** |
+| dropout 0.3 | 2.440 | **2.243** |
+
+Nine measurements now span two data scales, four dropout rates and three training
+positions, and the ratio never leaves 2.10–2.44.
+
 ### What that generalizes to
 
 The model does not get worse on average frames while improving on rare ones. It gets worse
@@ -161,12 +179,16 @@ Recorded before the runs, in the style of [0004](0004-grpo-experiment-plan.md) �
 | prediction | outcome |
 |---|---|
 | tail CE falls monotonically 3k → 20k on the existing D8 checkpoints | **falsified** — it rises 1.62 → 2.06 → 3.70 |
-| R1/R2 land within ±3 pp of control; R3 flat or negative | **unresolved** — sweep deferred by the §5 step-1 gate |
-| dropout 0.1 fails the Δ ≤ 0.4 gate | **unresolved** — same |
-| no cell exceeds GRPO u075's 71.6% | **unresolved** — same |
+| R1/R2 land within ±3 pp of control; R3 flat or negative | **mixed** — 0.1 at +2.5 pp and 0.3 at +0.1 pp were right; **0.2 at +3.5 pp was outside the band** |
+| dropout 0.1 fails the Δ ≤ 0.4 gate | **confirmed** — Δ = 0.789 |
+| no cell exceeds GRPO u075's 71.6% | **confirmed** — best cell 69.0% |
 
-The one prediction that could resolve without spending the two hours is the one that
-failed, and it was the load-bearing one.
+Two confirmed, one mixed, one falsified — and the falsified one was load-bearing. The
+mechanism in §1 was wrong, and the stance it implied ("regularization cannot help because
+it acts on an anti-correlated proxy") was too strong: dropout 0.2 produced a soft positive
+this doc argued against. What survives is the narrower, better-measured claim — offline CE
+does not *predict* play, which is a statement about steering, not about whether
+regularization can ever help.
 
 ## 4. What was rejected, and why
 
@@ -194,28 +216,49 @@ higher — but it would have to recover 12.9 pp to reach a checkpoint already in
 **Boss-only evaluation of any of this.** 57 tasks, 2–4 successes, ±5 pp RNG noise. Read
 boss off the full-suite runs.
 
-## 5. The dropout sweep — deferred, with its runbook
+## 5. The dropout sweep, and what it returned
 
-The sweep was always gated on step 1 inverting tail CE. It did not, so the sweep is
-**deferred rather than run**: dropout acts on held-out CE, and held-out CE is now measured
-uninformative at matched compute and inverted over training, so there is no route from
-dropout to better play through this proxy. It is two hours and the code is ready, so it
-remains a defensible spend if the alternative is idle GPU — but it is not the next lever.
+Run 2026-08-06 on D8, seed 0, 20,000 steps, `policy.core.dropout` the only change.
+Closed-loop from evaluation [0012](../../contra_nes_evaluation/doc/0012-d8-dropout-sweep.md):
 
-```bash
-for d in 0.1 0.2 0.3; do
-  python -m contra_policy.train_bc \
-    boss_scaling.shard_count=8 policy.core.dropout=$d \
-    hydra.run.dir=runs/bc/<date>/dropout-$d
-done
-```
+| cell | min val CE | final val CE | **Δ** | band | pooled 846 | vs control | p |
+|---|---:|---:|---:|---|---:|---:|---:|
+| 0.0 control | 0.703 | 1.754 | 1.051 | — | 65.5% | — | — |
+| 0.1 | 0.708 | 1.496 | **0.789** | partial | 68.0% | +2.5 pp | 0.17 |
+| **0.2** | 0.708 | 1.368 | **0.660** | partial | **69.0%** | **+3.5 pp** | **0.050** |
+| 0.3 | 0.705 | 1.288 | **0.583** | partial | 65.6% | +0.1 pp | 1.0 |
 
-Sequentially — 20 GB WSL ceiling, `num_workers: 2` already. ~34 min train + 5.5 min eval
-per cell. Evaluate finals on the **full 846**, paired McNemar against the control's 65.5%.
+Dropout engaged monotonically. **No cell reached `Δ ≤ 0.4`**, so by this doc's own gate
+every cell is "partial" and none is a clean test of "would curing overfit help play."
 
-Read `Δ = CE(20k) − CE(min)` before pooled success. Control is Δ = 1.051 (D8), 1.387 (D1).
-Δ ≥ 0.8 means dropout never bit at that rate — a **void cell**; raise the rate rather than
-recording "dropout does not help". Only Δ ≤ 0.4 makes the pooled number a real test.
+### Dropout probably cannot clear the gate at this placement
+
+The Δ decrements are **0.262 → 0.129 → 0.077**, roughly halving each step. Fitted
+geometrically that asymptotes at **Δ ≈ 0.47–0.51** — above the 0.4 threshold. Evaluation
+0012 §6.2 recommends escalating to rate 0.4–0.5 to clear the gate; on this placement that
+will not work, it will just underfit. Dropout reaches only attention weights and the
+SwiGLU output (`causal.py:135`, `:149`) — nothing on the residual stream, nothing on the
+embeddings, and the encoder is frozen. Clearing `Δ ≤ 0.4` needs **broader placement**, an
+architecture change, not a larger number. Three points fitted geometrically, so treat it
+as a strong hint; it is enough that the 0.4/0.5 cells are not worth funding as specified.
+
+### How much to believe 0.2
+
+Not much, as a finding; quite a lot, as a checkpoint.
+
+- **Three comparisons, best p = 0.050 uncorrected.** Family-wise error under the null is
+  `1 − 0.95³ ≈ 14%`; a Bonferroni threshold would be 0.0167.
+- **The dose response is incoherent.** Δ falls monotonically 0.789 → 0.660 → 0.583 while
+  pooled goes 68.0 → 69.0 → **65.6**. The most-regularized cell is the worst and sits
+  exactly at the control. A real regularization effect should not collapse like that.
+- **Boss is untouched**: 5.3–8.8% on the 846 suite, 4.0–8.5% on 0012's 200-resample probe,
+  with the same short-survival and low-damage histograms at every rate.
+- **Single seed**, finals only.
+
+So dropout 0.2's 69.0% is the best *point estimate* in the project for pure BC and a
+reasonable RL init — [0011](0011-boss-grpo.md) §2 gates it on a seed-1 replication before
+spending 10 GPU-hours on it — but it is not evidence that regularization is the lever, and
+it does not reopen the offline-CE axis.
 
 ## 6. What would reopen this
 
@@ -224,7 +267,8 @@ recording "dropout does not help". Only Δ ≤ 0.4 makes the pooled number a rea
 | an offline metric correlating with pooled across ≥ 6 checkpoints spanning ≥ 10 pp | §1's claim that no offline proxy works; would restore cheap steering |
 | a properly annealed short run beating 65.5% | the "early stopping is measured dead" line in §4 |
 | a ~3M cell matching D4 closed-loop | closes the capacity question; makes the rejected model-size sweep formally dead rather than argued |
-| dropout at Δ ≤ 0.4 beating control by ≥ 3 pp | the deferral in §5 |
+| dropout at Δ ≤ 0.4 beating control by ≥ 3 pp | §5's reading of the sweep — but it needs broader dropout placement, since rate alone asymptotes at Δ ≈ 0.5 |
+| dropout 0.2's +3.5 pp replicating at a second seed | §5's "not a finding"; would make regularization a live axis again |
 
 ## 7. What is next, and it is not this
 
@@ -251,6 +295,8 @@ signal, and it needs its own doc.
 | T = 0 vs T = 1 for BC and GRPO | `contra_nes_evaluation/runs/{0801-gpt-bc-final,0802-gpt-bc-final-t0,0803-grpo-000075,0802-grpo-000075-t0}/report.json` |
 | boss-only 57 is ±5 pp noise; D1→D8 pooled +0.2 pp p = 0.95 | `contra_nes_evaluation/doc/0011-boss-data-scaling.md` §2, §3 |
 | step time ~103 ms, eval wall clock 5.5 min | `metrics.csv` `step_ms`; `report.json` `meta.wall_clock` |
+| dropout sweep Δ, min/final val CE, tail/total ratios | `runs/bc/2026-08-06/dropout-{0.1,0.2,0.3}/metrics.csv`, rows with `phase=val` |
+| dropout closed-loop, McNemar, boss probe | `contra_nes_evaluation/doc/0012-d8-dropout-sweep.md` §2–§4; handoff `kaihe/contra_nes_evaluation#4` |
 | boss-HP accessor ready | `kaihe/contra_nes_policy#1` |
 
 Action entropy above is `-Σ p log p` over `overall.action_distribution`, i.e. the entropy

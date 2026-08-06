@@ -1,0 +1,35 @@
+# doc/0011 — is boss RL-solvable? Ten hours of graded-reward GRPO, boss only.
+#
+#   python -m contra_policy.rl.trainer --config-name boss_only \
+#     init_from=<base>/checkpoints/policy-final.pt
+#
+# Overrides config_grpo.yaml. Everything not listed here is inherited unchanged, which is
+# the point: `progress_coef` and the family restriction are the only departures from the
+# `2026-08-03/09-23-22` control that produced 71.6% pooled.
+defaults:
+  - config_grpo
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/boss-only-${now:%H-%M-%S}
+
+# Boss only. Restricting the catalog is cleaner than pushing `family_multiplier.boss`
+# upward: at the 0.3/0.7 natural/balanced split boss caps at 0.7 x 0.0675 + 0.3 = 34.7%
+# from the natural component alone, so 100% is unreachable by multiplier at any value.
+# `TaskCatalog.present_families` collapses to `[boss]` and both mixture components draw
+# boss, so the multiplier below is inert and kept only to avoid a silent KeyError.
+families: [boss]
+sampling:
+  family_multiplier: {boss: 1.0}
+
+# The other three families are out of scope for this experiment (doc/0011 §4): their
+# regression is recorded once at the end and must not gate the run.
+probe:
+  every: 10
+  tasks_per_family: 96          # 1 family now, so double the per-family count
+
+train:
+  updates: 2000                 # not the binding constraint; max_hours is
+  max_hours: 10.0
+  save_every: 25
