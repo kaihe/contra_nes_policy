@@ -1,24 +1,27 @@
-# Ten hours of graded-reward GRPO on boss alone — finish the run that was defunded
+# Settle whether boss is RL-solvable: ten hours of graded-reward GRPO, boss only
 
 Status: Proposed
 Supersedes: [0008](0008-fourteen-hour-grpo.md)
 Depends on: [0005](0005-graded-reward.md) (the reward, already built), [0004](0004-grpo-experiment-plan.md) (the stack)
 
-**Question.** Graded boss-HP reward is implemented and cut wasted rollout budget roughly
-in half, but every run using it was stopped early to fund a data campaign that returned
-nothing. Does a **10-hour, boss-only** GRPO run with that reward move boss past the ~9%
-ceiling every other intervention has hit?
+**Question.** Boss has resisted every intervention: 8× data, all three checkpoint
+positions, both temperatures, a dropout sweep, and 100 updates of sparse-reward GRPO. It
+sits at 3.5–8.8% with ~91–96% death throughout. **Is boss solvable by RL at all** with
+this architecture and a dense reward — or is something else the binding constraint?
 
-**Answer.** Run it. This is not new machinery and not a new idea — `progress_coef` is in
-`rollout.py`, the matched configuration is fixed by 0005 §2, and the two runs that used it
-died at updates **61 and 77** against the control's 100. The project's headline result
-(71.6% pooled) is the **ungraded** control. Boss is the only unsolved family and the only
-one where the reward change has measured leverage: **75–79%** of boss rollouts deal
-non-zero HP damage against **4.0–8.5%** that succeed, so grading converts roughly ten
-times more rollouts into gradient. Boss-only concentrates that budget where it pays.
-The cost is that a boss specialist will regress the other 93% of the val suite; that is
-accepted, **measured** by a full-846 guardrail at every probe, and reversible via a
-non-boss replay share.
+**Answer.** Spend 10 hours finding out, boss-only, and treat the result as a feasibility
+verdict rather than a product change. This is a **capability question, not a metric
+question**: what the other three families do while it runs is out of scope, recorded once
+at the end and never used as a gate. The setup is not new machinery — `progress_coef` is
+in `rollout.py`, the matched configuration is fixed by 0005 §2, and the two runs that used
+it died at updates **61 and 77** against the control's 100, defunded to pay for a data
+campaign that measured null. Boss is the only family where grading has leverage: **75–79%**
+of boss rollouts deal non-zero HP damage against **4.0–8.5%** that succeed, so ~61% of
+boss groups currently contribute nothing at G = 8.
+
+The verdict is read on **two axes — train-start success and held-out success** — because
+"RL can fit boss" and "RL produces a boss-general policy" are different claims and only
+the first is a feasibility proof. A negative needs a *plateau*, not merely a low endpoint.
 
 ---
 
@@ -122,14 +125,14 @@ trade worth making.
 
 Primary and secondary are both boss; the guardrail is the rest of the suite.
 
-| metric | source | cadence |
-|---|---|---|
-| **boss success + HP-damage histogram** | eval 0012 §4 probe, 200 resamples, seed 0 | every probe |
-| median / distribution of decision steps | same probe | every probe |
-| `collect/zero_variance_group_frac` | training metrics | continuous |
-| policy entropy, KL to reference | training metrics | continuous |
-| **full 846 pooled + per-family** | standard harness | probe checkpoints only |
-| train-task boss success | training probe | continuous |
+| metric | source | cadence | role |
+|---|---|---|---|
+| **held-out boss success + HP-damage histogram** | eval 0012 §4 probe, 200 resamples from the 57 val tasks, seed 0 | every probe | primary |
+| **train-start boss success** | training probe over the 466 published starts | continuous | primary |
+| median / distribution of decision steps | 0012 probe | every probe | shape of the failure |
+| `collect/zero_variance_group_frac` | training metrics | continuous | run health |
+| policy entropy, KL to reference | training metrics | continuous | run health |
+| full 846 pooled + per-family | standard harness | **once, at the end** | recorded cost, not a gate |
 
 The 200-resample probe is the reason to run this now rather than earlier: when the graded
 runs were cut, boss could only be measured as 57 binary tasks at ±5 pp, which could not
@@ -140,13 +143,22 @@ at closed-loop results first.
 
 ### Decision rule
 
-| observation | decision |
-|---|---|
-| boss 200-resample success > 20% with damage mass shifting out of `(0, 11]` | grading + focus works; write it up and decide whether to re-mix families |
-| boss 10–20%, histogram shifts right | real but partial; extend or move to 0005 phase 2 (speed term) |
-| boss stays < 10% with the same short-steps / low-damage shape | 10 h of dense-reward RL on boss does not move boss; the bottleneck is not gradient supply, and the next question is representation or task design |
-| train boss success climbs while val boss is flat | overfitting to the 466 train starts — see §4 |
-| non-boss pooled drops > 5 pp | specialist cost realized; re-run with replay share 0.25 |
+Because this is a feasibility question, the verdict is a 2×2 on *learnability* versus
+*generalization*, not a single number. "Solved" means substantially above the ~9% ceiling
+every prior method hit.
+
+| train starts | held-out | verdict |
+|---|---|---|
+| high | high | **Boss is RL-solvable.** Question settled; decide separately how to re-mix families |
+| high | low | **Learnable but not general.** RL fits boss from the 466 starts and does not transfer to 57 held-out ones — the constraint is *start-state coverage*, which makes diversified boss generation the justified next spend |
+| low | low | **Not solvable this way.** Dense reward, 10 h and undivided budget did not move it; gradient supply was never the bottleneck, and the next question is representation or task design |
+| low | high | incoherent — check the probe before believing it |
+
+**A negative requires a plateau, not a low endpoint.** Read boss success against update
+number: a run still climbing at the 10-hour cut proves solvability-in-progress and argues
+for more wall clock, whereas a flat trace for the last ~150 updates is the real negative.
+Record which of the two it is; without that the run cannot answer the question it exists
+to answer.
 
 ## 3. What was rejected, and why
 
@@ -177,8 +189,8 @@ episode length.
 
 | risk | why it is plausible | gate |
 |---|---|---|
-| **catastrophic forgetting of non-boss** | one shared causal core, 0% non-boss rollouts | full 846 at every probe; > 5 pp non-boss drop → restart with replay share 0.25 |
-| **overfitting the 466 train starts** | ~38 visits per task over 480 updates | train boss success vs val 200-resample probe; divergence > 15 pp is the signal |
+| **overfitting the 466 train starts** | ~38 visits per task over 480 updates | the §2 decision rule's second row — this *is* the primary scientific axis, not a side risk |
+| non-boss regression | one shared causal core, 0% non-boss rollouts | **out of scope.** Measured once at the end for the record; it must **not** trigger a restart or a replay share. A specialist that abandons the other families is the intended shape of this experiment |
 | **chip-without-kill** | grading pays partial damage | reward ranges are disjoint at `progress_coef ≤ 0.5` (0005 §2); watch the `(89, 100]` damage bin, not the mean |
 | **entropy collapse over 10 h** | 10× longer than any completed run | log policy entropy; T=1 rollout entropy below ~0.6 nats is a red flag (T=0 sits at 0.69 and costs 1.5–2.2 pp) |
 | **the run dies mid-way again** | it has happened twice | true resumption tested *before* launch, not after |
