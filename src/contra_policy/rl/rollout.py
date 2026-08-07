@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -361,8 +361,15 @@ class EpisodeCollector:
                  temperature: float = 1.0, precision: str = "bf16", seed: int = 0,
                  reward: Optional[Dict[str, float]] = None,
                  max_episode_steps: int = 0, stop_on_death: bool = True,
-                 collect_goal_points: bool = True, owner: str = "EpisodeCollector"):
-        catalog.assert_split("train")
+                 collect_goal_points: bool = True, owner: str = "EpisodeCollector",
+                 on_step: Optional[Callable[["_Slot", np.ndarray, int], None]] = None,
+                 require_split: str = "train"):
+        # Defaults to "train" so the guard holds for every training caller without them
+        # doing anything. Measurement tools that deliberately roll held-out tasks — they
+        # take no gradient — must name the split, which makes the exception greppable
+        # instead of a silently loosened assertion. `GRPOTrainer` asserts it again anyway.
+        catalog.assert_split(require_split)
+        self.require_split = require_split
         self.catalog = catalog
         self.sampler = sampler
         self.batch_size = batch_size
@@ -372,6 +379,7 @@ class EpisodeCollector:
         self.max_episode_steps = int(max_episode_steps)
         self.stop_on_death = stop_on_death
         self.collect_goal_points = collect_goal_points
+        self.on_step = on_step
         self.reward = {"success": 1.0, "death": 0.0, "timeout": 0.0, "step": 0.0,
                        "truncated": 0.0, "progress_coef": 0.0, **(reward or {})}
         self.actor = TokenHistoryActor(model, batch_size, device=device,
@@ -485,9 +493,12 @@ class EpisodeCollector:
     def _start(self, task: RLTask) -> _Slot:
         from util.replay import rewind_state
 
-        if task.split != "train":
-            raise RuntimeError(f"task {task.uid!r} is in the {task.split!r} split; "
-                               f"RL workers may only see training tasks")
+        # Per-task re-check behind the catalog-level one: `assert_split` can only vouch for
+        # the pool it was handed, and this is the last point before a save-state is loaded.
+        if task.split != self.require_split:
+            raise RuntimeError(f"task {task.uid!r} is in the {task.split!r} split but this "
+                               f"collector requires {self.require_split!r}; RL workers may "
+                               f"only see training tasks")
         seg = self.catalog.segment(task)
         slot = _Slot(task=task, seg=seg, maker=self._maker(task.family),
                      prompt=self.catalog.prompt(task),
@@ -582,6 +593,12 @@ class EpisodeCollector:
         # Both predicates are always evaluated (they are cheap RAM reads) so that
         # `died` is recorded even on the step the task is completed; `classify_step`
         # owns the ordering.
+        # Diagnostics hook. Off in training — it is a per-step Python call and this is the
+        # inner loop — but it is the only place the post-step RAM exists, which is what a
+        # failure autopsy needs (`tools/boss_autopsy.py`).
+        if self.on_step is not None:
+            self.on_step(slot, cur, action)
+
         reached = bool(slot.maker.goal_reached(slot.seg, slot.prev_ram, cur))
         died_now = slot.died or bool(self._die.trigger(slot.prev_ram, cur))
         slot.done, outcome, slot.died = classify_step(
