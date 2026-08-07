@@ -105,8 +105,8 @@ Departures from the 0011 boss-only run, each with its reason:
 | task filter | Spread + rapid | removes the 40% where no win is reachable |
 | `families` | `[boss]` | unchanged from 0011 |
 | **cumulative kl_ref stop** | **0.10** | *new*. 0011 had only a per-update `target_kl`, which fired on 1,500 of 1,619 updates while cumulative drift ran to 0.245 unchecked |
-| `train.updates` | **500** | bounded by updates, not wall clock — 0011's 10 h bought 1,619 updates, 3.4× its design |
-| `train.max_hours` | 4.0 | backstop only; ~22 s/update ⇒ 500 updates ≈ 3 h |
+| `train.updates` | **100** | a fixed budget matched to the runs that worked — the control `09-23-22` moved boss 3.5% → 10.5% in exactly 100 updates and ended at `kl_ref` ~0.030. 0011's collapse was at 1,619. At 100% boss share this carries ~2× the control's per-update boss gradient |
+| `train.max_hours` | 1.0 | backstop only; ~22 s/update ⇒ 100 updates ≈ 40 min, cheap enough to repeat across seeds |
 | `save_every` | 25 | unchanged |
 | `group_size`, `kl_coef`, lr | unchanged | one variable at a time; the control at 100 updates was healthy here |
 
@@ -135,7 +135,7 @@ Predeclared. "Init" is the BC base re-measured on the 13 × 16 protocol.
 | held-out Spread success rises ≥ 15 pp over init, spread across ≥ 5 of the 13 tasks | **GRPO works on boss.** The prior nulls were reachability and reward-shaping problems, not optimizer failure. Extend to Laser, then reconsider Regular |
 | rises ≥ 15 pp but concentrated in ≤ 2 tasks | memorization of specific starts, not capability — report as such, do not extend |
 | train probe rises while held-out is flat | overfitting the 120 train starts; the constraint is start-state coverage |
-| both flat after 500 updates at `zero_var` ≈ 0.2 | **GRPO does not move boss on this stack**, with gradient supply healthy and every reachability excuse removed. The next question is representation or survival, not RL |
+| both flat after 100 updates at `zero_var` ≈ 0.2 | **GRPO does not move boss on this stack**, with gradient supply healthy and every reachability excuse removed. The next question is representation or survival, not RL |
 | `kl_ref` hits the 0.10 stop early | configuration, not result — re-run with lower lr; do not report the truncated run as a null |
 
 ## 3. What was rejected, and why
@@ -149,8 +149,10 @@ behavior wins. That is where 0011's budget went.
 
 **Restricting to Spread without `rapid`.** Only 6 train tasks — too few to train on.
 
-**Wall-clock budget.** 0011's lesson: the same 10 h bought 3.4× the intended updates
-because boss episodes are short. Updates are the honest unit when episode length is stable.
+**A wall-clock budget.** 0011's lesson: the same 10 h bought 3.4× the intended updates
+because boss episodes are short. Updates are the honest unit, and a budget matched to a run
+that is known to have worked beats an open-ended session — 0011 also showed that a long run
+with an unbounded failure mode simply finds it.
 
 **A survival bonus.** It is probably the right long-term reward — the measured failure is a
 fixed ~2 s survival against 87–347 decisions needed, and 0005 §8 only ever rejected a
@@ -165,7 +167,7 @@ fight is 1.35× longer and mixing it in makes a null harder to attribute. Extend
 | risk | why it is plausible | gate |
 |---|---|---|
 | **13 val tasks cannot resolve the effect** | cluster-limited, not sample-limited | per-task table + cluster-aware CI; a verdict needs ≥ 5 of 13 tasks moving |
-| overfitting 120 train starts | ~67 visits per task over 500 updates | train probe vs held-out; §2's third decision row |
+| overfitting 120 train starts | ~13 visits per task over 100 updates | train probe vs held-out; §2's third decision row |
 | KL runaway repeats | it did in 0011 | cumulative `kl_ref` stop at 0.10 — the guard 0011 lacked |
 | entropy collapse | 0.875 → 0.407 in 0011 | log entropy; below 0.6 is a warning, and T = 0 already costs 1.5–2.2 pp |
 | the subset is *too* easy and results do not generalize | Spread is the strongest weapon | that is the point — this is a feasibility floor, not a shippable policy. Extension to Laser is the generalization test |
@@ -178,7 +180,8 @@ fight is 1.35× longer and mixing it in makes a null harder to attribute. Extend
 2. **Add the cumulative `kl_ref` stop.** 0011 had no bound on total drift.
 3. **Re-measure the BC init** on the 13 × 16 protocol. This is the control and it does not
    exist yet.
-4. **Run 500 updates** (~3 h), checkpointing every 25.
+4. **Run 100 updates** (~40 min), checkpointing every 25. Repeat on seeds 0/1/2 — at this
+   budget three seeds cost two hours and give the variance estimate 13 val tasks cannot.
 5. **Evaluate** held-out on the 13 × 16 protocol, with the per-task table.
 6. Update this doc's `Status`, resolve the decision rule, and hand results to eval.
 

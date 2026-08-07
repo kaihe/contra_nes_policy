@@ -20,6 +20,13 @@ cache_dir: ${hydra:runtime.cwd}/cache
 # all-failure groups. Not an isolation argument; phase 2 adds it from this same
 # checkpoint.
 families: [kill, item, traverse, boss]
+# Restrict the task pool by shard-JSON metadata, e.g. `{weapon: [Spread], rapid: true}`.
+# A list value means membership, anything else equality. Empty means no restriction.
+# doc/0012: weapon decides whether a boss fight is winnable at all.
+task_filter: {}
+# Assert the filtered pool size. 0 disables. A filter that silently kept a different pool
+# would read as a successful run on an easier set, so this is checked, not trusted.
+expected_tasks: 0
 image_size: 256
 sigma_px: 12.0
 
@@ -137,6 +144,11 @@ train:
   # episodes run ~1.8x the average length, so the hours a given update count costs depend
   # on the family mix. doc/0011 §2.
   max_hours: 0.0
+  # Stop when the 10-update mean KL to the *frozen reference* crosses this. 0 disables.
+  # Distinct from grpo.target_kl, which early-stops a single update against the behaviour
+  # policy: that one fired on 1,500 of 0011's 1,619 updates while drift from BC ran to
+  # 0.245 unwatched. doc/0012 §2.
+  max_kl_ref: 0.0
   epochs: 1               # passes over one collection; >1 makes the data more off-policy
   minibatch_episodes: 8
   # Calibrated, not guessed. At 1e-6 the first run held approx_kl at 2.13e-4 — 100x

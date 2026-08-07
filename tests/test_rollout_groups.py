@@ -218,3 +218,39 @@ def test_act_uses_the_active_mask_not_a_none_test_on_the_image_array():
 
     assert by_none == [0, 1, 2, 3]          # what the old code computed
     assert by_mask == [0, 2]                # what it must compute
+
+
+def test_meta_matches_supports_membership_equality_and_missing_keys():
+    """doc/0012's task filter: a typo must empty the pool, never pass everything."""
+    from contra_policy.rl.tasks import meta_matches
+
+    spread = {"weapon": "Spread", "rapid": True}
+    regular = {"weapon": "Regular", "rapid": True}
+
+    assert meta_matches(spread, {"weapon": ["Spread"], "rapid": True})
+    assert meta_matches(spread, {"weapon": ["Spread", "Laser"]})       # list = membership
+    assert not meta_matches(regular, {"weapon": ["Spread"]})
+    assert not meta_matches(spread, {"rapid": False})                  # scalar = equality
+    # An unknown field matches nothing rather than being ignored, so `expected_tasks`
+    # turns a mistyped filter into a hard failure instead of a silently different pool.
+    assert not meta_matches(spread, {"weapno": ["Spread"]})
+
+
+def test_shard_task_meta_keys_by_family_and_uid(tmp_path):
+    import json
+    import tarfile
+
+    from contra_policy.rl.tasks import shard_task_meta
+
+    path = tmp_path / "boss-train-00000.tar"
+    with tarfile.open(path, "w") as tf:
+        for uid, weapon in (("a1", "Spread"), ("b2", "Regular")):
+            blob = json.dumps({"weapon": weapon, "rapid": True}).encode()
+            info = tarfile.TarInfo(f"{uid}.json")
+            info.size = len(blob)
+            tf.addfile(info, __import__("io").BytesIO(blob))
+
+    meta = shard_task_meta([str(path)])
+
+    assert meta[("boss", "a1")]["weapon"] == "Spread"
+    assert meta[("boss", "b2")]["weapon"] == "Regular"

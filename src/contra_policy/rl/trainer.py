@@ -121,7 +121,10 @@ class GRPOTrainer:
             task_root=args.task_root, shard_dir=args.shard_dir,
             families=list(args.families), split="train",
             image_size=int(args.image_size), sigma_px=float(args.sigma_px),
-            cache_dir=args.cache_dir)
+            cache_dir=args.cache_dir,
+            task_filter=OmegaConf.to_container(args.get("task_filter", {}) or {},
+                                               resolve=True),
+            expected_tasks=int(args.get("expected_tasks", 0) or 0))
         self.catalog.assert_split("train")
         sampler = TaskSampler(self.catalog, float(args.sampling.natural_fraction),
                               float(args.sampling.balanced_family_fraction),
@@ -408,6 +411,13 @@ class GRPOTrainer:
         # are ~1.8x the average length, so the same update count costs very different
         # hours depending on the family mix (doc/0011 §2). Cumulative across resumes.
         budget = float(self.args.train.get("max_hours", 0.0) or 0.0) * 3600.0
+        # Drift bound the 0011 run lacked. `target_kl` early-stops one update against the
+        # *behaviour* policy and fired on 1,500 of its 1,619 updates — a guard that never
+        # stopped guarding and never guarded, because nothing watched the distance from the
+        # frozen BC reference, which ran 0.017 -> 0.245 and took the policy with it.
+        # Smoothed over 10 updates so a single noisy batch cannot end a run.
+        max_kl = float(self.args.train.get("max_kl_ref", 0.0) or 0.0)
+        kl_hist: collections.deque = collections.deque(maxlen=10)
         try:
             while self.update < total:
                 if budget and self.elapsed >= budget:
@@ -453,6 +463,16 @@ class GRPOTrainer:
                 if int(self.args.train.save_every) and \
                         self.update % int(self.args.train.save_every) == 0:
                     self.save()
+                kl_hist.append(float(row.get("kl_ref", 0.0)))
+                if max_kl and len(kl_hist) == kl_hist.maxlen:
+                    drift = sum(kl_hist) / len(kl_hist)
+                    if drift > max_kl:
+                        print(f"[grpo] KL to the frozen reference reached {drift:.4f} "
+                              f"> train.max_kl_ref={max_kl:.3f} (10-update mean) at update "
+                              f"{self.update}. Stopping: this is a configuration result, "
+                              f"not a measurement — lower the learning rate or raise "
+                              f"grpo.kl_coef and re-run.", flush=True)
+                        break
         finally:
             self.save(final=True)
             self.collector.close()

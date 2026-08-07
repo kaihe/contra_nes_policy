@@ -36,6 +36,7 @@ import glob
 import io
 import json
 import os
+import tarfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -93,6 +94,46 @@ def _splits_from_manifest(root: str, family: str) -> Dict[str, str]:
     return {os.path.splitext(os.path.basename(r["file"]))[0]: r["split"] for r in rows}
 
 
+def shard_task_meta(tar_paths: Sequence[str]) -> Dict[Tuple[str, str], dict]:
+    """``{(family, uid): metadata}`` read from the HF shard JSON members.
+
+    The shard JSON is the same source `contra_nes_evaluation` joins on, so a filter built
+    here and a report stratified there cannot disagree. The episode index does not carry
+    these fields — it holds `family`, `uid`, `length`, `action_counts` and nothing about
+    the emulator state — so the tar is the only place `weapon` and `rapid` live.
+    """
+    out: Dict[Tuple[str, str], dict] = {}
+    for path in tar_paths:
+        family = os.path.basename(path).split("-")[0]
+        with tarfile.open(path) as tf:
+            for member in tf:
+                if not member.name.endswith(".json"):
+                    continue
+                uid = os.path.basename(member.name)[: -len(".json")]
+                fh = tf.extractfile(member)
+                if fh is not None:
+                    out[(family, uid)] = json.load(fh)
+    return out
+
+
+def meta_matches(meta: dict, spec: Dict[str, object]) -> bool:
+    """Does one task's metadata satisfy every key of ``spec``?
+
+    A list value means membership (``weapon: [Spread, Laser]``); anything else is
+    equality (``rapid: true``). A key the metadata lacks never matches, so a typo in the
+    filter empties the pool rather than silently passing everything — which is why the
+    caller asserts an exact count.
+    """
+    for key, want in spec.items():
+        got = meta.get(key)
+        if isinstance(want, (list, tuple, set)):
+            if got not in want:
+                return False
+        elif got != want:
+            return False
+    return True
+
+
 def discover_tasks(task_root: str = DEFAULT_TASK_ROOT,
                    families: Sequence[str] = FAMILIES) -> List[RLTask]:
     """Every task ``.npz`` under ``task_root/<family>/<label>/<uid>.npz``.
@@ -144,7 +185,9 @@ class TaskCatalog:
                  families: Sequence[str] = FAMILIES, split: str = "train",
                  image_size: int = 256, sigma_px: float = 12.0,
                  cache_dir: str = "cache", prompt_cache: int = 128,
-                 segment_cache: int = 256, verbose: bool = True):
+                 segment_cache: int = 256, verbose: bool = True,
+                 task_filter: Optional[Dict[str, object]] = None,
+                 expected_tasks: int = 0):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
         self.split = split
@@ -155,7 +198,8 @@ class TaskCatalog:
         self.segment_cache_size = segment_cache
 
         shard_dir = os.path.expanduser(shard_dir)
-        index = load_or_build_index(shard_paths(shard_dir, self.families, split), cache_dir)
+        tars = shard_paths(shard_dir, self.families, split)
+        index = load_or_build_index(tars, cache_dir)
         self._shard: Dict[Tuple[str, str], dict] = {
             (ep["family"], ep["uid"]): ep for ep in index}
 
@@ -170,6 +214,30 @@ class TaskCatalog:
         if dropped and verbose:
             print(f"[rl.tasks] {dropped} {split} task(s) have no shard episode and were "
                   f"dropped (no cross-view prompt available)")
+
+        # Metadata restriction — doc/0012. Weapon decides whether a boss fight is winnable
+        # at all: Regular and Flamethrower scored 0 wins in 316 held-out rollouts while the
+        # policy survives a weapon-independent ~2 s, so ~40% of boss tasks are unreachable
+        # and training on them spends budget at full gradient weight for nothing.
+        if task_filter:
+            meta = shard_task_meta(tars)
+            before = len(self.tasks)
+            self.tasks = [t for t in self.tasks
+                          if meta_matches(meta.get(t.key, {}), task_filter)]
+            if verbose:
+                print(f"[rl.tasks] task_filter {dict(task_filter)} kept "
+                      f"{len(self.tasks)}/{before} {split} tasks")
+            if not self.tasks:
+                raise RuntimeError(
+                    f"task_filter {dict(task_filter)} matched no {split!r} task. Check the "
+                    f"field names against the shard JSON — an unknown key matches nothing.")
+        # Asserted, not trusted: a filter that silently keeps a different pool would read as
+        # a successful run on an easier set. Same discipline as 0009's episode-count checks.
+        if expected_tasks and len(self.tasks) != int(expected_tasks):
+            raise ValueError(
+                f"expected {int(expected_tasks)} {split} tasks after filtering, got "
+                f"{len(self.tasks)}. Either the release moved or the filter is wrong; "
+                f"do not run a sweep against an unverified pool.")
 
         # family -> label -> tasks, the structure the balanced sampler walks.
         self.by_family: Dict[str, Dict[str, List[RLTask]]] = {}
