@@ -326,6 +326,25 @@ class _Slot:
     group_id: int = 0
 
 
+def damage_frac(slot: "_Slot") -> float:
+    """Fraction of the boss's HP this rollout removed, or ``-1`` where undefined.
+
+    Anchored on the task's ``boss_hp_start`` — the data repo's full-reveal value — falling
+    back to the episode's own peak only when the metadata is absent. The boss spawns in
+    stages (16 -> 48 -> ~64), so neither step 0 nor the episode's own peak is a sound
+    denominator; see :class:`_Slot`.
+
+    ``-1`` means *no boss was ever seen*, which is not the same as *saw the boss and dealt
+    nothing*. Averaging those together would understate a policy that reaches the fight,
+    so callers filter on it rather than treating it as zero. Non-boss families return -1.
+    """
+    ref = slot.hp_ref if slot.hp_ref > 0 else slot.hp_peak
+    if ref <= 0:
+        return -1.0
+    removed = min(ref, max(0, ref - max(0, slot.hp_last)))
+    return removed / ref
+
+
 class EpisodeCollector:
     """Runs whole episodes through one emulator and returns complete trajectories.
 
@@ -607,15 +626,17 @@ class EpisodeCollector:
         alpha = float(self.reward.get("progress_coef", 0.0))
         if slot.outcome == "success" or alpha <= 0:
             return base
-        ref = slot.hp_ref if slot.hp_ref > 0 else slot.hp_peak
-        if ref <= 0:
-            return base
-        removed = min(ref, max(0, ref - max(0, slot.hp_last)))
-        return base + alpha * (removed / ref)
+        frac = damage_frac(slot)
+        return base if frac < 0 else base + alpha * frac
 
     def _finish(self, slot: _Slot) -> Episode:
         """A completed rollout, as the buffer wants it."""
         n = len(slot.actions)
+        # Carried separately from `reward`, which folds it in only when progress_coef > 0.
+        # Under the binary reward (doc/0012) the scalar keeps no trace of how far the
+        # rollout got, and boss damage and survival are the two quantities that move
+        # before success does: 0011 saw damage per failure go 11.9% -> 13.9% while
+        # success sat at 0.1%. Measuring progress must not depend on how it is rewarded.
         return Episode(
             task_uid=slot.task.uid,
             family=slot.task.family,
@@ -629,4 +650,5 @@ class EpisodeCollector:
             reward=self._reward_for(slot),
             outcome=slot.outcome,
             task_label=slot.task.label,
+            damage_frac=damage_frac(slot),
         )

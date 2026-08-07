@@ -21,7 +21,8 @@ reachable behavior wins, which is where 0011's gradient was going.
 
 If boss does not move here, it will not move anywhere, and the bottleneck is the policy or
 the representation rather than the optimizer. The binding constraint is measurement: only
-**13 val tasks** carry this weapon, so the protocol below is built around that.
+**13 val tasks** carry this weapon, so but the boss starts are near-identical, so the 120-task train probe carries the verdict
+and held-out is a sanity check.
 
 ---
 
@@ -110,21 +111,49 @@ Departures from the 0011 boss-only run, each with its reason:
 | `save_every` | 25 | unchanged |
 | `group_size`, `kl_coef`, lr | unchanged | one variable at a time; the control at 100 updates was healthy here |
 
-### Measurement, built around 13 tasks
+### Measurement: the 120-task train probe is primary
 
-This is the experiment's weak point and the protocol has to earn its conclusion.
+The earlier draft of this section built everything around the 13 held-out tasks. That was
+wrong, for a reason worth writing down: **the boss tasks are near-identical starts.** All
+120 Spread+rapid train tasks sit at `start_x` 3102–3104 — three distinct values, because
+the level-1 boss room is at a fixed map position — with `boss_hp_start` inside a 6-point
+band (59–64). They come from 120 distinct playthroughs, so they are not duplicates, but
+they are 120 samples of *one encounter*, not 120 different problems.
 
-- **Fixed 13 × 16 repeats = 208 rollouts** per checkpoint, not 200 draws with replacement.
-  Every task gets equal weight and the same 13 starts appear in every cell.
-- **Report per-task success as a 13-row table.** A rise concentrated in one or two tasks is
-  not a capability gain, and the aggregate cannot distinguish those.
-- **Cluster-aware intervals** — 13 clusters, not 208 independent samples. A naive binomial
-  CI here is roughly 4× too narrow.
-- **Re-measure the BC init on this exact protocol.** The 17.1% init figure comes from 41
-  draws inside a 200-draw pooled probe and is not a control for this design.
-- Track `collect/zero_variance_group_frac` (should start ~0.22 and *fall*), policy entropy,
-  and cumulative `kl_ref`.
-- Train-side: the unbiased probe over the 120 train tasks, every 10 updates.
+Two consequences:
+
+- **Held-out adds little.** A val Spread task is the same fight from an equivalently
+  similar state. There is no domain shift to generalize across, so the
+  memorization-versus-capability distinction that motivated the 13 × 16 protocol is much
+  weaker than assumed.
+- **The train probe is the better measurement.** 120 tasks against 13, already unbiased
+  by construction — fixed tasks, uniform within family, no filtering, no difficulty
+  weighting, and results never fed back to the sampler.
+
+So: **train probe every 10 updates as the primary signal; the 13 held-out tasks once at
+the end as a sanity check, not a gate.**
+
+### Progress metrics, not just outcome
+
+Binary success is the wrong primary metric on a pool this size, and switching to the
+binary *reward* makes that worse: `reward` folds damage in only when `progress_coef > 0`,
+so at 0.0 the scalar keeps no trace of how far a rollout got. Damage and survival are
+therefore recorded independently of the reward:
+
+| metric | why |
+|---|---|
+| `probe/damage_lost` | boss HP removed on **failed** episodes. Pooling wins in would just re-report success |
+| `probe/len_lost` | steps before death on failures — the quantity the whole diagnosis points at: the policy dies at a weapon-independent ~37–56 decisions against 87 needed on Spread |
+| `probe/tasks_won` | how many of the 120 tasks were won at least once — separates a broad gain from one lucky start |
+| `probe/damage_mean`, `probe/saw_boss` | context for the above |
+
+These move before success does. 0011 measured damage per failure going 11.9% → 13.9%
+while success sat at 0.1% — the wrong direction, but *measurable* where the binary metric
+was pinned. On 120 near-identical starts that sensitivity is the difference between an
+interpretable run and another null.
+
+Also tracked: `collect/zero_variance_group_frac` (should start ~0.22 and *fall*), policy
+entropy, and `kl_ref` against the 0.10 stop.
 
 ### Decision rule
 
@@ -132,9 +161,10 @@ Predeclared. "Init" is the BC base re-measured on the 13 × 16 protocol.
 
 | observation | verdict |
 |---|---|
-| held-out Spread success rises ≥ 15 pp over init, spread across ≥ 5 of the 13 tasks | **GRPO works on boss.** The prior nulls were reachability and reward-shaping problems, not optimizer failure. Extend to Laser, then reconsider Regular |
-| rises ≥ 15 pp but concentrated in ≤ 2 tasks | memorization of specific starts, not capability — report as such, do not extend |
-| train probe rises while held-out is flat | overfitting the 120 train starts; the constraint is start-state coverage |
+| train probe success rises ≥ 15 pp, with `tasks_won` rising and `len_lost` up | **GRPO works on boss.** The prior nulls were reachability and reward-shaping problems, not optimizer failure. Confirm on the 13 held-out, then extend to Laser |
+| success flat but `len_lost` and `damage_lost` rise | RL is moving survival without converting to kills yet — the leading indicators fired. Extend the update budget rather than concluding |
+| success rises but `tasks_won` barely moves | a lucky start, not capability — report as such, do not extend |
+| train rises ≥ 15 pp while the 13 held-out stay flat | surprising given the starts are near-identical; suspect the probe or the split before believing it |
 | both flat after 100 updates at `zero_var` ≈ 0.2 | **GRPO does not move boss on this stack**, with gradient supply healthy and every reachability excuse removed. The next question is representation or survival, not RL |
 | `kl_ref` hits the 0.10 stop early | configuration, not result — re-run with lower lr; do not report the truncated run as a null |
 
@@ -166,8 +196,8 @@ fight is 1.35× longer and mixing it in makes a null harder to attribute. Extend
 
 | risk | why it is plausible | gate |
 |---|---|---|
-| **13 val tasks cannot resolve the effect** | cluster-limited, not sample-limited | per-task table + cluster-aware CI; a verdict needs ≥ 5 of 13 tasks moving |
-| overfitting 120 train starts | ~13 visits per task over 100 updates | train probe vs held-out; §2's third decision row |
+| **binary success is noise-limited on this pool** | ~17% success over 120 near-identical starts | `len_lost` and `damage_lost` are the primary readouts; success is confirmatory |
+| overfitting 120 train starts | ~13 visits per task over 100 updates | weak here — the starts differ only in boss HP (59–64) and timing, so there is little task-specific structure to memorize. `tasks_won` is the check |
 | KL runaway repeats | it did in 0011 | cumulative `kl_ref` stop at 0.10 — the guard 0011 lacked |
 | entropy collapse | 0.875 → 0.407 in 0011 | log entropy; below 0.6 is a warning, and T = 0 already costs 1.5–2.2 pp |
 | the subset is *too* easy and results do not generalize | Spread is the strongest weapon | that is the point — this is a feasibility floor, not a shippable policy. Extension to Laser is the generalization test |
@@ -178,11 +208,11 @@ fight is 1.35× longer and mixing it in makes a null harder to attribute. Extend
 1. **Add the metadata task filter** — `weapon` / `rapid` read from shard JSON, with hard
    assertions of 120 train / 13 val. Test that the filter selects exactly those uids.
 2. **Add the cumulative `kl_ref` stop.** 0011 had no bound on total drift.
-3. **Re-measure the BC init** on the 13 × 16 protocol. This is the control and it does not
-   exist yet.
+3. **Re-measure the BC init** on the same 120-task probe. This is the control and it does
+   not exist yet — every published init figure comes from eval's pooled 200-draw probe.
 4. **Run 100 updates** (~40 min), checkpointing every 25. Repeat on seeds 0/1/2 — at this
    budget three seeds cost two hours and give the variance estimate 13 val tasks cannot.
-5. **Evaluate** held-out on the 13 × 16 protocol, with the per-task table.
+5. **Evaluate** the 13 held-out tasks once, at the end, as a sanity check on the train gain.
 6. Update this doc's `Status`, resolve the decision rule, and hand results to eval.
 
 Not blocked on another repo — the metadata is already in the shards eval reads.

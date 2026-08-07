@@ -366,6 +366,30 @@ class GRPOTrainer:
         out["probe/reward_mean"] = float(np.mean([e.reward for e in eps]))
         out["probe/episodes"] = float(len(eps))
         out["probe/mean_len"] = float(np.mean([len(e) for e in eps]))
+        # Progress, not outcome. Binary success on a small task pool is noise-limited —
+        # 13 val Spread tasks resolve nothing — while damage and survival move first and
+        # continuously. Reported whatever `progress_coef` is, so switching the reward off
+        # does not switch the measurement off with it. doc/0012 §2.
+        seen = [e for e in eps if e.damage_frac >= 0]
+        if seen:
+            out["probe/damage_mean"] = float(np.mean([e.damage_frac for e in seen]))
+            out["probe/damage_median"] = float(np.median([e.damage_frac for e in seen]))
+            out["probe/saw_boss"] = len(seen) / len(eps)
+            lost = [e for e in seen if not _won(e)]
+            if lost:
+                # Failures only: the pooled mean rises trivially when wins (damage 1.0)
+                # become more common, which would report the same thing as `success`.
+                out["probe/damage_lost"] = float(np.mean([e.damage_frac for e in lost]))
+                out["probe/len_lost"] = float(np.mean([len(e) for e in lost]))
+        # Per-task success over the fixed probe set, so a gain concentrated in one or two
+        # starts is distinguishable from a broad one.
+        per: Dict[str, List[float]] = {}
+        for e in eps:
+            per.setdefault(e.task_uid, []).append(float(_won(e)))
+        if per:
+            rates = [float(np.mean(v)) for v in per.values()]
+            out["probe/tasks"] = float(len(per))
+            out["probe/tasks_won"] = float(sum(1 for r in rates if r > 0))
         macro = []
         for fam in FAMILIES:
             sel = [e for e in eps if e.family == fam]
@@ -502,7 +526,13 @@ class GRPOTrainer:
         pf = [f"{f}={row[f'probe/{f}/success']:.2f}"
               for f in FAMILIES if f"probe/{f}/success" in row]
         if pf:
-            print(f"    PROBE macro={row['probe/macro']:.3f} " + " ".join(pf) +
+            extra = ""
+            if "probe/damage_lost" in row:
+                extra = (f" dmg_lost={row['probe/damage_lost']:.3f}"
+                         f" len_lost={row['probe/len_lost']:.0f}")
+            if "probe/tasks_won" in row:
+                extra += f" tasks_won={int(row['probe/tasks_won'])}/{int(row['probe/tasks'])}"
+            print(f"    PROBE macro={row['probe/macro']:.3f} " + " ".join(pf) + extra +
                   f"  (n={int(row['probe/episodes'])}, fixed tasks)", flush=True)
 
     def save(self, final: bool = False) -> str:

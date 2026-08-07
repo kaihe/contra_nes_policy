@@ -45,6 +45,11 @@ class Episode:
     #: difficulty sampler can pool 495 tasks per label into one usable estimate — see
     #: :class:`~contra_policy.rl.tasks.DifficultyTracker`.
     task_label: str = ""
+    #: Fraction of boss HP removed, or -1 where no boss was seen. Recorded independently
+    #: of `reward`, which only folds it in when `progress_coef > 0` — so progress stays
+    #: measurable under the binary reward (doc/0012). Damage and survival move before
+    #: success does, which is what makes them usable on a small task pool.
+    damage_frac: float = -1.0
 
     def __len__(self) -> int:
         return int(self.frames.shape[0])

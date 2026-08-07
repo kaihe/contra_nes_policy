@@ -201,3 +201,41 @@ def test_outcome_stats_agrees_with_the_probe_on_what_success_means():
     assert out["success"] == pytest.approx(0.5)      # not 1.0
     assert out["reward_mean"] == pytest.approx(0.7)
     assert out["boss/success"] == pytest.approx(0.5)
+
+
+def test_damage_frac_is_recorded_independently_of_the_reward_coefficient():
+    """doc/0012 runs at progress_coef 0.0; progress must still be measurable."""
+    import types
+
+    from contra_policy.rl.rollout import damage_frac
+
+    # boss_hp_start 64, died with 48 left -> removed 16 of 64
+    slot = types.SimpleNamespace(hp_ref=64, hp_peak=64, hp_last=48)
+    assert damage_frac(slot) == pytest.approx(16 / 64)
+
+    # A kill reads as the full bar.
+    assert damage_frac(types.SimpleNamespace(hp_ref=64, hp_peak=64, hp_last=0)) == 1.0
+
+    # Never saw the boss -> -1, which is not the same as "saw it and dealt nothing".
+    assert damage_frac(types.SimpleNamespace(hp_ref=-1, hp_peak=-1, hp_last=-1)) == -1.0
+    seen_no_damage = types.SimpleNamespace(hp_ref=64, hp_peak=64, hp_last=64)
+    assert damage_frac(seen_no_damage) == 0.0
+
+    # Falls back to the episode's own peak only when the task metadata is missing.
+    assert damage_frac(types.SimpleNamespace(hp_ref=-1, hp_peak=48, hp_last=24)) == 0.5
+
+
+def test_binary_reward_keeps_damage_out_of_the_scalar():
+    """Switching grading off must not change the reward, only what is reported."""
+    import types
+
+    from contra_policy.rl.rollout import EpisodeCollector
+
+    slot = types.SimpleNamespace(outcome="death", hp_ref=64, hp_peak=64, hp_last=32)
+    graded = EpisodeCollector._reward_for.__get__(
+        types.SimpleNamespace(reward={"death": 0.0, "progress_coef": 0.5}))
+    binary = EpisodeCollector._reward_for.__get__(
+        types.SimpleNamespace(reward={"death": 0.0, "progress_coef": 0.0}))
+
+    assert graded(slot) == pytest.approx(0.25)      # 0.5 * (32/64)
+    assert binary(slot) == 0.0                      # but damage_frac still reads 0.5
