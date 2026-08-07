@@ -1,6 +1,6 @@
 # Settle whether boss is RL-solvable: ten hours of graded-reward GRPO, boss only
 
-Status: Proposed
+Status: Implemented
 Supersedes: [0008](0008-fourteen-hour-grpo.md)
 Depends on: [0005](0005-graded-reward.md) (the reward, already built), [0004](0004-grpo-experiment-plan.md) (the stack)
 
@@ -22,6 +22,28 @@ boss groups currently contribute nothing at G = 8.
 The verdict is read on **two axes — train-start success and held-out success** — because
 "RL can fit boss" and "RL produces a boss-general policy" are different claims and only
 the first is a feasibility proof. A negative needs a *plateau*, not merely a low endpoint.
+
+**Measured outcome (2026-08-06/07).** Ran the full 10 h → **1,619 updates** at 22.2 s/update
+(3.4× this doc's ~480 estimate; boss episodes are short because the policy dies fast).
+**The 2×2 lands in the low/low cell, and all three §4 risks fired.**
+
+- **Train:** probe boss flat at ~4.3–5.8% for ~600 updates against a 3.1% init, then
+  collapse to ~0.1%. The single u540 probe of 11.5% is noise — neighbours read 1.0–8.3%
+  and the u490–620 mean is 4.6%. Do not cite it.
+- **Held-out** (eval [0013](../../contra_nes_evaluation/doc/0013-boss-only-grpo-precollapse.md)):
+  u525/u550/u575 at 7.5 / 11.0 / 7.5% against an 8.5% BC init — u550's edge is 0.84σ and
+  its neighbours sit below the init. Full 846 on u550 is 64.3% (−4.7 pp, p = 0.005), the
+  expected specialist cost.
+- **How it collapsed:** cumulative `kl_ref` 0.017 → **0.245** with no bound on total drift
+  (the per-update `target_kl` fired on 1,500 of 1,619 updates and was therefore no guard);
+  entropy 0.875 → 0.407; and **chip-without-kill** — damage per failed episode 11.9% →
+  13.9% while wins went 4.9% → 0.1%.
+- **The finding that outlived the run:** weapon stratification of the held-out probe shows
+  **~40% of boss tasks are unwinnable** (Regular/Flamethrower: 0 wins in 316 rollouts) and
+  every boss success ever recorded came from Spread or Laser. The graded reward also
+  **defeated the difficulty sampler** — hopeless groups gained damage spread, survived
+  filtering, and stopped being detectable as hopeless. [0012](0012-spread-grpo.md) is the
+  successor experiment: binary reward, Spread + rapid only.
 
 ---
 
