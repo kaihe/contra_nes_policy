@@ -787,8 +787,15 @@ def pad_episodes(items: List[Dict]) -> Dict:
 
     ``mask`` marks real steps and is what every loss must reduce over — a padded step
     has a fabricated action target of 0 and must never reach a gradient.
+
+    Handles both item kinds: pixel items carrying ``image``, and the precomputed-token
+    items :class:`~contra_policy.token_cache.CachedEpisodeDataset` emits, which carry
+    ``tokens`` and ``goal_token`` instead. Everything downstream of the time axis — the
+    padding rule, ``mask``, ``seq_len`` — is identical, which is what keeps a cached run
+    and a live run comparable.
     """
-    t = max(int(x["image"].shape[0]) for x in items)
+    time_key = "image" if "image" in items[0] else "tokens"
+    t = max(int(x[time_key].shape[0]) for x in items)
     out: Dict = {}
 
     def stack(key, fill=0):
@@ -799,7 +806,7 @@ def pad_episodes(items: List[Dict]) -> Dict:
             buf[i, :n] = x[key]
         return buf
 
-    for key in ("image", "action", "mask", "goal_heatmap", "exist", "point",
+    for key in ("image", "tokens", "action", "mask", "goal_heatmap", "exist", "point",
                 "n_goal_points", "prev_action", "prev_action_dropout", "first"):
         if key in items[0]:
             out[key] = stack(key)
@@ -807,17 +814,22 @@ def pad_episodes(items: List[Dict]) -> Dict:
         out["entity_heatmap"] = stack("entity_heatmap")
 
     # Per-episode members carry no time axis.
-    out["cross_view"] = {
-        "cross_view_image": torch.stack([x["cross_view"]["cross_view_image"] for x in items]),
-        "cross_view_obj_mask": torch.stack(
-            [x["cross_view"]["cross_view_obj_mask"] for x in items]),
-        # One interaction id per episode. The windowed loader emitted it per timestep;
-        # the policy takes a single id, so collapse it here rather than in the model.
-        "cross_view_obj_id": torch.stack(
-            [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
-    }
+    if "cross_view" in items[0]:
+        out["cross_view"] = {
+            "cross_view_image": torch.stack(
+                [x["cross_view"]["cross_view_image"] for x in items]),
+            "cross_view_obj_mask": torch.stack(
+                [x["cross_view"]["cross_view_obj_mask"] for x in items]),
+            # One interaction id per episode. The windowed loader emitted it per timestep;
+            # the policy takes a single id, so collapse it here rather than in the model.
+            "cross_view_obj_id": torch.stack(
+                [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
+        }
+    else:
+        out["goal_token"] = torch.stack([x["goal_token"] for x in items])
+        out["interaction"] = torch.stack([x["interaction"] for x in items])
     out["family"] = torch.stack([x["family"] for x in items])
-    out["seq_len"] = torch.tensor([int(x["image"].shape[0]) for x in items])
+    out["seq_len"] = torch.tensor([int(x[time_key].shape[0]) for x in items])
     return out
 
 

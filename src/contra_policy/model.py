@@ -134,9 +134,37 @@ class ContraPolicy(nn.Module):
 
         frames = self.encode_images(images)                      # (B, T, d)
         goal = self.encode_images(goal_image.unsqueeze(1))       # (B, 1, d)
+        return self._heads(frames, goal.squeeze(1), interaction, attn_mask)
+
+    def forward_tokens(self, frame_tokens: torch.Tensor, goal_token: torch.Tensor,
+                       interaction: torch.Tensor,
+                       attn_mask: Optional[torch.Tensor] = None
+                       ) -> Dict[str, torch.Tensor]:
+        """:meth:`forward` with the encoder already applied.
+
+        ``frame_tokens`` (B, T, d), ``goal_token`` (B, d) — what
+        :class:`~contra_policy.token_cache.CachedEpisodeDataset` reads off disk instead of
+        re-deriving from pixels every epoch. Identical to :meth:`forward` from the `cat`
+        onward, because it is literally the same code path.
+
+        Pass tokens in **float32**: the live path's are, since ``encode()`` ends in a
+        LayerNorm that autocast promotes, and the interaction embedding is fp32 too, so a
+        half-precision argument would fail the `cat` rather than silently downcast.
+        """
+        if frame_tokens.shape[1] + PREFIX > self.context:
+            raise ValueError(f"{frame_tokens.shape[1]} frames + {PREFIX} prefix exceeds "
+                             f"context {self.context}")
+        return self._heads(frame_tokens, goal_token, interaction, attn_mask)
+
+    def _heads(self, frames: torch.Tensor, goal: torch.Tensor,
+               interaction: torch.Tensor,
+               attn_mask: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """The shared body: assemble ``[interaction, goal, frames…]``, run it, read heads."""
+        b, t = frames.shape[:2]
         inter = self.interaction(interaction + 1).unsqueeze(1)   # (B, 1, d)
 
-        h = self.core(torch.cat([inter, goal, frames], dim=1), attn_mask=attn_mask)
+        h = self.core(torch.cat([inter, goal.unsqueeze(1), frames], dim=1),
+                      attn_mask=attn_mask)
         h = h[:, PREFIX:]                                        # frame positions only
 
         out = {"pi_logits": self.pi_head(h)}

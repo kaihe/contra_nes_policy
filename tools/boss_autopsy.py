@@ -86,6 +86,73 @@ class StepRecorder:
         })
 
 
+def replay_expert(catalog: TaskCatalog) -> List[dict]:
+    """The expert's own per-step state, by replaying their action sequence.
+
+    The index-matched comparison — policy action at t against expert action at t — is
+    weak, because by step t the two trajectories are in different states. This replays
+    ``seg.actions`` from the same save-state and records the *expert's* bullet distances,
+    so the comparison can be conditioned on the threat actually faced. Deterministic, so
+    one pass per task is the whole distribution.
+    """
+    from util.replay import make_env, rewind_state
+
+    from contra_policy.action_space import vectors_to_indices
+    from contra_policy.rl.rollout import claim_emulator, release_emulator
+
+    from env.entity import (is_grounded, nearest_enemy_bullet_dist,
+                            nearest_enemy_dist, player_pos)
+
+    claim_emulator("boss_autopsy.expert")
+    env = make_env()
+    rows: List[dict] = []
+    try:
+        for task in catalog.tasks:
+            seg = catalog.segment(task)
+            rewind_state(env, seg.initial_state)
+            idx = vectors_to_indices(np.asarray(seg.actions, dtype=np.uint8))
+            for t, vec in enumerate(seg.actions):
+                for _ in range(seg.skip):
+                    env.step(np.asarray(vec, dtype=np.uint8))
+                ram = env.unwrapped.get_ram().copy()
+                px, py = (float(v) for v in player_pos(ram))
+                rows.append({
+                    "uid": task.uid, "episode": -1, "t": t,
+                    "action": int(idx[t]), "expert_action": int(idx[t]),
+                    "player_x": px, "player_y": py,
+                    "grounded": int(bool(is_grounded(ram))),
+                    "bullet_dist": float(nearest_enemy_bullet_dist(ram)),
+                    "enemy_dist": float(nearest_enemy_dist(ram)),
+                })
+    finally:
+        env.close()
+        release_emulator()
+    return rows
+
+
+def state_matched(policy_rows: List[dict], expert_rows: List[dict]) -> None:
+    """Action mix conditioned on the threat actually faced, not on decision index."""
+    from contra_policy.action_space import ACTION_NAMES
+
+    jump = {i for i, n in enumerate(ACTION_NAMES) if "J" in n}
+    up = {i for i, n in enumerate(ACTION_NAMES) if "U" in n}
+    right = {i for i, n in enumerate(ACTION_NAMES) if n == "R"}
+    bins = [(0, 16), (16, 32), (32, 64), (64, float("inf"))]
+
+    print("\n4. state-matched: action mix by the distance of the nearest enemy bullet")
+    print(f"   {'bullet px':>12s}  {'who':7s} {'n':>6s} {'jump':>7s} {'up':>7s} {'R':>7s}")
+    for lo, hi in bins:
+        for who, rs in (("policy", policy_rows), ("expert", expert_rows)):
+            a = [r["action"] for r in rs if lo <= r["bullet_dist"] < hi]
+            if not a:
+                continue
+            label = f"{lo}-{hi:.0f}" if np.isfinite(hi) else f"{lo}+"
+            print(f"   {label:>12s}  {who:7s} {len(a):6d} "
+                  f"{np.mean([x in jump for x in a]):7.1%}"
+                  f"{np.mean([x in up for x in a]):7.1%}"
+                  f"{np.mean([x in right for x in a]):7.1%}")
+
+
 def summarize(rows: List[dict], outcomes: Dict[tuple, str]) -> None:
     """The three-hypothesis table."""
     by_ep: Dict[tuple, List[dict]] = collections.defaultdict(list)
@@ -225,6 +292,11 @@ def main() -> None:
     print(f"[autopsy] wrote {len(rec.rows)} steps to {path}")
 
     summarize(rec.rows, outcomes)
+
+    print("\n[autopsy] replaying the expert for the state-matched comparison...", flush=True)
+    exp = replay_expert(catalog)
+    print(f"[autopsy] {len(exp)} expert steps over {len(catalog.tasks)} tasks")
+    state_matched(rec.rows, exp)
 
 
 if __name__ == "__main__":

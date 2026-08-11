@@ -19,6 +19,15 @@ boss_scaling:
   validation_sha256: 131835e34c55f75ded04410976730600a866744b40a8525bfc4d7f9ab952ecad
 expected_episodes: {train: {}, val: {}}
 cache_dir: ${hydra:runtime.cwd}/cache
+# Precomputed frozen-encoder tokens (doc/0013 §2.3). When `train` is set, the loader reads
+# only these directories — no tar, no PyAV, no cv2 — and `policy.forward_tokens` replaces
+# the encoder forward, which is ~97% of a step. Requires `policy.freeze_encoder: true`:
+# a trainable encoder cannot be served from a cache of its own past outputs.
+# Build with `tools/build_token_cache.py`. Startup asserts the cache's encoder sha256
+# matches `policy.encoder_ckpt`, so a stale cache raises rather than training silently.
+token_cache:
+  train: null
+  val: null
 families: [kill, item, traverse, boss]
 image_size: 256
 sigma_px: 12.0            # must match the export and the prompt renderer

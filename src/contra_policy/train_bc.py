@@ -37,6 +37,8 @@ from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset,
 from contra_policy.action_space import ACTION_NAMES
 from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
+from contra_policy.token_cache import (CachedEpisodeDataset, TokenCache,
+                                       encoder_fingerprint)
 
 # The dataset's most common action, and the one `tail_ce` excludes. Derived from the
 # frozen action space rather than written as an integer, so a reordering there cannot
@@ -98,7 +100,8 @@ def _model_tokens(batch: Dict) -> int:
     tokens followed by the batch-padded frame sequence. ``frames`` remains the useful,
     unpadded counterpart, so the two rates expose padding overhead instead of hiding it.
     """
-    batch_size, padded_frames = batch["image"].shape[:2]
+    key = "image" if "image" in batch else "tokens"
+    batch_size, padded_frames = batch[key].shape[:2]
     return int(batch_size) * (int(padded_frames) + PREFIX)
 
 
@@ -174,11 +177,32 @@ class BCTrainer:
             expected_val["boss"] = release["val_episodes"]
         _require_family_counts(train_idx, expected_train, "train")
         _require_family_counts(val_idx, expected_val, "val")
+        # Precomputed frozen-encoder tokens replace the decode+encode legs entirely.
+        # `train_index` still comes from the tars, because the family schedule and the
+        # release assertions above are contracts about the *shards*; the cache only
+        # changes where the pixels' representation comes from.
+        tc_cfg = args.get("token_cache", {}) or {}
+        self.token_cache = bool(tc_cfg.get("train"))
+        if self.token_cache and not bool(args.policy.freeze_encoder):
+            raise ValueError(
+                "token_cache requires policy.freeze_encoder=true — a trainable encoder "
+                "cannot be served from a cache of its own past outputs")
         ds_kw = dict(whole_episode=True, image_size=int(args.image_size),
                      sigma_px=float(args.sigma_px), aux_size=int(args.policy.aux_size),
                      prev_action_keep_prob=0.0, seed=int(args.seed))
-        self.train_ds = ContraCrossViewDataset(train_idx, **ds_kw)
-        self.val_ds = ContraCrossViewDataset(val_idx, **ds_kw)
+        if self.token_cache:
+            enc_sha = encoder_fingerprint(str(args.policy.encoder_ckpt))
+            caches = {split: TokenCache(str(tc_cfg[split]), encoder_sha256=enc_sha,
+                                        image_size=int(args.image_size))
+                      for split in ("train", "val")}
+            self.train_ds = CachedEpisodeDataset(caches["train"],
+                                                 [e["uid"] for e in train_idx])
+            self.val_ds = CachedEpisodeDataset(caches["val"], [e["uid"] for e in val_idx])
+            print(f"[bc] token cache · {len(caches['train'])} train / "
+                  f"{len(caches['val'])} val episodes · encoder {enc_sha[:12]}", flush=True)
+        else:
+            self.train_ds = ContraCrossViewDataset(train_idx, **ds_kw)
+            self.val_ds = ContraCrossViewDataset(val_idx, **ds_kw)
         self.train_index = train_idx
         # -1 because the last frame of an episode has no action taken *from* it.
         self.train_len = [max(1, e["length"] - 1) for e in train_idx]
@@ -255,17 +279,22 @@ class BCTrainer:
     def _to_device(self, batch: Dict) -> Dict:
         out = {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v)
                for k, v in batch.items() if k != "cross_view"}
-        out["cross_view"] = {k: v.to(self.device, non_blocking=True)
-                             for k, v in batch["cross_view"].items()}
+        if "cross_view" in batch:
+            out["cross_view"] = {k: v.to(self.device, non_blocking=True)
+                                 for k, v in batch["cross_view"].items()}
         return out
 
     def _forward(self, batch: Dict):
-        cv = batch["cross_view"]
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null())
         with ctx:
-            latents = self.policy(batch["image"], cv["cross_view_image"],
-                                  cv["cross_view_obj_id"])
+            if self.token_cache:
+                latents = self.policy.forward_tokens(
+                    batch["tokens"], batch["goal_token"], batch["interaction"])
+            else:
+                cv = batch["cross_view"]
+                latents = self.policy(batch["image"], cv["cross_view_image"],
+                                      cv["cross_view_obj_id"])
             loss, metrics = self.objective(latents, batch)
         return loss, metrics
 

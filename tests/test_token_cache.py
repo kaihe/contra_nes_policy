@@ -9,6 +9,7 @@ encoder or image size raises instead of being tolerated.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 
@@ -17,8 +18,10 @@ import pytest
 import torch
 
 from contra_encoder.net import build_encoder
-from contra_policy.token_cache import (CACHE_VERSION, StaleCache, TokenCache,
-                                       build_token_cache, encoder_fingerprint)
+from contra_policy.action_space import ACTION_VECTORS, NUM_ACTIONS
+from contra_policy.token_cache import (CACHE_VERSION, CachedEpisodeDataset, StaleCache,
+                                       TokenCache, build_token_cache,
+                                       encoder_fingerprint)
 
 
 S, DIM = 32, 512
@@ -46,6 +49,21 @@ class _FakeDataset:
         return np.stack([self._pixels(ep["uid"], j)
                          for j in range(start, start + count)])
 
+    def actions_of(self, ep):
+        """Real 21-action indices, deterministic per uid — `vectors_to_indices` is strict."""
+        rng = np.random.default_rng(abs(hash(("act", ep["uid"]))) % (2 ** 32))
+        return rng.integers(0, NUM_ACTIONS, size=int(ep["length"]), dtype=np.int64)
+
+    def _read(self, ep, ext):
+        """The builder's only tar accessor, so the fake shard lives entirely here."""
+        if ext == "actions.npy":
+            buf = io.BytesIO()
+            np.save(buf, np.asarray(ACTION_VECTORS)[self.actions_of(ep)].astype(np.uint8))
+            return buf.getvalue()
+        if ext == "json":
+            return json.dumps({"goal_when": "boss"}).encode()
+        raise KeyError(ext)
+
 
 @pytest.fixture(scope="module")
 def encoder():
@@ -62,7 +80,7 @@ def ckpt(tmp_path_factory, encoder):
 
 
 def _index(lengths):
-    return [{"uid": f"ep{i}", "tar": "shard.tar", "length": n}
+    return [{"uid": f"ep{i}", "tar": "shard.tar", "family": "boss", "length": n}
             for i, n in enumerate(lengths)]
 
 
@@ -183,3 +201,123 @@ def test_fingerprint_is_the_file_hash(ckpt, tmp_path):
     import hashlib
     expected = hashlib.sha256(open(ckpt, "rb").read()).hexdigest()
     assert encoder_fingerprint(ckpt) == expected
+
+
+# ── the cached training path ─────────────────────────────────────────────────
+
+def test_cached_dataset_reproduces_the_action_shift(cache):
+    """frames[j] is the state AFTER actions[j], so its target is actions[j+1].
+
+    Pins the copy of that convention in CachedEpisodeDataset against the raw array. If
+    the two ever drift, a cached run trains on inverse dynamics and still looks healthy.
+    """
+    out, lengths, _ = cache
+    tc = TokenCache(out)
+    ds = CachedEpisodeDataset(tc, ["ep2"])
+    item = ds[0]
+    raw = tc.raw_actions("ep2")
+    n = int(item["mask"].sum())
+    assert n == lengths[2] - 1                      # last frame has no action FROM it
+    assert np.array_equal(item["action"][:n].numpy(), raw[1:1 + n])
+    assert item["tokens"].shape == (lengths[2] - 1, DIM)
+    assert item["tokens"].dtype == torch.float32    # fp32: see forward_tokens' docstring
+
+
+def test_padded_steps_carry_no_supervision(cache):
+    """A short episode padded into a batch must contribute zero gradient."""
+    from contra_policy.dataset import pad_episodes
+    out, lengths, _ = cache
+    ds = CachedEpisodeDataset(TokenCache(out), ["ep3", "ep2"])      # lengths 3 and 12
+    batch = pad_episodes([ds[0], ds[1]])
+    assert batch["tokens"].shape[1] == lengths[2] - 1               # padded to the longer
+    short, long = batch["mask"][0], batch["mask"][1]
+    assert short[:lengths[3] - 1].sum() == lengths[3] - 1
+    assert short[lengths[3] - 1:].sum() == 0
+    pad = batch["tokens"][0, lengths[3] - 1:]
+    assert torch.equal(pad, torch.zeros_like(pad))
+    assert long.sum() == lengths[2] - 1
+    assert batch["seq_len"].tolist() == [lengths[3] - 1, lengths[2] - 1]
+
+
+def test_a_length_one_episode_is_rejected_exactly_as_the_live_loader_rejects_it(cache):
+    """T = max(1, L-1) = 1 but n = min(T, L-1) = 0: nothing to supervise.
+
+    `ContraCrossViewDataset.__getitem__` asserts on this too. Pinned so the cached path
+    cannot start quietly tolerating an episode the live path refuses — real episodes run
+    24-1038 decisions, so hitting this means the index is wrong, not the data.
+    """
+    out, _, _ = cache
+    ds = CachedEpisodeDataset(TokenCache(out), ["ep1"])
+    with pytest.raises(AssertionError, match="no supervisable step"):
+        ds[0]
+
+
+def test_forward_tokens_equals_forward_on_the_same_pixels(encoder):
+    """The two model entry points must agree, or the cache changes the model."""
+    from contra_policy.model import PolicyConfig, build_policy
+
+    torch.manual_seed(0)
+    policy = build_policy(PolicyConfig(
+        core={"d_model": DIM, "n_layer": 2, "n_head": 4, "n_kv_head": 4, "context": 64},
+        encoder_ckpt=None, encoder=dict(image_size=S, hiddim=DIM, depth=4, minres=4,
+                                        proj_ch=16, aux_size=8, head_depth=8),
+        freeze_encoder=True, value_head=False, aux_size=0)).eval()
+
+    rng = np.random.default_rng(0)
+    images = torch.from_numpy(rng.integers(0, 256, (2, 6, S, S, 3), dtype=np.uint8))
+    goal = torch.from_numpy(rng.integers(0, 256, (2, S, S, 3), dtype=np.uint8))
+    inter = torch.tensor([0, 1])
+
+    with torch.no_grad():
+        live = policy(images, goal, inter)["pi_logits"]
+        tokens = policy.encode_images(images)
+        goal_tok = policy.encode_images(goal.unsqueeze(1)).squeeze(1)
+        cached = policy.forward_tokens(tokens, goal_tok, inter)["pi_logits"]
+    assert torch.equal(live, cached)
+
+
+RELEASE = os.path.expanduser(
+    "~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json")
+VAL_SHA = "29fd40177d9277931d1a115d8a36171c7eacc1a02c17cf1a4f7093ac94cc9ae0"
+VAL_CACHE = "cache/tokens/spread10k-val"
+
+
+@pytest.mark.skipif(not (os.path.exists(RELEASE) and os.path.isdir(VAL_CACHE)),
+                    reason="needs boss-spread-10k-v1 and its built val cache")
+def test_cached_batch_matches_the_live_loader():
+    """The equivalence the whole cached path rests on, on real shards.
+
+    The synthetic tests above pin layout and keying; this one pins that a cached batch
+    *is* a live batch — same targets, same mask, same padding, same loss. Everything
+    discrete must be bit-identical; only the tokens may differ, and only by fp16.
+    """
+    from contra_policy.dataset import (ContraCrossViewDataset, load_or_build_index,
+                                       pad_episodes, scaling_release)
+    idx = load_or_build_index(scaling_release(RELEASE, 1, VAL_SHA)["val"],
+                              cache_dir="cache")[:8]
+    live = ContraCrossViewDataset(idx, whole_episode=True, image_size=256, aux_size=0,
+                                  prev_action_keep_prob=0.0, seed=0)
+    cached = CachedEpisodeDataset(TokenCache(VAL_CACHE, image_size=256),
+                                  [e["uid"] for e in idx])
+
+    lb = pad_episodes([live[i] for i in range(len(idx))])
+    cb = pad_episodes([cached[i] for i in range(len(idx))])
+
+    assert torch.equal(lb["action"], cb["action"])
+    assert torch.equal(lb["mask"], cb["mask"])
+    assert torch.equal(lb["seq_len"], cb["seq_len"])
+    assert torch.equal(lb["family"], cb["family"])
+    assert torch.equal(lb["cross_view"]["cross_view_obj_id"], cb["interaction"])
+    assert lb["image"].shape[:2] == cb["tokens"].shape[:2]
+
+
+def test_forward_tokens_rejects_a_sequence_over_context(encoder):
+    from contra_policy.model import PolicyConfig, build_policy
+    policy = build_policy(PolicyConfig(
+        core={"d_model": DIM, "n_layer": 1, "n_head": 4, "n_kv_head": 4, "context": 8},
+        encoder_ckpt=None, encoder=dict(image_size=S, hiddim=DIM, depth=4, minres=4,
+                                        proj_ch=16, aux_size=8, head_depth=8),
+        freeze_encoder=True, value_head=False, aux_size=0)).eval()
+    with pytest.raises(ValueError, match="context"):
+        policy.forward_tokens(torch.zeros(1, 16, DIM), torch.zeros(1, DIM),
+                              torch.tensor([0]))

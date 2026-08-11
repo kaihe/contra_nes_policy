@@ -16,11 +16,21 @@ This module computes it once and memmaps the answer. See ``doc/0013-scaling-grid
 Layout, written by :func:`build_token_cache`::
 
     <dir>/tokens.npy     (rows, 512) float16, memmapped
+    <dir>/actions.npy    (total_steps,) int64 — raw action indices, memmapped
     <dir>/meta.json      {version, encoder_sha256, image_size, dim, dtype, episodes: […]}
 
-One episode occupies ``T + 1`` contiguous rows starting at its ``offset``: **row 0 is the
-goal-frame token**, rows ``1 … T`` are the frame tokens in decision order. Keeping the
-goal adjacent means a batch touches one slice per episode rather than two.
+One episode occupies ``T + 1`` contiguous rows of ``tokens.npy`` starting at its ``offset``:
+**row 0 is the goal-frame token**, rows ``1 … T`` are the frame tokens in decision order.
+Keeping the goal adjacent means a batch touches one slice per episode rather than two.
+
+``actions.npy`` holds each episode's *raw, unshifted* action indices, and ``meta`` carries
+its interaction id and family. With those, :class:`CachedEpisodeDataset` reads **nothing but
+this directory** — no tar, no PyAV, no cv2 — which is what lets ``num_workers`` go to 0.
+They cost 8 MB against the tokens' 800 MB, and the alternative is parsing a 19 KB episode
+JSON 320,000 times a run to recover one integer. The shift that turns raw actions into BC
+targets is deliberately *not* baked in: it lives in one place
+(``ContraCrossViewDataset.__getitem__``) and is reproduced against that, so a cached run and
+a live run cannot disagree about which action a frame is supervised with.
 
 **Storage is float16, and that is not the same choice as the model's compute dtype.**
 ``ContraFrameEncoder.encode`` ends in a ``LayerNorm``, which ``torch.autocast`` promotes to
@@ -47,18 +57,23 @@ see frames no cache has ever met.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 
 #: Bumped when the on-disk layout changes in a way that makes old caches unreadable.
-CACHE_VERSION = 1
+#: v2 added ``actions.npy`` and the per-episode interaction/family, which is what let the
+#: cached training path drop its tar dependency entirely.
+CACHE_VERSION = 2
 
 _META = "meta.json"
 _TOKENS = "tokens.npy"
+_ACTIONS = "actions.npy"
 _DTYPE = np.float16
 
 
@@ -95,8 +110,10 @@ class TokenCache:
         self._check("image_size", image_size)
 
         self.dim = int(self.meta["dim"])
-        self._by_uid: Dict[str, dict] = {e["uid"]: e for e in self.meta["episodes"]}
+        self.episodes: List[dict] = list(self.meta["episodes"])
+        self._by_uid: Dict[str, dict] = {e["uid"]: e for e in self.episodes}
         self._tokens: Optional[np.ndarray] = None      # opened lazily, see `tokens`
+        self._actions: Optional[np.ndarray] = None
 
     def _check(self, field: str, expected) -> None:
         if expected is None:
@@ -113,6 +130,29 @@ class TokenCache:
         if self._tokens is None:
             self._tokens = np.load(os.path.join(self.path, _TOKENS), mmap_mode="r")
         return self._tokens
+
+    @property
+    def actions(self) -> np.ndarray:
+        """Flat int64 memmap of raw, unshifted action indices."""
+        if self._actions is None:
+            self._actions = np.load(os.path.join(self.path, _ACTIONS), mmap_mode="r")
+        return self._actions
+
+    def raw_actions(self, uid: str) -> np.ndarray:
+        """``(L,)`` — the episode's action indices exactly as ``actions.npy`` recorded them.
+
+        Unshifted on purpose: see the module docstring. ``L`` is the episode's declared
+        length, which may exceed the number of frames that decoded.
+        """
+        ep = self._by_uid[uid]
+        base, n = int(ep["action_offset"]), int(ep["action_len"])
+        return np.asarray(self.actions[base:base + n])
+
+    def interaction(self, uid: str) -> int:
+        return int(self._by_uid[uid]["interaction"])
+
+    def family(self, uid: str) -> str:
+        return str(self._by_uid[uid]["family"])
 
     def __contains__(self, uid: str) -> bool:
         return uid in self._by_uid
@@ -145,6 +185,65 @@ class TokenCache:
         return np.asarray(self.tokens[base + start:base + stop])
 
 
+class CachedEpisodeDataset(Dataset):
+    """Whole-episode items read entirely from a :class:`TokenCache`.
+
+    Emits the same keys the action-only BC path consumes — ``tokens``, ``goal_token``,
+    ``action``, ``mask``, ``family``, ``interaction`` — so it drops into
+    :func:`~contra_policy.dataset.pad_episodes` and
+    :meth:`~contra_policy.model.ContraPolicy.forward_tokens` unchanged. It carries no
+    ``image``, and that is the point: nothing here opens a tar or a codec.
+
+    **The alignment below is copied from** ``ContraCrossViewDataset.__getitem__`` **and
+    pinned to it by test.** ``frames[j]`` is the state *after* ``actions[j]``, so the target
+    for ``frames[j]`` is ``actions[j + 1]`` — pairing them directly would ask the model to
+    do inverse dynamics (read the muzzle flash, answer "fire"), which is a causal leak and
+    off-distribution at rollout. If that convention ever changes, both sites move together
+    or ``test_cached_batch_matches_the_live_loader`` fails.
+    """
+
+    def __init__(self, cache: TokenCache, uids: Optional[Sequence[str]] = None):
+        self.cache = cache
+        self.uids = list(uids) if uids is not None else [e["uid"] for e in cache.episodes]
+        # -1 because the last frame of an episode has no action taken *from* it.
+        self.lengths = [max(1, cache.length(u) - 1) for u in self.uids]
+
+    def __len__(self) -> int:
+        return len(self.uids)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        from contra_policy.dataset import FAMILIES        # local: avoids a cycle
+
+        uid = self.uids[idx]
+        raw = self.cache.raw_actions(uid)
+        T = self.lengths[idx]
+        tokens = self.cache.frames(uid, 0, T)
+        n = int(min(T, len(tokens), len(raw) - 1))
+        assert n > 0, f"{uid} has no supervisable step (length={self.cache.length(uid)})"
+
+        tok = np.zeros((T, self.cache.dim), dtype=np.float32)
+        tok[:n] = tokens[:n]
+        act = np.zeros(T, dtype=np.int64)
+        act[:n] = raw[1:1 + n]
+        mask = np.zeros(T, dtype=np.float32)
+        mask[:n] = 1.0
+
+        return {
+            # float32, matching the live path exactly: `encode()` ends in a LayerNorm,
+            # which autocast promotes to fp32, so a live frame token reaches the core as
+            # fp32. Handing it fp16 here would also break `torch.cat` against the fp32
+            # interaction embedding.
+            "tokens": torch.from_numpy(tok),
+            "goal_token": torch.from_numpy(
+                self.cache.goal(uid).astype(np.float32)),
+            "action": torch.from_numpy(act),
+            "mask": torch.from_numpy(mask),
+            "interaction": torch.tensor(self.cache.interaction(uid), dtype=torch.int64),
+            "family": torch.tensor(FAMILIES.index(self.cache.family(uid)),
+                                   dtype=torch.int64),
+        }
+
+
 def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
                       encoder_ckpt: str, image_size: int = 256,
                       dataset=None, device: str = "cuda", chunk: int = 256,
@@ -159,7 +258,9 @@ def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
     Writes to a temporary directory and renames on success, so an interrupted build leaves
     no half-cache that a later run would trust.
     """
-    from contra_policy.dataset import ContraCrossViewDataset       # local: avoids a cycle
+    from contra_policy.action_space import vectors_to_indices    # local: avoids a cycle
+    from contra_policy.dataset import ContraCrossViewDataset
+    from contra_policy.goal import interaction_id
 
     out_dir = os.path.expanduser(out_dir)
     if dataset is None:
@@ -179,7 +280,8 @@ def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
           f"→ {rows} rows x {dim} @ fp16 = {rows * dim * 2 / 1e9:.2f} GB")
 
     episodes: List[dict] = []
-    cursor = 0
+    actions: List[np.ndarray] = []
+    cursor = action_cursor = 0
     for i, ep in enumerate(index):
         T = int(ep["length"])
         goal = dataset.goal_image(ep)                       # (S, S, 3) uint8
@@ -196,11 +298,22 @@ def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
                 for j in range(0, len(batch), chunk)]).float().cpu().numpy()
         tokens[cursor:cursor + len(tok)] = tok.astype(_DTYPE)
 
-        episodes.append({"uid": ep["uid"], "tar": ep["tar"],
-                         "offset": cursor, "length": got})
+        act = vectors_to_indices(
+            np.load(io.BytesIO(dataset._read(ep, "actions.npy")))).astype(np.int64)
+        meta_json = json.loads(dataset._read(ep, "json"))
+        actions.append(act)
+
+        episodes.append({"uid": ep["uid"], "tar": ep["tar"], "family": ep["family"],
+                         "offset": cursor, "length": got,
+                         "action_offset": action_cursor, "action_len": int(len(act)),
+                         "interaction": int(interaction_id(meta_json))})
         cursor += got + 1
+        action_cursor += len(act)
         if log_every and (i + 1) % log_every == 0:
             print(f"[token_cache] {i + 1}/{len(index)} episodes", flush=True)
+
+    np.save(os.path.join(staging, _ACTIONS),
+            np.concatenate(actions) if actions else np.zeros(0, dtype=np.int64))
 
     tokens.flush()
     del tokens
@@ -224,6 +337,7 @@ def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
             "dim": dim,
             "dtype": np.dtype(_DTYPE).name,
             "rows": int(cursor),
+            "action_steps": int(action_cursor),
             "episodes": episodes}
     with open(os.path.join(staging, _META), "w") as fh:
         json.dump(meta, fh)

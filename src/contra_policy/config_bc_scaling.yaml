@@ -1,0 +1,66 @@
+# The 0013 scaling grid: boss-only, Spread-only, on precomputed encoder tokens.
+#
+#   python -m contra_policy.train_bc --config-name config_bc_scaling
+#   python -m contra_policy.train_bc --config-name config_bc_scaling \
+#       boss_scaling.shard_count=4 policy.core.d_model=768 policy.core.n_layer=6
+#
+# Differences from `config_bc.yaml`, all of them deliberate and all in doc/0013:
+#
+#   families: [boss]   the release is generated-only Spread boss with zero baseline
+#                      episodes, so a four-family mixture would fill its boss slot from a
+#                      different distribution than its own validation set (§3)
+#   family_draws: {}   0009's control holds the boss share of a *mixture* constant; there
+#                      is no mixture here, and at 666 draws/cycle it would cover 19% of a
+#                      40k release and cap the very axis this measures (§2.2)
+#   batch_size: 16     Spread episodes average 77.8 frames against the mixed set's ~103,
+#                      so batch 4 is only ~312 tokens/step
+#   token_cache        the encoder is 97% of a step and its output never changes (§2.3)
+#
+# The M cell here is NOT comparable to 0009/0010's 12.86M runs — different data, mixture
+# and batch. The anchor for this document is M at D13, trained under this file.
+defaults:
+  - config_bc
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/scaling/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+families: [boss]
+
+# Read exact cumulative membership from the release contract; `shard_count` is the data
+# cell (1, 2, 4, 8 or 13 — note 13, not 16, so plot against log2(frames)).
+boss_scaling:
+  enabled: true
+  manifest: ~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json
+  shard_count: 13
+  validation_sha256: 29fd40177d9277931d1a115d8a36171c7eacc1a02c17cf1a4f7093ac94cc9ae0
+
+# Built by tools/build_token_cache.py, one per (release prefix, split). Startup asserts
+# each cache's encoder sha256 against `policy.encoder_ckpt`.
+token_cache:
+  train: ${hydra:runtime.cwd}/cache/tokens/spread10k-d13
+  val: ${hydra:runtime.cwd}/cache/tokens/spread10k-val
+
+loader:
+  batch_size: 16
+  # No decode and no codec on this path, so workers buy nothing and cost RAM on a 20 GB
+  # WSL box. The memmap is read in the main process.
+  num_workers: 0
+  family_draws: {}
+
+policy:
+  value_head: false
+  aux_size: 0
+  freeze_encoder: true      # required by token_cache, and asserted at startup
+  core:
+    n_layer: 4              # the M cell; the ladder overrides d_model/n_layer/n_head
+    n_head: 8
+    n_kv_head: 8
+    context: 1024
+    dropout: 0.2            # 0010's best cell
+
+train:
+  steps: 20000
+  learning_rate: 3.0e-4     # swept per model size before the grid — see doc/0013 §2.2
+  save_steps: [3000, 10000]
