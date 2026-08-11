@@ -256,7 +256,9 @@ class BCTrainer:
         return 1.0
 
     def _loader(self, ds, lengths, shuffle: bool) -> DataLoader:
-        family_draws = dict(self.args.loader.get("family_draws", {}))
+        # `or {}` because a boss-only config disables the schedule with `family_draws: null`
+        # — OmegaConf merges mappings, so `{}` would silently inherit the parent's.
+        family_draws = dict(self.args.loader.get("family_draws", {}) or {})
         if shuffle and family_draws:
             batch_sampler = FixedFamilyBatchSampler(
                 self.train_index, lengths, int(self.args.loader.batch_size),

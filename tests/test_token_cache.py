@@ -321,3 +321,25 @@ def test_forward_tokens_rejects_a_sequence_over_context(encoder):
     with pytest.raises(ValueError, match="context"):
         policy.forward_tokens(torch.zeros(1, 16, DIM), torch.zeros(1, DIM),
                               torch.tensor([0]))
+
+
+# ── the boss-only scaling config ─────────────────────────────────────────────
+
+def test_scaling_config_actually_disables_the_family_schedule():
+    """OmegaConf merges mappings, so `family_draws: {}` would inherit the parent's.
+
+    That inheritance is invisible in the YAML and only surfaces as "fixed-family schedule
+    has no episodes for ['kill', 'item', 'traverse']" once a boss-only index is built —
+    after the cache, the model and the release checks have all already been paid for.
+    """
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_scaling")
+    assert cfg.loader.family_draws is None
+    assert list(cfg.families) == ["boss"]
+    assert cfg.loader.batch_size == 16
+    assert cfg.loader.num_workers == 0
+    assert cfg.policy.freeze_encoder is True      # token_cache requires it
+    assert cfg.boss_scaling.shard_count == 13
+    assert dict(cfg.loader.family_draws or {}) == {}

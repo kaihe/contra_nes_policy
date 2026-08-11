@@ -47,7 +47,10 @@ loader:
   # No decode and no codec on this path, so workers buy nothing and cost RAM on a 20 GB
   # WSL box. The memmap is read in the main process.
   num_workers: 0
-  family_draws: {}
+  # `null`, not `{}`: OmegaConf *merges* mappings, so an empty dict inherits the parent's
+  # {kill, item, traverse, boss} schedule verbatim and the sampler then demands families a
+  # boss-only index has none of. null replaces, and `_loader` reads it as "no schedule".
+  family_draws: null
 
 policy:
   value_head: false
