@@ -190,10 +190,13 @@ encoder becomes the primary suspect for the first time.
 
 ## 6. Sequencing
 
-1. ~~**Token cache**~~ — **built.** `token_cache.py`, `tools/build_token_cache.py`, 11 tests.
-   Verified against a live encoder on the real val shard at 1.946e-3 max error. Still owed:
-   report the cached-vs-uncached training ratio on `contra_nes_data#6`, which is blocked on it
-   and on policy publishing `encoder-final.pt` (sha `f36041bc…1923c`; `runs/` is gitignored).
+1. ~~**Token cache**~~ — **built, and D13 is cached.** `token_cache.py`,
+   `tools/build_token_cache.py`, 11 tests. 9,900 episodes / 770,679 frames in **7.7 min →
+   0.80 GB**, both gates met (<15 min, ≤1 GB); episode and frame counts match the manifest
+   exactly, and 15 random episodes agree with a live encoder to **1.939e-3**. Still owed: the
+   cached-vs-uncached training ratio, which needs step 3's config and is what
+   `contra_nes_data#6` is blocked on — along with policy publishing `encoder-final.pt`
+   (sha `f36041bc…1923c`; `runs/` is gitignored).
 2. **In-projection** (§2.1) + the state-dict-identity test. Gate: `pytest tests/ -q` green, an
    existing checkpoint loads unchanged.
 3. **Boss-only config.** Gate: a 100-step D1 smoke run reproduces manifest episode counts exactly.
