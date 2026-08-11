@@ -89,17 +89,29 @@ class ContraPolicy(nn.Module):
                 p.requires_grad = False
             self.encoder.eval()
 
-        d = self.encoder.cfg.hiddim
-        core_cfg = CausalGPTConfig(**{**cfg.core, "d_model": d})
+        # The encoder's token width is fixed by stage A; the core's is the 0013 experiment
+        # variable. They were the same number until the model-size ladder needed d_core to
+        # move, and `{**cfg.core, "d_model": d_enc}` used to pin them together — silently,
+        # since the override came last, so `core.d_model=1024` was accepted and ignored.
+        d_enc = self.encoder.cfg.hiddim
+        d_core = int(cfg.core.get("d_model") or d_enc)
+        core_cfg = CausalGPTConfig(**{**cfg.core, "d_model": d_core})
         self.core = CausalGPT(core_cfg)
 
-        self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d)   # +1 for id -1
-        self.pi_head = nn.Linear(d, NUM_ACTIONS)
-        self.value_head = nn.Linear(d, 1) if cfg.value_head else None
+        # `nn.Identity` at d_core == d_enc carries **no parameters**, so every checkpoint
+        # trained before the ladder keeps its exact state-dict shape and the M cell stays
+        # bit-identical to the 0006/0009/0010 anchor. See doc/0013 §2.1.
+        self.in_proj = (nn.Identity() if d_core == d_enc
+                        else nn.Linear(d_enc, d_core, bias=False))
+
+        self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d_core)   # +1 for id -1
+        self.pi_head = nn.Linear(d_core, NUM_ACTIONS)
+        self.value_head = nn.Linear(d_core, 1) if cfg.value_head else None
         # Grounding lives here now, not in the encoder: predicting where the goal is
         # requires comparing this frame against the goal token, which is what attention
         # upstream has just done.
-        self.aux_head = nn.Linear(d, cfg.aux_size ** 2) if cfg.aux_size > 0 else None
+        self.aux_head = (nn.Linear(d_core, cfg.aux_size ** 2)
+                         if cfg.aux_size > 0 else None)
 
     @property
     def context(self) -> int:
@@ -159,9 +171,14 @@ class ContraPolicy(nn.Module):
     def _heads(self, frames: torch.Tensor, goal: torch.Tensor,
                interaction: torch.Tensor,
                attn_mask: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """The shared body: assemble ``[interaction, goal, frames…]``, run it, read heads."""
+        """The shared body: assemble ``[interaction, goal, frames…]``, run it, read heads.
+
+        ``frames``/``goal`` arrive at the *encoder's* width and are projected to the core's.
+        At the M cell that projection is an identity and costs nothing.
+        """
         b, t = frames.shape[:2]
-        inter = self.interaction(interaction + 1).unsqueeze(1)   # (B, 1, d)
+        frames, goal = self.in_proj(frames), self.in_proj(goal)
+        inter = self.interaction(interaction + 1).unsqueeze(1)   # (B, 1, d_core)
 
         h = self.core(torch.cat([inter, goal.unsqueeze(1), frames], dim=1),
                       attn_mask=attn_mask)

@@ -343,3 +343,53 @@ def test_scaling_config_actually_disables_the_family_schedule():
     assert cfg.policy.freeze_encoder is True      # token_cache requires it
     assert cfg.boss_scaling.shard_count == 13
     assert dict(cfg.loader.family_draws or {}) == {}
+
+
+# ── the model-size ladder (doc/0013 §2.1) ────────────────────────────────────
+
+LADDER = [("XS", 256, 2, 4), ("S", 384, 3, 6), ("M", 512, 4, 8),
+          ("L", 640, 5, 10), ("XL", 768, 6, 12), ("XXL", 1024, 8, 16)]
+
+
+def _policy(d, n_layer, n_head):
+    from contra_policy.model import PolicyConfig, build_policy
+    return build_policy(PolicyConfig(
+        core=dict(d_model=d, n_layer=n_layer, n_head=n_head, n_kv_head=n_head,
+                  context=64),
+        encoder_ckpt=None, encoder=dict(image_size=S, hiddim=DIM, depth=4, minres=4,
+                                        proj_ch=16, aux_size=8, head_depth=8),
+        freeze_encoder=True, value_head=False, aux_size=0))
+
+
+@pytest.mark.parametrize("name,d,n_layer,n_head", LADDER)
+def test_every_ladder_cell_is_expressible_and_runs(name, d, n_layer, n_head):
+    """`core.d_model` used to be silently overridden to the encoder's 512.
+
+    That is the worst kind of bug for a scaling sweep: L/XL/XXL would all have trained
+    at d=512 with only depth varying, every run would have succeeded, and the resulting
+    flat curve would have looked like a finding.
+    """
+    pol = _policy(d, n_layer, n_head).eval()
+    assert pol.core.cfg.d_model == d, "d_model must not be pinned to the encoder width"
+    assert d // n_head == 64, "the ladder holds head_dim at 64"
+    with torch.no_grad():
+        out = pol.forward_tokens(torch.zeros(2, 5, DIM), torch.zeros(2, DIM),
+                                 torch.tensor([0, 1]))
+    from contra_policy.action_space import NUM_ACTIONS
+    assert out["pi_logits"].shape == (2, 5, NUM_ACTIONS)
+
+
+def test_the_M_cell_adds_no_parameters_and_keeps_its_state_dict():
+    """d_core == d_enc must stay bit-compatible with every pre-ladder checkpoint."""
+    import torch.nn as nn
+    m = _policy(DIM, 4, 8)
+    assert isinstance(m.in_proj, nn.Identity)
+    assert sum(p.numel() for p in m.in_proj.parameters()) == 0
+    assert not [k for k in m.state_dict() if k.startswith("in_proj")]
+
+
+def test_a_wider_core_projects_rather_than_truncating():
+    import torch.nn as nn
+    m = _policy(1024, 8, 16)
+    assert isinstance(m.in_proj, nn.Linear)
+    assert m.in_proj.weight.shape == (1024, DIM) and m.in_proj.bias is None
