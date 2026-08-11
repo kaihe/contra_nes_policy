@@ -1,151 +1,65 @@
-# Scale the core, not just the data: a 6x5 boss-only Spread grid on cached encoder tokens
+# Scale the core and the data: a 6x5 boss-only Spread grid
 
 Status: Proposed
 Supersedes: —
-Depends on: [0009](0009-boss-data-scaling.md) (the flat mixed-v2 data curve this
-re-runs at 15x the boss data), [0010](0010-dropout-regularization.md) (which **rejected**
-model scaling — §1 says why that rejection expires), [0012](0012-spread-grpo.md) (the
-Spread-only scope this inherits)
+Depends on: [0009](0009-boss-data-scaling.md) (flat data curve at 2,500 episodes),
+[0010](0010-dropout-regularization.md) (rejected model scaling at 666), [0012](0012-spread-grpo.md) (Spread-only scope)
 
-**Question.** Boss has sat at 7–11% success through four BC data scales, a dropout sweep,
-sparse GRPO, graded GRPO and — as of eval [0014](../../contra_nes_evaluation/doc/0014-spread-specialty-boss-grpo.md)
-— Spread-only binary-reward GRPO, which finished at **9.5%, exactly its init**. The
-optimizer has now been eliminated. Data has been eliminated at the 2,500-episode scale.
-That leaves **capacity** and **more data than has ever been tried**, and a 9,900-episode
-Spread release just landed. Which one moves?
+**Question.** GRPO is now eliminated — eval [0014](../../contra_nes_evaluation/doc/0014-spread-specialty-boss-grpo.md)
+finished at 9.5%, exactly its init. Data was eliminated at 2,500 boss episodes
+([0009](0009-boss-data-scaling.md)). A 9,900-episode Spread release just landed. Is the
+bottleneck capacity, or data beyond that scale?
 
-**Answer.** Run both axes as one grid, boss-only and Spread-only, on **cached frozen-encoder
-tokens**. Six core sizes spanning **1.6M → 101M** parameters (0.14x to 7.9x the current
-12.85M) crossed with the five nested data prefixes already in the release
-(**762 → 9,900** episodes). The cache is what makes this affordable. The shards store
-**lossless MKV video**, not features, so every step pays a PyAV decode *and* a frozen
-encoder forward before the core sees a token — together **~97% of a boss-only step**, of
-which the core at 12.85M is 8.5 ms. Precomputing 790 MB of bf16 tokens **once, in about
-five minutes** turns a **~1.6-hour** cell into a **3–14 minute** one: the 30-cell grid goes
-from ~50 GPU-hours to **~3**, and the full 3-seed version fits in ~9. Model scaling here was
-never expensive — it was never measured.
+**Answer.** One grid: **6 core sizes (1.6M–101M)** x the **5 nested prefixes already in
+`boss-spread-10k-v1` (762–9,900 episodes)**, boss-only. Cache the frozen encoder's tokens
+first — preprocessing is 97% of a step, so caching turns ~50 GPU-hours into ~3, which is
+what buys a grid instead of a line.
 
-**This doc predicts the model axis is flat and says so before running it** (§4). 0010
-measured train CE at 0.051 with 666 boss episodes: a variance problem, not a capacity
-problem. The premise that expires is the *data* half — at 9,900 episodes the memorization
-headroom is 15x larger, and a capacity claim made at 666 episodes does not carry. If the
-model axis is flat at 9,900 too, that is a real result and it points at the frozen encoder,
-not the core.
-
-**The binding caveat, stated once and carried into every table:** all 9,900 traces share
-**one source emulator state** (`win_level1_20260701015306_i371`), and the 100-task
-validation split is a holdout *from that same state*. This is narrower than `boss-pure-v1`,
-which 0009 already labelled fixed-start/OOD at four states. A curve read only on the
-100-task holdout measures how fast each cell memorizes one boss encounter. The
-**57-task mixed-v2 boss validation is therefore co-primary**, not a footnote — see §2.4.
+**Caveat governing every table below.** All 9,900 traces share **one start state**
+(`…_i371`) and validation is a holdout from it, so the **57-task mixed-v2 boss set is
+co-primary**.
 
 ---
 
-## 1. Why — the evidence
+## 1. Why
 
-### Everything except capacity and data-beyond-2,500 has now been eliminated
+Everything but capacity and data-past-2,500 has been eliminated:
 
-| what was tried | where | boss result |
+| tried | where | boss result |
 |---|---|---|
-| BC at 4 boss data scales (58k → 464k frames) | [0009](0009-boss-data-scaling.md) | flat, ~90% death at every scale |
-| dropout 0.0–0.3 | [0010](0010-dropout-regularization.md) | best cell +3.5 pp pooled, boss unmoved |
-| sparse GRPO | [0004](0004-grpo-experiment-plan.md) | 3.5% → 10.5% |
-| graded GRPO, 10 h / 1,619 updates | [0011](0011-boss-grpo.md) | collapse; held-out 7.5/11.0/7.5% vs 8.5% init |
-| **binary GRPO, Spread + rapid only** | [0012](0012-spread-grpo.md) / eval 0014 | **9.5% = init, exactly.** McNemar p = 1.0 |
+| BC, 4 data scales (58k → 464k frames) | [0009](0009-boss-data-scaling.md) | flat, ~90% death at every scale |
+| dropout 0.0–0.3 | [0010](0010-dropout-regularization.md) | boss unmoved |
+| sparse / graded GRPO | [0004](0004-grpo-experiment-plan.md), [0011](0011-boss-grpo.md) | 10.5%, then collapse |
+| **binary GRPO, Spread + rapid** | [0012](0012-spread-grpo.md) / eval 0014 | **9.5% = init.** McNemar p = 1.0 |
 
-0012 was built as the decisive optimizer test: *"if boss does not move here, it will not
-move anywhere, and the bottleneck is the policy or the representation."* It did not move.
-That sentence is now a standing instruction, and this doc executes it.
+Model size was never priced. Per frame on the 4090, batch 16 x 78 = 1,248 frames:
 
-### Model scaling costs almost nothing, which is why nobody noticed it was untested
-
-Three legs, measured on the 4090 laptop (16 GB) and normalized per frame, then costed for
-this doc's boss-only batch of **16 x 78 = 1,248** frames:
-
-| leg | per frame | per batch | where |
-|---|---:|---:|---|
-| tar read → PyAV decode → cv2 resize, 2 workers | 0.33 ms | **209 ms** | CPU, `dataset.py:259-300` |
-| frozen encoder forward (chunk 256) | 0.229 ms | **286 ms** | GPU |
-| core fwd+bwd+opt @ 12.85M (d512 L4) | — | **8.5 ms** | GPU |
-| core fwd+bwd+opt @ 101M (d1024 L8) | — | 40.5 ms | GPU |
-| core fwd+bwd+opt @ 198M (d1280 L10) | — | 79.7 ms | GPU |
-
-The two preprocessing legs overlap (workers prefetch), so a step is GPU-bound at ~295 ms and
-the **core is 2.9% of it**. Even at 101M the core is 12%. Going 12.85M → 101M costs **+11%
-wall clock for 7.9x the parameters** — which is the whole reason this axis was never priced:
-the 12.85M core inherited VPT's 4x512 shape in [0002](0002-gpt-policy.md), and nothing since
-has had a reason to question it.
-
-The same arithmetic says the *right* engineering move is to delete both preprocessing legs
-from the inner loop. The encoder is frozen (`freeze_encoder: true`), and the loader applies
-**no pixel augmentation** — every frame maps to exactly one deterministic 512-d token,
-forever. Uncached, a cell is **~1.6 h** and the grid is ~50 GPU-hours; cached, a cell is
-**3–14 min** and the grid is ~3. The cache also drops `num_workers` to 0, which retires the
-loader's share of the 20 GB WSL ceiling.
-
-### The regime, in tokens per parameter
-
-| release | episodes | decision frames | frames/param @ 12.85M |
-|---|---:|---:|---:|
-| mixed-v2 D8 (0009's largest) | 2,500 | 464,019 | 0.036 |
-| **boss-spread-10k-v1** | 9,900 | 770,679 | 0.060 |
-| projected 20k | 19,900 | ~1.55M | 0.121 |
-| projected 40k | 39,900 | ~3.11M | 0.242 |
-
-"20k"/"40k" name **candidate traces**, as `boss-spread-10k-v1` does (`candidate_episodes:
-10000` → 100 validation + 9,900 train). Validation is fixed at 100 tasks *per release* by
-the data-repo scaling contract, so a 40k snapshot is 39,900 training episodes — not 4 x
-9,900. Frames are projected at this release's **77.85 frames/episode**, which holds only
-while later snapshots stay Spread-from-`i371`; §2.5 asks for the opposite, and a
-multi-start-state release would move that constant (0012 measured expert fight length
-varying 3.2x across weapons). Treat the frame column as ±20%, and the conclusion below as
-robust to that because it is an order-of-magnitude argument.
-
-Chinchilla's compute-optimal ratio is ~20 tokens/parameter. Even at 40k traces this project
-is **~80x over-parameterized** at the *current* size. That is the quantitative reason §4
-predicts the model axis is flat, and the reason the data axis is predicted to be the live
-one. It is also why the ladder goes **down** as well as up: if 12.85M is already past
-saturation, the interesting number is where the curve stops being flat below it.
-
-## 2. The design
-
-### 2.1 The cache
-
-One offline pass writes, per episode, a `(T+1, 512)` bf16 array — `T` frame tokens plus the
-one goal-frame token — keyed by episode uid, alongside actions and lengths. Sizes:
-
-| release | frames | cache (bf16) |
+| leg | per frame | per batch |
 |---|---:|---:|
-| boss-spread-10k-v1 | 770,679 | **790 MB** |
-| projected 40k | ~3.08M | ~3.2 GB |
+| PyAV decode (PNG-in-MKV, 240x224) | 0.192 ms | 123 ms |
+| cv2 resize → 256 | 0.097 ms | 62 ms |
+| **frozen encoder → 512-d token** | **0.229 ms** | **286 ms** |
+| trainable core @ 12.85M | — | 8.5 ms |
+| trainable core @ 101M | — | 40.5 ms |
 
-Stored as a memmapped `.npy` plus a uid → (offset, length) index, so the 20 GB WSL VM never
-holds more than a batch (see memory note in `doc/README.md` open questions). The cache key
-must include the **encoder checkpoint sha256** and `image_size`; a mismatch is a hard error,
-not a silent rebuild. Training reads tokens directly and skips `encode_images` entirely.
+CPU overlaps GPU, so a step is GPU-bound at ~295 ms and **the core is 2.9% of it** — 7.9x the
+parameters costs **+11% wall clock**. The 12.85M core inherited VPT's 4x512 shape in
+[0002](0002-gpt-policy.md) and nothing since has questioned it. The encoder is frozen with no
+pixel augmentation, so training re-encodes each frame identically 32x (D13) to 420x (D1);
+§2.3 caches that away.
 
-Build cost is ~2 min of CPU decode at 2 workers plus ~3 min of GPU encode, so the whole 10k
-release caches in **well under ten minutes** — one-off, against ~50 GPU-hours saved.
+**The regime.** 770,679 frames / 12.85M params = 0.060 frames per parameter against
+Chinchilla's ~20. Even a projected 40k release (39,900 episodes, ~3.1M frames, 0.242) leaves
+this ~80x over-parameterized — hence §4's flat prediction, and a ladder that goes **down** as
+well as up.
 
-This is a training-time optimization only. Closed-loop evaluation and GRPO still run the
-encoder live — they see frames the cache has never met.
+## 2. Design
 
-**Who should build it.** The cache is derived from a *policy*-repo artifact (the stage-A
-encoder checkpoint) applied to *data*-repo bytes, so it could live on either side. It is
-built here, and the request to ship it in the release instead is
-`kaihe/contra_nes_data#6`. The reason it is built here first and asked for second — and why
-the issue tells the data side that declining is a legitimate answer — is that §3 names
-"unfreeze the encoder" as the likely successor
-experiment, and a token sidecar in an immutable release is bound to one encoder forever.
-The ask is therefore for an **optional sidecar keyed by encoder sha, never a replacement for
-the video** — which only makes sense once this doc has shown the sidecar earns its bytes.
+### 2.1 The ladder
 
-### 2.2 The model ladder
+Constant head dim 64, aspect ratio d/L = 128, so width and depth scale together.
 
-Constant head dim 64, aspect ratio d/L = 128 held fixed so depth and width scale together
-and RoPE numerics are identical across cells.
-
-| cell | d_model | n_layer | n_head | core params | x current |
+| cell | d_model | n_layer | n_head | params | x current |
 |---|---:|---:|---:|---:|---:|
 | XS | 256 | 2 | 4 | 1.61M | 0.14x |
 | S | 384 | 3 | 6 | 5.31M | 0.43x |
@@ -154,27 +68,15 @@ and RoPE numerics are identical across cells.
 | XL | 768 | 6 | 12 | 42.48M | 3.34x |
 | XXL | 1024 | 8 | 16 | 101.20M | 7.92x |
 
-**The one architectural change.** `model.py:92` pins `d_model` to the encoder's `hiddim`,
-so no cell but M is currently expressible. Add an in-projection:
+`model.py:92` pins `d_model` to the encoder's `hiddim`, so only M is expressible today. Add
+`in_proj = nn.Linear(512, d_core, bias=False)`, or `nn.Identity()` when `d_core == 512` — no
+parameters at M, so every existing checkpoint keeps its state-dict shape. That equality is a
+test, not a hope.
 
-```python
-d_enc  = self.encoder.cfg.hiddim                    # 512, fixed by stage A
-d_core = int(cfg.core.get("d_model") or d_enc)      # the experiment variable
-self.in_proj = (nn.Identity() if d_core == d_enc
-                else nn.Linear(d_enc, d_core, bias=False))
-```
+### 2.2 Data cells and the fixed recipe
 
-applied to frame and goal tokens; `interaction`, `pi_head`, `value_head` and `aux_head`
-become `d_core`-wide. `nn.Identity()` at `d_core == 512` carries **no parameters**, so every
-existing checkpoint keeps its exact state-dict shape and the M cell stays bit-identical to
-the 0006/0009/0010 anchor. That equality is a test, not a hope
-(`test_identity_projection_preserves_state_dict`).
-
-### 2.3 Data cells and the fixed recipe
-
-Read from `boss-spread-10k-v1/manifest.json::train_scaling_prefixes` by `shard_count` —
-never by directory glob. Note the top cell is **13 shards, not 16**: 1.63x the 8-shard cell,
-not 2x. Plot against log2(frames), not cell index.
+Read by `shard_count` from `manifest.json::train_scaling_prefixes`, never by glob. The top
+cell is **13 shards, not 16** — plot against log2(frames).
 
 | cell | shards | episodes | frames | epochs @ 20k steps x batch 16 |
 |---|---:|---:|---:|---:|
@@ -184,148 +86,108 @@ not 2x. Plot against log2(frames), not cell index.
 | D8 | 8 | 6,093 | 474,297 | 52.5 |
 | D13 | 13 | 9,900 | 770,679 | 32.3 |
 
-Fixed across all 30 cells: `families: [boss]`, batch **16** episodes (raised from 4 — Spread
-episodes average **77.8** frames against the mixed set's ~103, so batch 4 is only ~312
-tokens/step), 20,000 steps, AdamW, cosine decay, 500 warmup, bf16, `aux_size: 0`,
-`value_head: false`, `dropout: 0.2` (0010's best cell), frozen stage-A encoder.
-Validation SHA-256 `29fd40177d9277931d1a115d8a36171c7eacc1a02c17cf1a4f7093ac94cc9ae0`
-asserted at startup. Checkpoints at steps 3,000, 10,000 and 20,000, fixed before looking.
+Fixed across all 30 cells: `families: [boss]`, batch **16** (Spread episodes average 77.8
+frames, so batch 4 is only ~312 tokens/step), 20,000 steps, AdamW, cosine, 500 warmup, bf16,
+`aux_size: 0`, `value_head: false`, `dropout: 0.2`, frozen stage-A encoder, validation SHA
+`29fd4017…cc9ae0` asserted at startup. Checkpoints at 3,000 / 10,000 / 20,000, fixed before
+looking.
 
-0009's `family_draws` control is **dropped, not broken**: it exists to hold the boss share
-of a four-family mixture constant, and there is no mixture here. Its failure mode is worth
-recording anyway — at 666 boss draws per cycle, a 20,000-step run touches 7,500 draws, which
-covers 76% of 9,900 episodes and would cover **19% of 40k**. The control that made 0009
-sound would have silently capped the data axis this doc exists to measure.
+**LR is swept, not inherited** — one LR across a 63x parameter span is the standard way to
+manufacture a false flat curve. `{1e-4, 3e-4, 1e-3}` per size at D13 for 3,000 steps, pick by
+train loss, then hold; 18 runs, ~15 min cached. Publish the six chosen LRs.
 
-**Learning rate is swept, not inherited.** A too-high LR at large width is the single most
-common way a model-size sweep manufactures a false flat curve. Before the grid, sweep
-`{1e-4, 3e-4, 1e-3}` per model size at D13 for 3,000 steps and pick by train loss; then hold
-that LR fixed for every data cell of that size. Publish the six chosen LRs. 18 short runs,
-~20 minutes total on the cache.
+0009's `family_draws` control is dropped — it holds the boss share of a *mixture* constant and
+there is no mixture here. Recorded because it could not have been kept anyway: at 666 boss
+draws per cycle it covers 76% of 9,900 episodes and **19% of 40k**, capping this very axis.
 
-### 2.4 Evaluation — two axes, and the second one is the real one
+### 2.3 The token cache
 
-Every checkpoint is read on both:
+One offline pass writes a `(T+1, 512)` bf16 array per episode (frames + goal token), memmapped
+with a uid → (offset, length) index: **790 MB** for the 10k release, built in under ten
+minutes, and `num_workers` drops to 0. The key **must** include the encoder checkpoint sha256
+and `image_size` — a mismatch is a hard error, never a silent rebuild. Training-time only;
+eval and GRPO still encode live.
 
-1. **In-distribution (100-task generated holdout).** Action CE plus closed-loop success on
-   the release's own holdout. Same start state as training. This axis will produce a clean
-   curve; a clean curve here is **not** evidence of a scaling law for play.
-2. **Transfer (57-task mixed-v2 boss validation,** SHA `1318…ecad`**).** Published starts,
-   all four weapons. Reported three ways: all 57; the **13 Spread+rapid** tasks 0012
-   identified as the specialty pool; and the 23 Regular/Flamethrower tasks that 0012 showed
-   are structurally unwinnable (expected 0.0%, included as a floor check, excluded from the
-   headline).
+Requested as an optional release sidecar on `kaihe/contra_nes_data#6`, but built here first
+and the issue says declining is fine: §3 names unfreezing the encoder as the likely successor,
+and a sidecar baked into an immutable release is bound to one encoder forever.
 
-The primary comparison is **transfer, Spread subset, D13 XXL vs D13 M**, paired by task uid
-with a task/seed bootstrap interval. The 846-task suite is **not** run: a boss-only Spread
-specialist cannot play kill/item/traverse, and reporting a pooled number for it would be
-meaningless. This is the price of the boss-only scope and it is paid knowingly.
+### 2.4 Evaluation — two axes
 
-**Checkpoint selection is by fixed step, never by validation CE.** 0010 measured the
-CE-optimal checkpoint playing **12.9 pp worse** than the overfit final, and killed every
-reweighting of CE as a proxy. CE is reported as a diagnostic and as the *memorization rate*
-signal the model axis is actually about; it selects nothing.
+**In-distribution** is the release's own 100-task holdout, same start state; a clean curve
+there is *not* evidence of a scaling law for play. **Transfer** is the 57-task mixed-v2 boss
+val (SHA `1318…ecad`), reported as all 57, the **13 Spread+rapid** tasks, and the 23
+Regular/Flamethrower tasks 0012 showed are unwinnable (floor check, out of the headline).
 
-Cost staging, because rollouts are the expensive half: CE on all 30 cells x 3 seeds; closed
-loop on the 6 model cells at D13, the 5 data cells at the selected size, and the D1/D13 x
-XS/XXL corners — 13 cells, seed 0. The two best cells are then re-run at seeds 1 and 2
-before any number is called a result.
+Primary comparison: **transfer / Spread subset, D13 XXL vs D13 M**, paired by task uid, 200
+draws with replacement as in eval 0014. The 846-task suite is not run — a boss-only specialist
+cannot play the other families, which is the price of this scope.
 
-### 2.5 The 20k and 40k extension
+**Selection is by fixed step, never validation CE**: 0010 measured the CE-optimal checkpoint
+playing 12.9 pp *worse* than the overfit final. CE is a diagnostic and the memorization-rate
+signal the model axis is about; it selects nothing.
 
-Predeclared here, blocked on data. `boss-spread-10k-v1` is the only release that exists;
-`contra_nes_data` [0003](../../contra_nes_data/doc/0003-incremental-spread-scaling.md)
-commits to further snapshots under the same contract. When they land, the data axis extends
-to 7 points (762 → 39,900 episodes) at the size selected by phase A, with **no recipe
-change**. The two new points are projections, not deliveries — nothing in §4 is gated on
-them, and if they never arrive the grid still resolves every prediction on the five cells
-that exist today.
+Staging: CE on all 30 cells x 3 seeds (~9 GPU-h); closed loop on 13 cells at seed 0 — the 6
+sizes at D13, the 5 data cells at the selected size, the D1/D13 x XS/XXL corners. Top two
+cells re-run at seeds 1 and 2 before any number is called a result.
 
-Three things must hold for the extension to be comparable, and they are requests on the data
-repo, not assumptions: the **same 100-task validation split**, the **same deterministic
-prefix scheme**, and — the one that matters most — **more than one source start state**.
-A 40k release that is still one state scales memorization, not competence. No handoff issue
-is filed yet; see §5 step 6.
+### 2.5 The 20k / 40k extension
 
-## 3. What was rejected
+Predeclared, blocked on data, gated on nothing — if the later snapshots never arrive, the five
+cells above still resolve every §4 prediction. When they land the axis extends to 7 points
+with no recipe change, provided they keep the same 100-task validation and prefix scheme and
+use **more than one start state**.
 
-**Depth-only scaling.** Free — no in-projection, no code change. Rejected because at fixed
-d=512 the ladder runs out at L=12 (38.5M) and gets there with aspect ratio 512/12 = 43,
-far off the ~128 that every reference decoder uses. A flat curve from a badly-shaped ladder
-is uninterpretable, and the projection costs 0.13–0.52M parameters.
+## 3. Rejected
 
-**Unfreezing the encoder as part of this experiment.** It is the obvious suspect — §1's
-elimination argument points at the representation, and the encoder is 74% of the compute
-that a scaling experiment is trying to spend on the core. Rejected as a *second variable*.
-If the model axis is flat at D13, "unfreeze and re-run the ladder" is 0014's headline, and
-the cache built here is exactly what makes the comparison sharp. Doing both at once means a
-positive result cannot be attributed.
-
-**muP.** The principled fix for LR-vs-width, and it would replace §2.3's sweep with a
-transfer rule. Rejected on cost: it needs per-tensor multiplier plumbing through
-`causal.py` and a coordinate check to verify, against 18 runs that take 20 minutes on cached
-tokens. Revisit if the ladder is extended past 101M, where the sweep gets expensive.
-
-**Keeping the four-family mixture.** Preserves comparability with every pooled number this
-project has (65–69%) and keeps the 846-task regression guardrail. Rejected because the
-release is Spread-only boss with `baseline_train_episodes: 0`, so the mixture's boss slot
-would be filled by data from a different distribution than its own validation set, and
-§2.3's coverage arithmetic caps the data axis at 19% by 40k. The scaling question gets a
-clean answer or a comparable one, not both; this doc takes clean.
-
-**Selecting on validation CE.** See §2.4. Recorded here because it is the single most likely
-thing for a future reader to reintroduce — every scaling-law paper selects on held-out loss,
-and in this project that is measured backwards.
+- **Depth-only scaling** — free, no in-projection. But it caps at 38.5M and gets there at
+  aspect ratio 43, and a flat curve from a badly shaped ladder is uninterpretable.
+- **Unfreezing the encoder** — the obvious suspect, and 74% of the compute. Rejected as a
+  *second variable*; it is the successor experiment, and this cache sharpens it.
+- **muP** — the principled fix for LR-vs-width. Costs per-tensor plumbing and a coordinate
+  check, against 18 runs that take 15 minutes. Revisit past 101M.
+- **Keeping the 4-family mixture** — preserves comparability with every pooled number (65–69%)
+  and the 846 guardrail. But the release is Spread-only boss with `baseline_train_episodes: 0`,
+  so the mixture's boss slot would come from a different distribution than its own validation.
+  Clean or comparable, not both; this takes clean.
+- **Selecting on validation CE** — measured backwards in this project (0010). Listed because
+  every scaling-law paper does it and someone will reintroduce it.
 
 ## 4. Predictions, registered before running
 
-Written down first so a flat result is a result rather than a disappointment.
-
-| axis | prediction | what would falsify it |
+| axis | prediction | falsified by |
 |---|---|---|
-| **model, at D13** | **Flat or non-monotone** on transfer-Spread. XS (1.6M) within noise of M. | XXL beats M by >5 pp on transfer-Spread with non-overlapping CIs |
-| **model, in-distribution** | **Monotone improvement.** Larger cores memorize one start state faster — CE falls, closed-loop-on-holdout rises | in-distribution flat too, which would indict the encoder immediately |
-| **data, D1 → D13** | in-distribution rises; **transfer flat**, reproducing 0009 at 15x the data | transfer-Spread rises monotonically with log2(frames) |
-| **the gap** | in-distribution success exceeds transfer-Spread success by **>20 pp** at every cell | a small gap, which would mean the single start state is less of a confound than §0 claims |
+| model, at D13 | **flat or non-monotone** on transfer-Spread; XS within noise of M | XXL beats M by >5 pp, non-overlapping CIs |
+| model, in-distribution | monotone — bigger cores memorize one state faster | flat here too, which indicts the encoder immediately |
+| data, D1 → D13 | in-distribution rises, **transfer flat**, reproducing 0009 at 15x | transfer-Spread rises with log2(frames) |
+| the gap | in-distribution exceeds transfer-Spread by **>20 pp** at every cell | a small gap, meaning one start state confounds less than feared |
 
-The honest reading if all four hold: neither capacity nor same-state data is the bottleneck,
-and the frozen encoder becomes the primary suspect for the first time in the project.
+If all four hold, neither capacity nor same-state data is the bottleneck, and the frozen
+encoder becomes the primary suspect for the first time.
 
-## 5. Risks, and the gate on each
+## 5. Risks and gates
 
-| risk | why it is plausible | gate |
-|---|---|---|
-| single start state makes every curve a memorization curve | 9,900/9,900 uids share `..._i371`; validation is a holdout from it | transfer-Spread (n=13) is co-primary; the in-distribution/transfer gap is a reported quantity, not a footnote |
-| cache silently diverges from the live encoder | GRPO and eval run the encoder on frames the cache never saw | cache key = encoder ckpt sha256 + image_size; a test asserts cached tokens equal a live forward to bf16 tolerance on 64 held-out frames |
-| big cells are undertrained, faking a flat model axis | one LR for a 63x parameter span | per-size 3-point LR sweep (§2.3); the six chosen LRs are published |
-| n = 13 cannot resolve the primary comparison | 0012 already hit this; eval 0014 reports 19/200 both arms | 200 draws with replacement as in 0014; a null is reported as "underpowered at n=13", never as "no effect" |
-| 105–420 epochs on D1/D2 is pathological, not informative | fixed-step budget over a 13x data span | train CE reported per cell; a cell at train CE < 0.01 is labelled saturated on the plot rather than dropped |
-| batch 4 → 16 breaks comparison with 0009/0010 | it does | the M cell is not claimed comparable to those runs; the anchor for this doc is M at D13, trained here |
-| a live release changes underneath the grid | directory globs consume later shards | manifest filenames, episode-count assertions, both validation SHAs checked at startup |
+| risk | gate |
+|---|---|
+| one start state makes every curve a memorization curve | transfer-Spread co-primary; the in-distribution/transfer gap is a reported quantity |
+| cache diverges from the live encoder | key = encoder sha + image_size; test asserts cached == live to bf16 tolerance on 64 held-out frames |
+| big cells undertrained, faking a flat model axis | per-size LR sweep (§2.2); six chosen LRs published |
+| n = 13 cannot resolve the primary comparison | reported as "underpowered at n=13", never as "no effect" |
+| 105–420 epochs on D1/D2 is pathological | train CE per cell; < 0.01 is labelled saturated on the plot, not dropped |
+| batch 4 → 16 breaks comparison with 0009/0010 | it does; the anchor for this doc is M at D13, trained here |
+| a live release changes underneath the grid | manifest filenames, episode assertions, both validation SHAs checked at startup |
 
 ## 6. Sequencing
 
-1. **Token cache.** Builder + memmap reader + cache-key validation. Test: cached tokens
-   match a live encoder forward; a wrong encoder sha raises. Gate: full 10k cache builds in
-   **under 15 min** and is ≤ 1 GB, and a cached D1 cell trains ≥ 20x faster than uncached.
-   Report that ratio on `kaihe/contra_nes_data#6`, which is blocked on it — and on policy
-   publishing `encoder-final.pt` (sha `f36041bc…1923c`) as a versioned artifact, since
-   `runs/` is gitignored and the data side cannot build a sidecar it cannot reproduce.
-2. **In-projection.** `model.py` change per §2.2, plus the state-dict-identity test at
-   d=512. Gate: `pytest tests/ -q` green, and an existing checkpoint loads unchanged.
-3. **Boss-only config.** `config_bc_scaling.yaml` — `families: [boss]`, the 10k manifest,
-   batch 16, no `family_draws`. Gate: a 100-step smoke run on D1 reproduces episode counts
-   from the manifest exactly.
-4. **LR sweep**, 6 sizes x 3 LRs x 3,000 steps at D13. Gate: publish the six chosen LRs
-   before starting the grid. Do not proceed if the best LR sits at a sweep endpoint.
-5. **The 30-cell grid**, 3 seeds for CE, then the §2.4 closed-loop staging. Do not change
-   the recipe after seeing an intermediate cell.
-6. **Extension.** Only after §4's predictions have resolved: file the `contra_nes_data`
-   handoff issue for 20k/40k with the three §2.5 requirements, the multi-start-state one
-   argued from whatever the in-distribution/transfer gap turns out to be. Deferred
-   deliberately — the gap is the evidence that makes the request specific.
-7. Update this doc with the measured grid, mark it Implemented, record how each §4
-   prediction resolved.
+1. **Token cache** — builder, memmap reader, key validation. Gate: builds in <15 min, ≤1 GB,
+   cached D1 trains ≥20x faster. Report that ratio on `contra_nes_data#6`, which is blocked on
+   it and on policy publishing `encoder-final.pt` (sha `f36041bc…1923c`; `runs/` is gitignored).
+2. **In-projection** (§2.1) + the state-dict-identity test. Gate: `pytest tests/ -q` green, an
+   existing checkpoint loads unchanged.
+3. **Boss-only config.** Gate: a 100-step D1 smoke run reproduces manifest episode counts exactly.
+4. **LR sweep.** Gate: publish the six LRs before the grid. Stop if a best LR sits at an endpoint.
+5. **The 30-cell grid**, then the §2.4 closed-loop staging. No recipe changes mid-grid.
+6. Update this doc with the measured grid, mark Implemented, record how each §4 prediction resolved.
 
 ---
 
@@ -333,18 +195,16 @@ and the frozen encoder becomes the primary suspect for the first time in the pro
 
 | claim | source |
 |---|---|
-| 9,900 episodes / 770,679 frames / 5 nested prefixes / Spread-only / `generated_only` | `~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json` |
-| all 9,900 uids share one source state `win_level1_20260701015306_i371` | same manifest, `train_shards[*].uids` split on `__`, 1 distinct prefix |
-| 100-task holdout, SHA `29fd4017…cc9ae0`, `kind: generated_holdout` | same manifest, `validation` |
-| encoder 477.4 ms / core 13.8–133.1 ms per 2,084 frames (→ 0.229 ms/frame, and the per-batch core figures) | microbenchmark, 4090 laptop 16 GB, B=4 T=521 bf16 autocast, 12 iters after 4 warmup |
-| shards store `.obs.mkv` + `.actions.npy` + `.goal.png` + `.json`, **no precomputed features** | `tar tf` over both `boss-spread-10k-v1/hf/boss-val-00000.tar` and the legacy `game_trace/hf/boss-train-00000.tar` |
-| decode+resize 0.33 ms/frame (0.445 cold), 77.1 frames/episode | PyAV + cv2 over 25 episodes / 1,928 frames of the val shard, `cv2.setNumThreads(0)` as the loader sets it |
-| 195 ms mean step, 3,244 tokens/s, 8.2M valid tokens, 7,500 boss draws @ 20k steps | `runs/bc/2026-08-06/dropout-0.2/metrics.csv` |
-| core parameter counts | `CausalGPTConfig` + `SwiGLU` hidden rule (`causal.py:144`), `4d² + 3d·h + 2d` per layer |
+| 9,900 episodes / 770,679 frames / 5 prefixes / Spread-only / `generated_only` | `~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json` |
+| all 9,900 uids share one source state; 100-task holdout SHA `29fd4017…cc9ae0` | same manifest — `train_shards[*].uids` split on `__` gives 1 distinct prefix |
+| shards hold `.obs.mkv` + `.actions.npy` + `.goal.png` + `.json`, **no precomputed features** | `tar tf` over the 10k val shard and the legacy `game_trace/hf/boss-train-00000.tar` |
+| decode 0.192 / resize 0.097 ms per frame, 77.85 frames/episode | PyAV + cv2 over 30 episodes / 2,270 frames, blobs preloaded, `cv2.setNumThreads(0)` |
+| encoder 0.229 ms/frame; core 8.5 / 40.5 ms per 1,248-frame batch | microbenchmark, 4090 laptop 16 GB, bf16 autocast, 12 iters after 4 warmup |
+| core parameter counts | `4d² + 3d·h + 2d` per layer, `h` from the SwiGLU rule at `causal.py:144` |
 | `d_model` pinned to encoder `hiddim` | `src/contra_policy/model.py:92` |
-| no pixel augmentation anywhere in the loader | grep over `src/contra_policy/dataset.py` for augment/jitter/flip — only sampling RNG |
-| train CE 0.051 @ 666 boss episodes; CE-optimal plays −12.9 pp | [0010](0010-dropout-regularization.md) §1 |
-| mixed-v2 flat curve, 2,500 episodes / 464,019 frames, val SHA `1318…ecad` | [0009](0009-boss-data-scaling.md) §2, appendix |
-| Spread+rapid GRPO finished at 9.5% = init, n=13, McNemar p = 1.0 | [evaluation 0014](../../contra_nes_evaluation/doc/0014-spread-specialty-boss-grpo.md) |
+| no pixel augmentation in the loader | grep for augment/jitter/flip over `dataset.py` — only sampling RNG |
+| train CE 0.051 @ 666 episodes; CE-optimal plays −12.9 pp | [0010](0010-dropout-regularization.md) §1 |
+| flat mixed-v2 curve; val SHA `1318…ecad` | [0009](0009-boss-data-scaling.md) |
+| Spread GRPO finished at 9.5% = init, n=13, McNemar p = 1.0 | [eval 0014](../../contra_nes_evaluation/doc/0014-spread-specialty-boss-grpo.md) |
 | Regular/Flamethrower 0 wins in 316 rollouts; 13 Spread+rapid val tasks | [0012](0012-spread-grpo.md) §1 |
-| further Spread snapshots use the same 100-task validation and prefix scheme | `~/code/contra_nes_data/doc/0003-incremental-spread-scaling.md` §"Scaling contract" |
+| "20k"/"40k" name candidate traces; validation fixed at 100 per release | `~/code/contra_nes_data/doc/0003-incremental-spread-scaling.md` |
