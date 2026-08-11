@@ -299,6 +299,27 @@ class ContraCrossViewDataset(Dataset):
             return img
         return cv2.resize(img, (s, s), interpolation=cv2.INTER_AREA)
 
+    # -- public preprocessing, shared with the token cache ------------------
+    #
+    # `token_cache` precomputes the frozen encoder's output over these exact pixels, so
+    # it must reach them through the same code the loader uses. Both entry points are
+    # public for that reason: a second decode/resize implementation that drifted by one
+    # interpolation flag would poison every cached token silently.
+
+    def frames(self, ep: dict, start: int, count: int) -> np.ndarray:
+        """``(count, S, S, 3)`` uint8 — decoded, resized episode frames."""
+        return self._frames(ep, start, count)
+
+    def goal_image(self, ep: dict) -> np.ndarray:
+        """``(S, S, 3)`` uint8 — the episode's cross-view prompt frame.
+
+        cv2.imdecode rather than imageio.imread: same pixels, ~3x cheaper, and in the
+        loader this runs once per window (the goal is re-decoded for each window).
+        """
+        goal_bgr = cv2.imdecode(np.frombuffer(self._read(ep, "goal.png"), np.uint8),
+                                cv2.IMREAD_COLOR)
+        return self._resize(cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB))
+
     # -- item --------------------------------------------------------------
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -328,11 +349,7 @@ class ContraCrossViewDataset(Dataset):
         # to OOM a multi-worker loader. The model expands the encoded tokens instead,
         # which is both identical in result and ~2x less backbone compute, since the
         # goal frame is then encoded once per window rather than once per frame.
-        # cv2.imdecode rather than imageio.imread: same pixels, ~3x cheaper, and this
-        # runs once per window (the goal is re-decoded for each window of an episode).
-        goal_bgr = cv2.imdecode(np.frombuffer(self._read(ep, "goal.png"), np.uint8),
-                                cv2.IMREAD_COLOR)
-        goal_img = self._resize(cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB))
+        goal_img = self.goal_image(ep)
         gmask = goal_mask(meta["goal_points"], self.image_size, self.sigma_px)
         cross_id = np.full(T, interaction_id(meta), dtype=np.int64)
         # uint8, not float32: the mask is a [0,1] blob map and quantising it to 256

@@ -100,13 +100,24 @@ train loss, then hold; 18 runs, ~15 min cached. Publish the six chosen LRs.
 there is no mixture here. Recorded because it could not have been kept anyway: at 666 boss
 draws per cycle it covers 76% of 9,900 episodes and **19% of 40k**, capping this very axis.
 
-### 2.3 The token cache
+### 2.3 The token cache — built, `src/contra_policy/token_cache.py`
 
-One offline pass writes a `(T+1, 512)` bf16 array per episode (frames + goal token), memmapped
-with a uid → (offset, length) index: **790 MB** for the 10k release, built in under ten
-minutes, and `num_workers` drops to 0. The key **must** include the encoder checkpoint sha256
-and `image_size` — a mismatch is a hard error, never a silent rebuild. Training-time only;
-eval and GRPO still encode live.
+One offline pass writes a `(T+1, 512)` fp16 block per episode (row 0 the goal token, then
+frames), memmapped with a uid → (offset, length) index: **~800 MB** for the 10k release, and
+`num_workers` drops to 0. The key **must** include the encoder checkpoint sha256 and
+`image_size` — a mismatch raises `StaleCache`, never a silent rebuild or fallback. The
+builder goes through `ContraCrossViewDataset.frames` / `.goal_image` rather than its own
+decode, so a cached token cannot drift from a live one by an interpolation flag.
+
+**fp16, not bf16 as first drafted.** `encode()` ends in a LayerNorm, which `torch.autocast`
+promotes to fp32 — so the live token is fp32 *even under bf16 autocast*, and it is the
+reference both dtypes are measured against. At the same two bytes fp16 costs **1.9e-3** max
+error against it and bf16 **1.5e-2**; fp16 is also numpy-native, so the memmap needs no bit
+reinterpretation. Verified end-to-end on the real val shard: **1.946e-3**, the fp16
+quantization bound exactly, against a tolerance of 5e-3 that is itself well under the bf16
+resolution (~8e-3) of the core's first matmul.
+
+Training-time only; eval and GRPO still encode live.
 
 Requested as an optional release sidecar on `kaihe/contra_nes_data#6`, but built here first
 and the issue says declining is fine: §3 names unfreezing the encoder as the likely successor,
@@ -179,9 +190,10 @@ encoder becomes the primary suspect for the first time.
 
 ## 6. Sequencing
 
-1. **Token cache** — builder, memmap reader, key validation. Gate: builds in <15 min, ≤1 GB,
-   cached D1 trains ≥20x faster. Report that ratio on `contra_nes_data#6`, which is blocked on
-   it and on policy publishing `encoder-final.pt` (sha `f36041bc…1923c`; `runs/` is gitignored).
+1. ~~**Token cache**~~ — **built.** `token_cache.py`, `tools/build_token_cache.py`, 11 tests.
+   Verified against a live encoder on the real val shard at 1.946e-3 max error. Still owed:
+   report the cached-vs-uncached training ratio on `contra_nes_data#6`, which is blocked on it
+   and on policy publishing `encoder-final.pt` (sha `f36041bc…1923c`; `runs/` is gitignored).
 2. **In-projection** (§2.1) + the state-dict-identity test. Gate: `pytest tests/ -q` green, an
    existing checkpoint loads unchanged.
 3. **Boss-only config.** Gate: a 100-step D1 smoke run reproduces manifest episode counts exactly.
@@ -200,6 +212,8 @@ encoder becomes the primary suspect for the first time.
 | shards hold `.obs.mkv` + `.actions.npy` + `.goal.png` + `.json`, **no precomputed features** | `tar tf` over the 10k val shard and the legacy `game_trace/hf/boss-train-00000.tar` |
 | decode 0.192 / resize 0.097 ms per frame, 77.85 frames/episode | PyAV + cv2 over 30 episodes / 2,270 frames, blobs preloaded, `cv2.setNumThreads(0)` |
 | encoder 0.229 ms/frame; core 8.5 / 40.5 ms per 1,248-frame batch | microbenchmark, 4090 laptop 16 GB, bf16 autocast, 12 iters after 4 warmup |
+| tokens are LayerNorm-bounded to ±5.1; fp16 err 1.9e-3 vs bf16 1.5e-2 against the fp32 live token | 951 real frames of the val shard through `load_pretrained_encoder`, under and outside autocast |
+| cached tokens match a live forward at 1.946e-3 (tol 5e-3); read 0.02 ms per 16-episode batch | `cache/tokens/spread10k-val` over 12 episodes; `tests/test_token_cache.py` |
 | core parameter counts | `4d² + 3d·h + 2d` per layer, `h` from the SwiGLU rule at `causal.py:144` |
 | `d_model` pinned to encoder `hiddim` | `src/contra_policy/model.py:92` |
 | no pixel augmentation in the loader | grep for augment/jitter/flip over `dataset.py` — only sampling RNG |
