@@ -17,10 +17,13 @@ Spread release just landed. Which one moves?
 **Answer.** Run both axes as one grid, boss-only and Spread-only, on **cached frozen-encoder
 tokens**. Six core sizes spanning **1.6M → 101M** parameters (0.14x to 7.9x the current
 12.85M) crossed with the five nested data prefixes already in the release
-(**762 → 9,900** episodes). The cache is what makes this affordable: the frozen encoder is
-**~74% of a training step** and the core is 14 ms of it, so precomputing 790 MB of bf16
-tokens once turns a 1-hour cell into a **3–14 minute** cell and the whole 30-cell grid into
-about **4 GPU-hours**. Model scaling was never expensive — it was never measured.
+(**762 → 9,900** episodes). The cache is what makes this affordable. The shards store
+**lossless MKV video**, not features, so every step pays a PyAV decode *and* a frozen
+encoder forward before the core sees a token — together **~97% of a boss-only step**, of
+which the core at 12.85M is 8.5 ms. Precomputing 790 MB of bf16 tokens **once, in about
+five minutes** turns a **~1.6-hour** cell into a **3–14 minute** one: the 30-cell grid goes
+from ~50 GPU-hours to **~3**, and the full 3-seed version fits in ~9. Model scaling here was
+never expensive — it was never measured.
 
 **This doc predicts the model axis is flat and says so before running it** (§4). 0010
 measured train CE at 0.051 with 666 boss episodes: a variance problem, not a capacity
@@ -56,23 +59,29 @@ That sentence is now a standing instruction, and this doc executes it.
 
 ### Model scaling costs almost nothing, which is why nobody noticed it was untested
 
-Measured on the 4090 laptop (16 GB), one batch of 4 x 521 frames = 2,084 tokens:
+Three legs, measured on the 4090 laptop (16 GB) and normalized per frame, then costed for
+this doc's boss-only batch of **16 x 78 = 1,248** frames:
 
-| component | time | share |
-|---|---:|---:|
-| frozen encoder forward (chunk 256) | **477.4 ms** | — |
-| core fwd+bwd+opt @ 12.85M (d512 L4) | 13.8 ms | 2.8% of encoder |
-| core fwd+bwd+opt @ 101M (d1024 L8) | 67.7 ms | 14% of encoder |
-| core fwd+bwd+opt @ 198M (d1280 L10) | 133.1 ms | 28% of encoder |
+| leg | per frame | per batch | where |
+|---|---:|---:|---|
+| tar read → PyAV decode → cv2 resize, 2 workers | 0.33 ms | **209 ms** | CPU, `dataset.py:259-300` |
+| frozen encoder forward (chunk 256) | 0.229 ms | **286 ms** | GPU |
+| core fwd+bwd+opt @ 12.85M (d512 L4) | — | **8.5 ms** | GPU |
+| core fwd+bwd+opt @ 101M (d1024 L8) | — | 40.5 ms | GPU |
+| core fwd+bwd+opt @ 198M (d1280 L10) | — | 79.7 ms | GPU |
 
-At the realized mean batch of a 0010 run (~633 padded tokens/step, 195 ms mean step) the
-encoder is **~74% of wall clock**. Going 12.85M → 101M adds ~16 ms to a 195 ms step: **+8%**.
-The 12.85M core is small because it inherited VPT's 4x512 shape in [0002](0002-gpt-policy.md),
-not because a larger one was priced and rejected.
+The two preprocessing legs overlap (workers prefetch), so a step is GPU-bound at ~295 ms and
+the **core is 2.9% of it**. Even at 101M the core is 12%. Going 12.85M → 101M costs **+11%
+wall clock for 7.9x the parameters** — which is the whole reason this axis was never priced:
+the 12.85M core inherited VPT's 4x512 shape in [0002](0002-gpt-policy.md), and nothing since
+has had a reason to question it.
 
-The same arithmetic says the *right* engineering move is to delete the encoder from the
-inner loop entirely. It is frozen (`freeze_encoder: true`), and the loader applies **no
-pixel augmentation** — every frame maps to exactly one deterministic 512-d token forever.
+The same arithmetic says the *right* engineering move is to delete both preprocessing legs
+from the inner loop. The encoder is frozen (`freeze_encoder: true`), and the loader applies
+**no pixel augmentation** — every frame maps to exactly one deterministic 512-d token,
+forever. Uncached, a cell is **~1.6 h** and the grid is ~50 GPU-hours; cached, a cell is
+**3–14 min** and the grid is ~3. The cache also drops `num_workers` to 0, which retires the
+loader's share of the 20 GB WSL ceiling.
 
 ### The regime, in tokens per parameter
 
@@ -106,8 +115,21 @@ holds more than a batch (see memory note in `doc/README.md` open questions). The
 must include the **encoder checkpoint sha256** and `image_size`; a mismatch is a hard error,
 not a silent rebuild. Training reads tokens directly and skips `encode_images` entirely.
 
+Build cost is ~2 min of CPU decode at 2 workers plus ~3 min of GPU encode, so the whole 10k
+release caches in **well under ten minutes** — one-off, against ~50 GPU-hours saved.
+
 This is a training-time optimization only. Closed-loop evaluation and GRPO still run the
 encoder live — they see frames the cache has never met.
+
+**Who should build it.** The cache is derived from a *policy*-repo artifact (the stage-A
+encoder checkpoint) applied to *data*-repo bytes, so it could live on either side. It is
+built here, and the request to ship it in the release instead is
+`kaihe/contra_nes_data#6`. The reason it is built here first and asked for second — and why
+the issue tells the data side that declining is a legitimate answer — is that §3 names
+"unfreeze the encoder" as the likely successor
+experiment, and a token sidecar in an immutable release is bound to one encoder forever.
+The ask is therefore for an **optional sidecar keyed by encoder sha, never a replacement for
+the video** — which only makes sense once this doc has shown the sidecar earns its bytes.
 
 ### 2.2 The model ladder
 
@@ -273,7 +295,10 @@ and the frozen encoder becomes the primary suspect for the first time in the pro
 
 1. **Token cache.** Builder + memmap reader + cache-key validation. Test: cached tokens
    match a live encoder forward; a wrong encoder sha raises. Gate: full 10k cache builds in
-   under an hour and is ≤ 1 GB.
+   **under 15 min** and is ≤ 1 GB, and a cached D1 cell trains ≥ 20x faster than uncached.
+   Report that ratio on `kaihe/contra_nes_data#6`, which is blocked on it — and on policy
+   publishing `encoder-final.pt` (sha `f36041bc…1923c`) as a versioned artifact, since
+   `runs/` is gitignored and the data side cannot build a sidecar it cannot reproduce.
 2. **In-projection.** `model.py` change per §2.2, plus the state-dict-identity test at
    d=512. Gate: `pytest tests/ -q` green, and an existing checkpoint loads unchanged.
 3. **Boss-only config.** `config_bc_scaling.yaml` — `families: [boss]`, the 10k manifest,
@@ -299,7 +324,9 @@ and the frozen encoder becomes the primary suspect for the first time in the pro
 | 9,900 episodes / 770,679 frames / 5 nested prefixes / Spread-only / `generated_only` | `~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json` |
 | all 9,900 uids share one source state `win_level1_20260701015306_i371` | same manifest, `train_shards[*].uids` split on `__`, 1 distinct prefix |
 | 100-task holdout, SHA `29fd4017…cc9ae0`, `kind: generated_holdout` | same manifest, `validation` |
-| encoder 477.4 ms / core 13.8–133.1 ms, peak memory per ladder cell | microbenchmark, 4090 laptop 16 GB, B=4 T=521 bf16 autocast, 12 iters after 4 warmup |
+| encoder 477.4 ms / core 13.8–133.1 ms per 2,084 frames (→ 0.229 ms/frame, and the per-batch core figures) | microbenchmark, 4090 laptop 16 GB, B=4 T=521 bf16 autocast, 12 iters after 4 warmup |
+| shards store `.obs.mkv` + `.actions.npy` + `.goal.png` + `.json`, **no precomputed features** | `tar tf` over both `boss-spread-10k-v1/hf/boss-val-00000.tar` and the legacy `game_trace/hf/boss-train-00000.tar` |
+| decode+resize 0.33 ms/frame (0.445 cold), 77.1 frames/episode | PyAV + cv2 over 25 episodes / 1,928 frames of the val shard, `cv2.setNumThreads(0)` as the loader sets it |
 | 195 ms mean step, 3,244 tokens/s, 8.2M valid tokens, 7,500 boss draws @ 20k steps | `runs/bc/2026-08-06/dropout-0.2/metrics.csv` |
 | core parameter counts | `CausalGPTConfig` + `SwiGLU` hidden rule (`causal.py:144`), `4d² + 3d·h + 2d` per layer |
 | `d_model` pinned to encoder `hiddim` | `src/contra_policy/model.py:92` |
