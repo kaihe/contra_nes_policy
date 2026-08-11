@@ -89,8 +89,17 @@ loader's share of the 20 GB WSL ceiling.
 |---|---:|---:|---:|
 | mixed-v2 D8 (0009's largest) | 2,500 | 464,019 | 0.036 |
 | **boss-spread-10k-v1** | 9,900 | 770,679 | 0.060 |
-| projected 20k | ~19,800 | ~1.54M | 0.120 |
-| projected 40k | ~39,600 | ~3.08M | 0.240 |
+| projected 20k | 19,900 | ~1.55M | 0.121 |
+| projected 40k | 39,900 | ~3.11M | 0.242 |
+
+"20k"/"40k" name **candidate traces**, as `boss-spread-10k-v1` does (`candidate_episodes:
+10000` → 100 validation + 9,900 train). Validation is fixed at 100 tasks *per release* by
+the data-repo scaling contract, so a 40k snapshot is 39,900 training episodes — not 4 x
+9,900. Frames are projected at this release's **77.85 frames/episode**, which holds only
+while later snapshots stay Spread-from-`i371`; §2.5 asks for the opposite, and a
+multi-start-state release would move that constant (0012 measured expert fight length
+varying 3.2x across weapons). Treat the frame column as ±20%, and the conclusion below as
+robust to that because it is an order-of-magnitude argument.
 
 Chinchilla's compute-optimal ratio is ~20 tokens/parameter. Even at 40k traces this project
 is **~80x over-parameterized** at the *current* size. That is the quantitative reason §4
@@ -227,7 +236,10 @@ before any number is called a result.
 Predeclared here, blocked on data. `boss-spread-10k-v1` is the only release that exists;
 `contra_nes_data` [0003](../../contra_nes_data/doc/0003-incremental-spread-scaling.md)
 commits to further snapshots under the same contract. When they land, the data axis extends
-to 7 points (762 → 39,600) at the size selected by phase A, with **no recipe change**.
+to 7 points (762 → 39,900 episodes) at the size selected by phase A, with **no recipe
+change**. The two new points are projections, not deliveries — nothing in §4 is gated on
+them, and if they never arrive the grid still resolves every prediction on the five cells
+that exist today.
 
 Three things must hold for the extension to be comparable, and they are requests on the data
 repo, not assumptions: the **same 100-task validation split**, the **same deterministic
