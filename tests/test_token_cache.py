@@ -393,3 +393,29 @@ def test_a_wider_core_projects_rather_than_truncating():
     m = _policy(1024, 8, 16)
     assert isinstance(m.in_proj, nn.Linear)
     assert m.in_proj.weight.shape == (1024, DIM) and m.in_proj.bias is None
+
+
+@pytest.mark.parametrize("name,d,n_layer,n_head", LADDER)
+def test_every_ladder_cell_composes_as_a_hydra_override(name, d, n_layer, n_head):
+    """`core.d_model` must be a declared key, or the override errors instead of applying.
+
+    OmegaConf refuses to create keys on a struct, so an omitted `d_model` makes
+    `policy.core.d_model=1024` a hard failure — which is how the first ladder queue lost
+    all three cells. Composing here costs milliseconds; finding out at launch costs a
+    scheduling round trip.
+    """
+    from hydra import compose, initialize_config_module
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_scaling", overrides=[
+            f"policy.core.d_model={d}", f"policy.core.n_layer={n_layer}",
+            f"policy.core.n_head={n_head}", f"policy.core.n_kv_head={n_head}"])
+    assert cfg.policy.core.d_model == d
+    assert cfg.policy.core.n_layer == n_layer and cfg.policy.core.n_head == n_head
+
+
+def test_the_unoverridden_scaling_config_is_the_M_cell():
+    from hydra import compose, initialize_config_module
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_scaling")
+    assert cfg.policy.core.d_model is None      # null = take the encoder's width
+    assert cfg.policy.core.n_layer == 4 and cfg.policy.core.n_head == 8

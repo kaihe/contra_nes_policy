@@ -57,6 +57,12 @@ policy:
   aux_size: 0
   freeze_encoder: true      # required by token_cache, and asserted at startup
   core:
+    # Declared here, and only here, because it is this experiment's variable. The parent
+    # config deliberately omits it ("a second source of truth for a number that must match
+    # the encoder"), which was right while the core was always the encoder's width — but an
+    # omitted key is a *struct* key OmegaConf refuses to create, so `core.d_model=1024`
+    # errors rather than overriding. null = use the encoder's width, i.e. the M cell.
+    d_model: null
     n_layer: 4              # the M cell; the ladder overrides d_model/n_layer/n_head
     n_head: 8
     n_kv_head: 8
