@@ -46,6 +46,28 @@ from contra_policy.token_cache import (CachedEpisodeDataset, TokenCache,
 MODAL_ACTION = ACTION_NAMES.index("R")
 
 
+def wsd_onset(total_steps: int, decay_frac: float) -> int:
+    """First step of the cooldown in a warmup-stable-decay schedule.
+
+    WSD is this repo's schedule, and the reason is reusability rather than final loss —
+    the two land in about the same place. **Cosine bakes the total budget into the
+    schedule**: its LR reaches 0 exactly at ``train.steps``, so a finished run cannot be
+    extended and every budget costs a run from scratch. Chinchilla flags this directly —
+    the cosine cycle must match the training duration or the result degrades — and it is
+    why a 40k cosine checkpoint cannot become an 80k run.
+
+    WSD holds the LR *flat* after warmup and only anneals over the last ``decay_frac`` of
+    the budget. Any checkpoint taken in that stable phase is a legitimate starting point
+    for **any** longer budget, because the schedule there does not depend on the total. A
+    20k/40k/80k ladder is then one trunk plus short anneals rather than three full runs.
+
+    The cooldown is linear to ``final_lr_frac``. (1-sqrt) is reported slightly better in
+    the literature and is a one-line change if that ever matters here; linear is kept
+    because it is the shape most results were measured with.
+    """
+    return max(0, int(total_steps) - int(round(float(decay_frac) * int(total_steps))))
+
+
 class CSVLogger:
     """Append-only CSV with a growing header."""
 
@@ -247,12 +269,21 @@ class BCTrainer:
     # -- plumbing -----------------------------------------------------------
 
     def _lr_scale(self, step: int) -> float:
+        """Multiplier on the base LR. ``wsd`` is this repo's default — see :func:`wsd_phase`."""
         warm, total = int(self.args.train.warmup_steps), int(self.args.train.steps)
         if warm > 0 and step < warm:
             return (step + 1) / warm
-        if self.args.train.lr_decay == "cosine":
+        decay = str(self.args.train.lr_decay)
+        if decay == "cosine":
             p = (step - warm) / max(1, total - warm)
             return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, p))))
+        if decay == "wsd":
+            onset = wsd_onset(total, float(self.args.train.get("decay_frac", 0.1)))
+            if step < onset:
+                return 1.0                      # the stable phase: LR is flat, so branchable
+            p = (step - onset) / max(1, total - onset)
+            floor = float(self.args.train.get("final_lr_frac", 0.0))
+            return floor + (1.0 - floor) * (1.0 - min(1.0, max(0.0, p)))
         return 1.0
 
     def _loader(self, ds, lengths, shuffle: bool) -> DataLoader:
@@ -417,15 +448,47 @@ class BCTrainer:
             raise ValueError(f"BC checkpoint cannot resume; missing {missing}")
         previous = ckpt["train_config"]
         current = OmegaConf.to_container(self.args, resolve=True)
-        for keys in (("seed",), ("loader", "family_draws"),
-                     ("boss_scaling", "shard_count"), ("train", "steps")):
-            old, new = previous, current
+
+        def get(cfg, keys):
             for key in keys:
-                old = old.get(key) if isinstance(old, dict) else None
-                new = new.get(key) if isinstance(new, dict) else None
+                cfg = cfg.get(key) if isinstance(cfg, dict) else None
+            return cfg
+
+        guards = [("seed",), ("loader", "family_draws"), ("boss_scaling", "shard_count")]
+        # Extending the budget is the whole point of WSD, so `train.steps` is only a guard
+        # under a schedule that cannot be extended. Under WSD it is checked differently
+        # below: the constraint is not "same total" but "resumed inside the stable phase".
+        old_decay, new_decay = get(previous, ("train", "lr_decay")), get(current, ("train", "lr_decay"))
+        extendable = old_decay == "wsd" and new_decay == "wsd"
+        if not extendable:
+            guards.append(("train", "steps"))
+        for keys in guards:
+            old, new = get(previous, keys), get(current, keys)
             if old != new:
                 dotted = ".".join(keys)
-                raise ValueError(f"resume changes {dotted}: {old!r} -> {new!r}")
+                hint = ""
+                if dotted == "train.steps":
+                    hint = (f" — schedule is {old_decay!r}, whose LR is defined against the "
+                            f"total, so it cannot be extended. Use lr_decay: wsd.")
+                raise ValueError(f"resume changes {dotted}: {old!r} -> {new!r}{hint}")
+
+        old_total = int(get(previous, ("train", "steps")) or 0)
+        new_total = int(get(current, ("train", "steps")) or 0)
+        # Only when the budget actually changes. Resuming the *same* run after a crash must
+        # work from any step, cooldown included — that is ordinary resumption, not a branch.
+        if extendable and new_total != old_total:
+            old_frac = float(get(previous, ("train", "decay_frac")) or 0.1)
+            onset = wsd_onset(old_total, old_frac)
+            resumed_at = int(ckpt["step"])
+            if resumed_at > onset:
+                raise ValueError(
+                    f"cannot extend from step {resumed_at}: its run began cooling down at "
+                    f"{onset} (of {old_total}), so the LR there is already annealed and the "
+                    f"weights are not a stable-phase trunk. Branch from a checkpoint at or "
+                    f"before step {onset}, or train the longer budget from scratch.")
+            if new_total < resumed_at:
+                raise ValueError(f"resume target {new_total} is before the checkpoint's "
+                                 f"step {resumed_at}")
         self.policy.load_state_dict(ckpt["policy"], strict=True)
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])

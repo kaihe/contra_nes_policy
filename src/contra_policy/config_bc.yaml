@@ -86,7 +86,15 @@ train:
   learning_rate: 3.0e-4   # the core is from scratch; only the encoder is pretrained
   weight_decay: 0.01
   warmup_steps: 500
-  lr_decay: cosine        # none | cosine
+  # `wsd` is this repo's schedule and should stay that way: cosine defines its LR against
+  # `steps`, reaching 0 exactly at the end, so a finished run can never be extended and
+  # every budget costs a run from scratch. WSD holds the LR flat after warmup and anneals
+  # only over the last `decay_frac`, so any stable-phase checkpoint can be resumed into a
+  # *longer* budget — a 20k/40k/80k ladder becomes one trunk plus short anneals. `_resume`
+  # enforces exactly that: it will extend a wsd run and refuse to extend a cosine one.
+  lr_decay: wsd           # none | cosine | wsd
+  decay_frac: 0.1         # cooldown as a fraction of `steps`; the last 10% by default
+  final_lr_frac: 0.0      # LR multiplier at the end of the cooldown
   max_grad_norm: 1.0
   log_every: 50
   val_every: 1000

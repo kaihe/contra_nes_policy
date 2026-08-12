@@ -87,7 +87,8 @@ cell is **13 shards, not 16** — plot against log2(frames).
 | D13 | 13 | 9,900 | 770,679 | 32.3 |
 
 Fixed across all 30 cells: `families: [boss]`, batch **16** (Spread episodes average 77.8
-frames, so batch 4 is only ~312 tokens/step), 20,000 steps, AdamW, cosine, 500 warmup, bf16,
+frames, so batch 4 is only ~312 tokens/step), 20,000 steps, AdamW, **WSD** (500 warmup, flat,
+then a linear cooldown over the last 10%), bf16,
 `aux_size: 0`, `value_head: false`, `dropout: 0.2`, frozen stage-A encoder, validation SHA
 `29fd4017…cc9ae0` asserted at startup. Checkpoints at 3,000 / 10,000 / 20,000, fixed before
 looking.
@@ -99,6 +100,17 @@ train loss, then hold; 18 runs, ~15 min cached. Publish the six chosen LRs.
 0009's `family_draws` control is dropped — it holds the boss share of a *mixture* constant and
 there is no mixture here. Recorded because it could not have been kept anyway: at 666 boss
 draws per cycle it covers 76% of 9,900 episodes and **19% of 40k**, capping this very axis.
+
+**The schedule is WSD, and that is now a repo-wide rule.** Cosine defines its LR against
+`train.steps` and reaches 0 exactly at the end, so a finished run cannot be extended: a 40k
+checkpoint resumed toward 80k would jump its LR from 0 back to 1.5e-4, a warm restart rather
+than a continuation. Chinchilla flags the same thing — the cosine cycle must match the
+training duration. WSD holds the LR flat after warmup, so **any stable-phase checkpoint is a
+valid trunk for any longer budget**, and a 20k/40k/80k ladder costs one trunk plus short
+anneals instead of three runs. `_resume` enforces it: it extends a `wsd` run, refuses to
+extend a `cosine` one, and refuses to branch from inside a cooldown. The four size cells in
+§4 were run under cosine and are **internally comparable but not comparable to anything run
+after this change**; re-running them under WSD is ~50 min at 20k each.
 
 ### 2.3 The token cache — built, `src/contra_policy/token_cache.py`
 
@@ -123,24 +135,36 @@ Requested as an optional release sidecar on `kaihe/contra_nes_data#6`, but built
 and the issue says declining is fine: §3 names unfreezing the encoder as the likely successor,
 and a sidecar baked into an immutable release is bound to one encoder forever.
 
-### 2.4 Evaluation — two axes
+### 2.4 Evaluation — CE here, win rate in the evaluation repo
 
-**In-distribution** is the release's own 100-task holdout, same start state; a clean curve
-there is *not* evidence of a scaling law for play. **Transfer** is the 57-task mixed-v2 boss
-val (SHA `1318…ecad`), reported as all 57, the **13 Spread+rapid** tasks, and the 23
-Regular/Flamethrower tasks 0012 showed are unwinnable (floor check, out of the headline).
+**This repo's BC stage reports cross-entropy and nothing else** — 0006's contract, since
+`train_bc` never steps the emulator. That is also the division of labour for 0013: training
+produces checkpoints and CE curves; **`contra_nes_evaluation` reports closed-loop success
+later**, from the saved fixed-step checkpoints, on its own schedule.
 
-Primary comparison: **transfer / Spread subset, D13 XXL vs D13 M**, paired by task uid, 200
-draws with replacement as in eval 0014. The 846-task suite is not run — a boss-only specialist
-cannot play the other families, which is the price of this scope.
+**In-distribution** is the release's own 100-task holdout, SHA `29fd4017…cc9ae0` — **CE
+only, and not by choice.** `boss-spread-10k-v1` ships shards; closed-loop needs task `.npz`
+start states the release does not contain (data
+[0003](../../contra_nes_data/doc/0003-incremental-spread-scaling.md): "converted task files
+are build intermediates, not release artifacts"), and none of its 9,900 uids has one.
+Verifying the validation *shard's* SHA proves the CE set is intact and says nothing about
+this. Recorded because this doc originally promised an in-distribution closed-loop curve it
+could not have produced; recovering it needs a request to data, and nothing here blocks on it.
 
-**Selection is by fixed step, never validation CE**: 0010 measured the CE-optimal checkpoint
-playing 12.9 pp *worse* than the overfit final. CE is a diagnostic and the memorization-rate
-signal the model axis is about; it selects nothing.
+**Transfer** is the 57-task mixed-v2 boss val — 466 train / 57 val `.npz` are on disk, so
+this axis runs today and carries the verdict. Reported as all 57, the **13 Spread+rapid**
+tasks, and the 23 Regular/Flamethrower tasks 0012 showed are unwinnable (floor check, out of
+the headline). Primary comparison: **transfer / Spread subset, D13 XXL vs D13 M**, paired by
+task uid, 200 draws with replacement as in eval 0014. The 846-task suite is not run — a
+boss-only specialist cannot play the other families.
 
-Staging: CE on all 30 cells x 3 seeds (~9 GPU-h); closed loop on 13 cells at seed 0 — the 6
-sizes at D13, the 5 data cells at the selected size, the D1/D13 x XS/XXL corners. Top two
-cells re-run at seeds 1 and 2 before any number is called a result.
+**CE selects nothing**: 0010 measured the CE-optimal checkpoint playing 12.9 pp *worse* than
+the overfit final. Checkpoints are therefore kept at fixed steps (3,000 / 10,000 / 20,000)
+and CE is read as the **memorization-rate** signal the model axis is about — how fast each
+cell fits, never which cell plays best.
+
+Staging: CE on all 30 cells x 3 seeds (~9 GPU-h) here; then hand evaluation the finals for
+the 6 sizes at D13, the 5 data cells at the selected size, and the D1/D13 x XS/XXL corners.
 
 ### 2.5 The 20k / 40k extension
 
