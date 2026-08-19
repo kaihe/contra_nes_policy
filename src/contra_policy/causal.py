@@ -9,7 +9,7 @@ Replaces VPT's ``ResidualRecurrentBlocks``. That was a Transformer-XL: a learned
 relative-position basis, a clipped-causal band mask, carried KV memory and per-chunk
 ``first`` bookkeeping — all of it scaffolding to simulate a long context from a 32-step
 window. With one token per frame an episode *fits*, so the scaffolding goes rather than
-gets ported. See ``doc/0002-gpt-policy.md``.
+gets ported. See ``doc/0002-design-gpt-policy.md``.
 
 Shape: RMSNorm, RoPE, SwiGLU, grouped-query attention, pre-norm residual blocks — the
 minimind / Llama starter arrangement, at the size the old core was (4 layers, 512 wide).

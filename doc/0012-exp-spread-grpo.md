@@ -1,8 +1,8 @@
-# Prove GRPO can move boss at all: binary reward, Spread + rapid only
+# Can binary-reward GRPO improve Spread and rapid-fire boss tasks?
 
 Status: Proposed
 Supersedes: —
-Depends on: [0011](0011-boss-grpo.md) (the run this diagnoses), [0005](0005-graded-reward.md) (the reward this switches **off**)
+Depends on: [0011](0011-exp-boss-grpo.md) (the run this diagnoses), [0005](0005-design-graded-reward.md) (the reward this switches **off**)
 
 **Question.** Every boss result in this project sits at 7–11% with ~90% death, across BC
 at four data scales, a dropout sweep, sparse GRPO and graded GRPO. Weapon stratification

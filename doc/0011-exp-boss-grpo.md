@@ -1,8 +1,8 @@
-# Settle whether boss is RL-solvable: ten hours of graded-reward GRPO, boss only
+# Can ten hours of boss-only graded GRPO solve the boss fight?
 
 Status: Implemented
-Supersedes: [0008](0008-fourteen-hour-grpo.md)
-Depends on: [0005](0005-graded-reward.md) (the reward, already built), [0004](0004-grpo-experiment-plan.md) (the stack)
+Supersedes: [0008](0008-exp-fourteen-hour-grpo.md)
+Depends on: [0005](0005-design-graded-reward.md) (the reward, already built), [0004](0004-exp-grpo.md) (the stack)
 
 **Question.** Boss has resisted every intervention: 8× data, all three checkpoint
 positions, both temperatures, a dropout sweep, and 100 updates of sparse-reward GRPO. It
@@ -42,7 +42,7 @@ the first is a feasibility proof. A negative needs a *plateau*, not merely a low
   **~40% of boss tasks are unwinnable** (Regular/Flamethrower: 0 wins in 316 rollouts) and
   every boss success ever recorded came from Spread or Laser. The graded reward also
   **defeated the difficulty sampler** — hopeless groups gained damage spread, survived
-  filtering, and stopped being detectable as hopeless. [0012](0012-spread-grpo.md) is the
+  filtering, and stopped being detectable as hopeless. [0012](0012-exp-spread-grpo.md) is the
   successor experiment: binary reward, Spread + rapid only.
 
 ---

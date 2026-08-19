@@ -81,7 +81,7 @@ def tail_ce_metrics(ce: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
     minimum (0.703 at step 3,000) scores 52.6% pooled on the 846 suite against 65.5% for
     the fully overfit final at CE 1.754. Survival depends on the rare frames — the jump
     timing, the dodge, the step where holding ``R`` kills you — and this restricts the
-    average to them. See ``doc/0010-dropout-regularization.md``.
+    average to them. See ``doc/0010-exp-dropout-regularization.md``.
 
     ``tail_n`` rides along because callers average over batches: the non-modal step count
     varies far more between batches than the valid-step count does, so an unweighted mean

@@ -1,23 +1,42 @@
-# The 0013 scaling grid: boss-only, Spread-only, on precomputed encoder tokens.
+# The D10k scaling cells: boss-only, Spread-only, on precomputed encoder tokens. Every D10k
+# run comes from this file with overrides on the command line — doc/0013's size ladder
+# (20,000 cycles, cosine), and the 40,000-cycle WSD row that doc/0014 reads on the budget
+# axis and doc/0015 uses as its data-axis control.
 #
 #   python -m contra_policy.train_bc --config-name config_bc_scaling
 #   python -m contra_policy.train_bc --config-name config_bc_scaling \
 #       boss_scaling.shard_count=4 policy.core.d_model=768 policy.core.n_layer=6
 #
-# Differences from `config_bc.yaml`, all of them deliberate and all in doc/0013:
+# Differences from `config_bc.yaml`, each deliberate:
 #
 #   families: [boss]   the release is generated-only Spread boss with zero baseline
 #                      episodes, so a four-family mixture would fill its boss slot from a
-#                      different distribution than its own validation set (§3)
+#                      different distribution than its own validation set. That costs
+#                      comparability with every pooled number (65-69%) and the 846-task
+#                      guardrail: clean or comparable, not both, and this takes clean.
 #   family_draws: {}   0009's control holds the boss share of a *mixture* constant; there
 #                      is no mixture here, and at 666 draws/cycle it would cover 19% of a
-#                      40k release and cap the very axis this measures (§2.2)
-#   batch_size: 16     Spread episodes average 77.8 frames against the mixed set's ~103,
-#                      so batch 4 is only ~312 tokens/step
-#   token_cache        the encoder is 97% of a step and its output never changes (§2.3)
+#                      40k release and cap the very data axis 0015 measures.
+#   batch_size: 32     Spread episodes average 77.8 frames against the mixed set's ~103,
+#                      so batch 4 is only ~312 tokens/step. Was 16 through doc/0018;
+#                      doc/0019 measured 32 as the fastest setting across the ladder.
+#   token_cache        the encoder is 97% of a step and its output never changes; see
+#                      `token_cache.py` for the layout, the fp16 choice and the keying
 #
 # The M cell here is NOT comparable to 0009/0010's 12.86M runs — different data, mixture
-# and batch. The anchor for this document is M at D13, trained under this file.
+# and batch. The anchor for doc/0013 is M at D13, trained under this file.
+#
+# Ladder shapes rejected before this one, so they are not re-proposed:
+#   depth-only scaling  free (no in-projection), but caps at 38.5M and gets there at
+#                       aspect ratio 43 — a flat curve from a badly shaped ladder is
+#                       uninterpretable.
+#   muP                 the principled fix for LR-vs-width, and the right answer past
+#                       101M. Costs per-tensor plumbing and a coordinate check against
+#                       18 sweep runs of ~15 min each. Note the sweep it would replace
+#                       never actually ran; every 0013 cell trained at 3e-4.
+#   unfreezing the      the other prime suspect and 74% of the pre-cache compute, but a
+#   encoder             second variable on this axis. It is the successor experiment,
+#                       and the token cache sharpens it.
 defaults:
   - config_bc
   - _self_
@@ -43,10 +62,22 @@ token_cache:
   val: ${hydra:runtime.cwd}/cache/tokens/spread10k-val
 
 loader:
-  batch_size: 16
-  # No decode and no codec on this path, so workers buy nothing and cost RAM on a 20 GB
-  # WSL box. The memmap is read in the main process.
-  num_workers: 0
+  # doc/0019: batch 32 with 2 workers is the fastest config across the ladder — 4.33 h
+  # against 9.11 h for the batch 16 / 0 worker setting every cell from 0013 to 0018 ran.
+  # It is not the per-size optimum (M and XL prefer batch 64), but per-size tuning buys
+  # only 4% and would make a size comparison also a batch comparison.
+  #
+  # **Batch 32 halves the gradient noise relative to 0013-0018**, so it changes results:
+  # the first ladder at this setting is a new baseline, not an extension of the old one,
+  # and 0018's "1e-4 beats 3e-4" was established at batch 16. Any config below that
+  # declares an epoch-matched budget must halve `train.steps` to keep its exposure.
+  batch_size: 32
+  # Was 0 on the theory that a decode-free path buys nothing from workers. Measured wrong
+  # in doc/0019: 2 workers cut step time 7-21%, and the `num_workers: 0-2` ceiling this
+  # repo carries came from the RL rollout path, not this one. Summed RSS over forked
+  # workers also over-counts shared pages ~4x, which is what made workers look expensive.
+  # Worker count does not change results, only speed.
+  num_workers: 2
   # `null`, not `{}`: OmegaConf *merges* mappings, so an empty dict inherits the parent's
   # {kill, item, traverse, boss} schedule verbatim and the sampler then demands families a
   # boss-only index has none of. null replaces, and `_loader` reads it as "no schedule".
@@ -70,6 +101,9 @@ policy:
     dropout: 0.2            # 0010's best cell
 
 train:
+  # 20,000 cycles was doc/0013's budget **at batch 16**; at the batch 32 this file now
+  # defaults to it is twice the exposure. Set it per experiment rather than inheriting it.
   steps: 20000
-  learning_rate: 3.0e-4     # swept per model size before the grid — see doc/0013 §2.2
-  save_steps: [3000, 10000]
+  learning_rate: 3.0e-4     # one LR for every cell; the sweep never ran — doc/0013 §2
+  save_steps: []
+  save_best: false

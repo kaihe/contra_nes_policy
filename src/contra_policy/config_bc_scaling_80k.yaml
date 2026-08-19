@@ -1,0 +1,37 @@
+# The D80k cells of doc/0017: 40k Spread + 40k Laser, at the same 160,000 cycles.
+#
+#   python -m contra_policy.train_bc --config-name config_bc_scaling_80k \
+#       policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 \
+#       policy.core.n_kv_head=10 hydra.run.dir=./runs/scaling80k/L-D80k-C160k
+#
+# **This is not "D40k with more of the same data."** The two weapon stores in the datahouse
+# were generated from *different start states* — Spread from `…_i371`, Laser from `…_i8`.
+# So D80k doubles the episodes while halving the share that come from the probe's start, and
+# it introduces a second weapon the boss probe never scores. Read against D40k it moves two
+# things: how much data, and what the data is.
+#
+# Differences from `config_bc_scaling_40k.yaml`:
+#
+#   weapon           [spread, laser] — both stores, 40,000 episodes each.
+#   epochs           160,000 x 16 / 80,000 = **32.0**, against D40k's 64.0. At a fixed
+#                    budget, doubling the data halves exposure; that is the same trade
+#                    doc/0015 made and it is deliberate here, because the budget is what
+#                    doc/0017 holds fixed across cells.
+#   val_every 40     1-in-40 keeps the holdout at ~2,000 episodes, matching D40k's 1,976,
+#                    so val CE carries the same noise floor and costs the same ~10 min per
+#                    run. 1-in-20 would have been 4,000 episodes and ~21 min.
+#
+# Laser episodes are longer than Spread's (mean 104.5 vs 78.4 frames, max 311 vs 242), so a
+# batch of 16 carries ~17% more tokens and steps cost proportionally more. Longest episode
+# is far inside `policy.core.context: 1024`.
+defaults:
+  - config_bc_scaling_40k
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/scaling80k/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  weapon: [spread, laser]
+  val_every: 40

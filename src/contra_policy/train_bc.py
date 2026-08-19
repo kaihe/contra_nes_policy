@@ -6,7 +6,7 @@
 The base-policy contract is deliberately GPT-like: masked action cross-entropy is the
 only objective, and its optimisation telemetry matches ``build-nanogpt``. Closed-loop
 task completion remains an evaluation job; offline diagnostic heads and accuracies do
-not belong to this trainer. See ``doc/0006-action-only-base-policy.md``.
+not belong to this trainer. See ``doc/0006-design-action-only-base-policy.md``.
 
 The encoder is **frozen by default**. That makes the causal core the only thing that
 changed, so a bad number is unambiguously its fault rather than a co-adaptation between
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import math
+import json
 import os
 import random
 import signal
@@ -37,6 +38,8 @@ from contra_policy.dataset import (FAMILIES, ContraCrossViewDataset,
 from contra_policy.action_space import ACTION_NAMES
 from contra_policy.loss import BehaviorCloneLoss
 from contra_policy.model import PREFIX, PolicyConfig, build_policy
+from contra_policy.datahouse import (DatahouseTokens, datahouse_index,
+                                     shard_prefix, split_uids)
 from contra_policy.token_cache import (CachedEpisodeDataset, TokenCache,
                                        encoder_fingerprint)
 
@@ -168,63 +171,116 @@ class BCTrainer:
             self.autocast_dtype = None
 
         # -- data ------------------------------------------------------------
-        shard_dir = os.path.expanduser(args.shard_dir)
-        fams = list(args.families)
-        overrides = {k: os.path.expanduser(str(v))
-                     for k, v in dict(args.get("shard_overrides", {})).items()}
-        scaling = args.get("boss_scaling", {})
-        release = None
-        if bool(scaling.get("enabled", False)):
-            if "boss" not in fams:
-                raise ValueError("boss_scaling requires 'boss' in families")
-            release = scaling_release(
-                str(scaling.manifest), int(scaling.shard_count),
-                str(scaling.validation_sha256))
-            other = [f for f in fams if f != "boss"]
-            train_tars = shard_paths(shard_dir, other, "train", overrides) + release["train"]
-            val_tars = shard_paths(shard_dir, other, "val", overrides) + release["val"]
-            print(f"[bc] boss scaling D{int(scaling.shard_count)} · "
-                  f"{release['train_episodes']} episodes / "
-                  f"{release['train_frames']} decisions", flush=True)
-        else:
-            train_tars = shard_paths(shard_dir, fams, "train", overrides)
-            val_tars = shard_paths(shard_dir, fams, "val", overrides)
-        train_idx = load_or_build_index(train_tars, args.cache_dir)
-        val_idx = load_or_build_index(val_tars, args.cache_dir)
-        expected = args.get("expected_episodes", {})
-        expected_train = dict(expected.get("train", {}))
-        expected_val = dict(expected.get("val", {}))
-        if release is not None:
-            expected_train["boss"] = release["train_episodes"]
-            expected_val["boss"] = release["val_episodes"]
-        _require_family_counts(train_idx, expected_train, "train")
-        _require_family_counts(val_idx, expected_val, "val")
-        # Precomputed frozen-encoder tokens replace the decode+encode legs entirely.
-        # `train_index` still comes from the tars, because the family schedule and the
-        # release assertions above are contracts about the *shards*; the cache only
-        # changes where the pixels' representation comes from.
-        tc_cfg = args.get("token_cache", {}) or {}
-        self.token_cache = bool(tc_cfg.get("train"))
-        if self.token_cache and not bool(args.policy.freeze_encoder):
-            raise ValueError(
-                "token_cache requires policy.freeze_encoder=true — a trainable encoder "
-                "cannot be served from a cache of its own past outputs")
-        ds_kw = dict(whole_episode=True, image_size=int(args.image_size),
-                     sigma_px=float(args.sigma_px), aux_size=int(args.policy.aux_size),
-                     prev_action_keep_prob=0.0, seed=int(args.seed))
-        if self.token_cache:
+        # Data owns the tokens now (doc/0016 §2, `kaihe/contra_nes_policy#7`), so this
+        # branch has no shard tars, no `cache/` and no family schedule to assert: the
+        # datahouse slice *is* the dataset. Everything below the branch is shared.
+        dh_cfg = args.get("datahouse", {}) or {}
+        self.datahouse = bool(dh_cfg.get("root"))
+        if self.datahouse:
+            if not bool(args.policy.freeze_encoder):
+                raise ValueError(
+                    "datahouse requires policy.freeze_encoder=true — a trainable encoder "
+                    "cannot be served from precomputed tokens")
             enc_sha = encoder_fingerprint(str(args.policy.encoder_ckpt))
-            caches = {split: TokenCache(str(tc_cfg[split]), encoder_sha256=enc_sha,
-                                        image_size=int(args.image_size))
-                      for split in ("train", "val")}
-            self.train_ds = CachedEpisodeDataset(caches["train"],
-                                                 [e["uid"] for e in train_idx])
-            self.val_ds = CachedEpisodeDataset(caches["val"], [e["uid"] for e in val_idx])
-            print(f"[bc] token cache · {len(caches['train'])} train / "
-                  f"{len(caches['val'])} val episodes · encoder {enc_sha[:12]}", flush=True)
+            store = DatahouseTokens(
+                str(dh_cfg.root), level=int(dh_cfg.get("level", 1)),
+                task=str(dh_cfg.get("task", "boss")),
+                # str or list: a multi-weapon cell mixes start states (datahouse.py).
+                weapon=OmegaConf.to_container(dh_cfg.weapon, resolve=True)
+                if not isinstance(dh_cfg.get("weapon", "spread"), str)
+                else str(dh_cfg.weapon),
+                encoder_sha256=enc_sha, image_size=int(args.image_size))
+            train_uids, val_uids = split_uids(store, int(dh_cfg.get("val_every", 20)))
+            # A shard prefix cuts the training tier only: the holdout is carved by uid digest
+            # over the whole store first, so every prefix validates on the same episodes.
+            prefix = dh_cfg.get("shard_counts") or dh_cfg.get("shard_count")
+            if prefix is not None and not isinstance(prefix, (int, float)):
+                prefix = OmegaConf.to_container(prefix, resolve=True)
+            train_uids = shard_prefix(store, train_uids, prefix)
+            train_idx = datahouse_index(store, train_uids)
+            val_idx = datahouse_index(store, val_uids)
+            self.token_cache = True
+            self.train_ds = CachedEpisodeDataset(store, train_uids)
+            self.val_ds = CachedEpisodeDataset(store, val_uids)
+            train_frames = sum(store.length(u) for u in train_uids)
+            # What this run trains on, not what the store holds: a shard prefix reads a
+            # fraction of the slice, and `tools/scaling_report.py` names the tier from this
+            # file rather than guessing a size from the config.
+            json.dump({"source": "datahouse", "slice": list(store.slice[:2]) + [
+                        list(store.slice[2])],
+                       "train_episodes": len(train_uids), "val_episodes": len(val_uids),
+                       "train_frames": int(train_frames),
+                       "store_episodes": len(store), "store_frames": int(store.declared[1]),
+                       "shard_count": prefix,
+                       "val_every": int(dh_cfg.get("val_every", 20))},
+                      open("dataset.json", "w"), indent=2)
+            print(f"[bc] datahouse {store.slice} · {len(train_uids)} train / "
+                  f"{len(val_uids)} val episodes ({train_frames} train frames) · "
+                  f"encoder {enc_sha[:12]} · provisional split 1/"
+                  f"{int(dh_cfg.get('val_every', 20))}"
+                  + (f" · train shard prefix {prefix}" if prefix else ""), flush=True)
         else:
-            self.train_ds = ContraCrossViewDataset(train_idx, **ds_kw)
-            self.val_ds = ContraCrossViewDataset(val_idx, **ds_kw)
+            shard_dir = os.path.expanduser(args.shard_dir)
+            fams = list(args.families)
+            overrides = {k: os.path.expanduser(str(v))
+                         for k, v in dict(args.get("shard_overrides", {})).items()}
+            scaling = args.get("boss_scaling", {})
+            release = None
+            if bool(scaling.get("enabled", False)):
+                if "boss" not in fams:
+                    raise ValueError("boss_scaling requires 'boss' in families")
+                release = scaling_release(
+                    str(scaling.manifest), int(scaling.shard_count),
+                    str(scaling.validation_sha256))
+                other = [f for f in fams if f != "boss"]
+                train_tars = (shard_paths(shard_dir, other, "train", overrides)
+                              + release["train"])
+                val_tars = (shard_paths(shard_dir, other, "val", overrides)
+                            + release["val"])
+                print(f"[bc] boss scaling D{int(scaling.shard_count)} · "
+                      f"{release['train_episodes']} episodes / "
+                      f"{release['train_frames']} decisions", flush=True)
+            else:
+                train_tars = shard_paths(shard_dir, fams, "train", overrides)
+                val_tars = shard_paths(shard_dir, fams, "val", overrides)
+            train_idx = load_or_build_index(train_tars, args.cache_dir)
+            val_idx = load_or_build_index(val_tars, args.cache_dir)
+            expected = args.get("expected_episodes", {})
+            expected_train = dict(expected.get("train", {}))
+            expected_val = dict(expected.get("val", {}))
+            if release is not None:
+                expected_train["boss"] = release["train_episodes"]
+                expected_val["boss"] = release["val_episodes"]
+            _require_family_counts(train_idx, expected_train, "train")
+            _require_family_counts(val_idx, expected_val, "val")
+            # Precomputed frozen-encoder tokens replace the decode+encode legs entirely.
+            # `train_index` still comes from the tars, because the family schedule and the
+            # release assertions above are contracts about the *shards*; the cache only
+            # changes where the pixels' representation comes from.
+            tc_cfg = args.get("token_cache", {}) or {}
+            self.token_cache = bool(tc_cfg.get("train"))
+            if self.token_cache and not bool(args.policy.freeze_encoder):
+                raise ValueError(
+                    "token_cache requires policy.freeze_encoder=true — a trainable encoder "
+                    "cannot be served from a cache of its own past outputs")
+            ds_kw = dict(whole_episode=True, image_size=int(args.image_size),
+                         sigma_px=float(args.sigma_px), aux_size=int(args.policy.aux_size),
+                         prev_action_keep_prob=0.0, seed=int(args.seed))
+            if self.token_cache:
+                enc_sha = encoder_fingerprint(str(args.policy.encoder_ckpt))
+                caches = {split: TokenCache(str(tc_cfg[split]), encoder_sha256=enc_sha,
+                                            image_size=int(args.image_size))
+                          for split in ("train", "val")}
+                self.train_ds = CachedEpisodeDataset(caches["train"],
+                                                     [e["uid"] for e in train_idx])
+                self.val_ds = CachedEpisodeDataset(caches["val"],
+                                                   [e["uid"] for e in val_idx])
+                print(f"[bc] token cache · {len(caches['train'])} train / "
+                      f"{len(caches['val'])} val episodes · encoder {enc_sha[:12]}",
+                      flush=True)
+            else:
+                self.train_ds = ContraCrossViewDataset(train_idx, **ds_kw)
+                self.val_ds = ContraCrossViewDataset(val_idx, **ds_kw)
         self.train_index = train_idx
         # -1 because the last frame of an episode has no action taken *from* it.
         self.train_len = [max(1, e["length"] - 1) for e in train_idx]
@@ -392,7 +448,14 @@ class BCTrainer:
                     self._emit(row, "train")
                 if self.step % int(self.args.train.val_every) == 0:
                     self._run_val(int(self.args.train.val_batches))
-                if self.step in {int(x) for x in self.args.train.get("save_steps", [])}:
+                periodic = self.step in {
+                    int(x) for x in self.args.train.get("save_steps", [])}
+                trunk = (
+                    bool(self.args.train.get("save_wsd_trunk", False))
+                    and str(self.args.train.lr_decay) == "wsd"
+                    and self.step == wsd_onset(
+                        total, float(self.args.train.get("decay_frac", 0.1))))
+                if periodic or trunk:
                     self.save()
         finally:
             # Whole val set however the run ended — this is the gate.
@@ -407,7 +470,8 @@ class BCTrainer:
         val_loss = v["loss"]
         if val_loss < self.best:
             self.best = val_loss
-            self.save(best=True)
+            if bool(self.args.train.get("save_best", True)):
+                self.save(best=True)
 
     def _emit(self, row: Dict[str, float], phase: str) -> None:
         self.logger.log({**row, "phase": phase})

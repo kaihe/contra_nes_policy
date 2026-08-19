@@ -1,0 +1,16 @@
+# doc/0022: D10k Spread + D10k Laser in one training set. Prefixes are per weapon;
+# a single global shard_count would select Laser first under catalog ordering.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/mixed_d10/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  weapon: [spread, laser]
+  shard_count: null
+  shard_counts:
+    spread: 13
+    laser: 18

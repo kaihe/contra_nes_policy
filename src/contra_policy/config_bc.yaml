@@ -19,7 +19,7 @@ boss_scaling:
   validation_sha256: 131835e34c55f75ded04410976730600a866744b40a8525bfc4d7f9ab952ecad
 expected_episodes: {train: {}, val: {}}
 cache_dir: ${hydra:runtime.cwd}/cache
-# Precomputed frozen-encoder tokens (doc/0013 §2.3). When `train` is set, the loader reads
+# Precomputed frozen-encoder tokens (see `token_cache.py`). When `train` is set, the loader reads
 # only these directories — no tar, no PyAV, no cv2 — and `policy.forward_tokens` replaces
 # the encoder forward, which is ~97% of a step. Requires `policy.freeze_encoder: true`:
 # a trainable encoder cannot be served from a cache of its own past outputs.
@@ -98,6 +98,11 @@ train:
   max_grad_norm: 1.0
   log_every: 50
   val_every: 1000
-  save_steps: [3000, 10000]
+  # Keep one branchable WSD trunk (the cooldown onset) plus final. Metrics retain the best
+  # validation loss and its step without writing `policy-best.pt`; the trunk is optimizer-
+  # complete so a longer budget can resume before any annealing has changed the weights.
+  save_steps: []
+  save_best: false
+  save_wsd_trunk: true
   # Batches per in-run validation. 0 in `val_full` means the whole validation set.
   val_batches: 60

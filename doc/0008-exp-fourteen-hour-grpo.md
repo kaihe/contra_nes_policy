@@ -1,10 +1,10 @@
-# Run GRPO for fourteen hours before judging its learning horizon
+# Does GRPO continue learning over fourteen hours?
 
 Status: Superseded by 0011
 Supersedes: —
-Depends on: [0004](0004-grpo-experiment-plan.md) (GRPO stack and probes),
-[0005](0005-graded-reward.md) (current reward),
-[0006](0006-action-only-base-policy.md) (initial policy)
+Depends on: [0004](0004-exp-grpo.md) (GRPO stack and probes),
+[0005](0005-design-graded-reward.md) (current reward),
+[0006](0006-design-action-only-base-policy.md) (initial policy)
 
 **Question.** The existing GRPO experiments stop after roughly 100 updates. Is their
 plateau a real learning limit, or does the action-only GPT policy need a much longer
@@ -24,7 +24,7 @@ reallocate the remaining compute to MC-search data generation. Its fixed probe s
 an early, noisy gain, but 61 updates do not answer this document's fourteen-hour
 question. The resulting `grpo-final.pt` is a pilot artifact, not evidence for or
 against long-horizon GRPO. The active sequence is now data scale, model scale, then RL
-scale; see [0009](0009-boss-data-scaling.md).
+scale; see [0009](0009-exp-boss-data-scaling.md).
 
 ---
 

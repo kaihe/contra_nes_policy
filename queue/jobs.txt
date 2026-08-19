@@ -1,0 +1,81 @@
+# doc/0016 (D40k) and doc/0017 (D80k = Spread + Laser), on the data-owned datahouse.
+# TSV: <name>\t<command>. Names are `<model>-D<data>-C<cycles>`; seed 0 and WSD are the
+# defaults and stay out of the name.
+#
+# M and L only for now. XL and XXL are a further ~6.5 h and can be appended to this file
+# while the queue runs — the runner picks up new lines within a minute.
+#
+# ~3 h total: M ~1 h 16, L ~1 h 44 (0015 ms/step x 160,000).
+#
+# Validation is the provisional 1-in-20 uid-digest holdout (see datahouse.py); CE from
+# these runs is comparable within doc/0016 only, never against the 10k or 20k tiers.
+#
+# doc/0015's four D20k cells ran from this file on 2026-08-12 and are recorded in
+# queue/state.tsv; the runner skips any name already marked done there.
+
+M-D40k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_40k hydra.run.dir=./runs/scaling40k/M-D40k-C160k
+L-D40k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_40k policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/scaling40k/L-D40k-C160k
+XL-D40k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_40k policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/scaling40k/XL-D40k-C160k
+XXL-D40k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_40k policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/scaling40k/XXL-D40k-C160k
+
+# doc/0017 — D80k = 40k Spread + 40k Laser, same 160,000 cycles. NOTE: the two stores come
+# from *different* start states, so this doubles the data and halves the share drawn from the
+# boss probe's start. 32.0 epochs, against D40k's 64.0.
+M-D80k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_80k hydra.run.dir=./runs/scaling80k/M-D80k-C160k
+L-D80k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_80k policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/scaling80k/L-D80k-C160k
+#XL-D80k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_80k policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 resume_from=./runs/scaling80k/XL-D80k-C160k/checkpoints/policy-130000.pt hydra.run.dir=./runs/scaling80k/XL-D80k-C160k
+#XXL-D80k-C160k	python -m contra_policy.train_bc --config-name config_bc_scaling_80k policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/scaling80k/XXL-D80k-C160k
+
+# doc/0018 — learning-rate sweep. The D10k tier cut from the D40k datahouse (13 of 53 shards,
+# 9,330 train episodes) so it validates on doc/0016's own 1,976-episode holdout. 40,000 cycles,
+# WSD, decay_frac 0.1. The only thing that differs within a size pair is `train.learning_rate`.
+#
+# ~3 h 06: L 2 x 25 min, XXL 2 x 68 min. L runs first so a signal arrives inside an hour.
+#
+# The two D80k cells above are commented out — XL was frozen at step 130,000 to free the GPU
+# and XXL never started. Uncomment both to resume that work; XL picks up from its checkpoint.
+L-D10k-C40k	python -m contra_policy.train_bc --config-name config_bc_scaling_lr policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/scaling_lr/L-D10k-C40k
+L-D10k-C40k-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_scaling_lr policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 train.learning_rate=1e-4 hydra.run.dir=./runs/scaling_lr/L-D10k-C40k-lr1e-4
+XXL-D10k-C40k	python -m contra_policy.train_bc --config-name config_bc_scaling_lr policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/scaling_lr/XXL-D10k-C40k
+XXL-D10k-C40k-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_scaling_lr policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 train.learning_rate=1e-4 hydra.run.dir=./runs/scaling_lr/XXL-D10k-C40k-lr1e-4
+
+# doc/0020 — how does model size affect the low-LR Laser boss fight, and can XXL reproduce
+# its 0018 result? Laser-only D10k prefix (18/70 shards, 9,771 train episodes), batch 32,
+# 20,000 cycles, LR 1e-4. Smallest first so the size curve arrives incrementally.
+M-D10k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser hydra.run.dir=./runs/laser/M-D10k-C20k-laser-lr1e-4
+L-D10k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/laser/L-D10k-C20k-laser-lr1e-4
+XL-D10k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/laser/XL-D10k-C20k-laser-lr1e-4
+XXL-D10k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/laser/XXL-D10k-C20k-laser-lr1e-4
+
+# doc/0020 — matched lower-LR arms, after the complete 1e-4 ladder. The 3e-5 point preserves
+# roughly logarithmic spacing from 3e-4 → 1e-4 → 3e-5 and tests 0018's cooldown signal.
+M-D10k-C20k-laser-lr3e-5	python -m contra_policy.train_bc --config-name config_bc_laser train.learning_rate=3e-5 hydra.run.dir=./runs/laser/M-D10k-C20k-laser-lr3e-5
+L-D10k-C20k-laser-lr3e-5	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 train.learning_rate=3e-5 hydra.run.dir=./runs/laser/L-D10k-C20k-laser-lr3e-5
+XL-D10k-C20k-laser-lr3e-5	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 train.learning_rate=3e-5 hydra.run.dir=./runs/laser/XL-D10k-C20k-laser-lr3e-5
+XXL-D10k-C20k-laser-lr3e-5	python -m contra_policy.train_bc --config-name config_bc_laser policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 train.learning_rate=3e-5 hydra.run.dir=./runs/laser/XXL-D10k-C20k-laser-lr3e-5
+
+# doc/0021 — double Laser-only data at fixed C20k and LR 1e-4. The first 36/70 shards
+# yield 19,496 train episodes; smallest first so the size curve arrives incrementally.
+M-D20k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_20k hydra.run.dir=./runs/laser20k/M-D20k-C20k-laser-lr1e-4
+L-D20k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_20k policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/laser20k/L-D20k-C20k-laser-lr1e-4
+XL-D20k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_20k policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/laser20k/XL-D20k-C20k-laser-lr1e-4
+XXL-D20k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_20k policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/laser20k/XXL-D20k-C20k-laser-lr1e-4
+
+# doc/0021 — full-store D40k Laser data at fixed C20k and LR 1e-4. All 70 shards yield
+# 38,007 train episodes; smallest first so the size curve arrives incrementally.
+M-D40k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_40k hydra.run.dir=./runs/laser40k/M-D40k-C20k-laser-lr1e-4
+L-D40k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_40k policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/laser40k/L-D40k-C20k-laser-lr1e-4
+XL-D40k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_40k policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/laser40k/XL-D40k-C20k-laser-lr1e-4
+XXL-D40k-C20k-laser-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_laser_40k policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/laser40k/XXL-D40k-C20k-laser-lr1e-4
+
+# doc/0022 — D10k Spread + D10k Laser in one model. C20k holds total compute fixed;
+# C40k restores the 67-epoch exposure of separate D10k/C20k training. Saves WSD trunk + final.
+M-D20k-C20k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 hydra.run.dir=./runs/mixed_d10/M-D20k-C20k-mixed-lr1e-4
+L-D20k-C20k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/mixed_d10/L-D20k-C20k-mixed-lr1e-4
+# Deferred for the later-night queue; uncomment these four lines to run XL/XXL.
+#XL-D20k-C20k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/mixed_d10/XL-D20k-C20k-mixed-lr1e-4
+#XXL-D20k-C20k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/mixed_d10/XXL-D20k-C20k-mixed-lr1e-4
+M-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 hydra.run.dir=./runs/mixed_d10/M-D20k-C40k-mixed-lr1e-4
+L-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/mixed_d10/L-D20k-C40k-mixed-lr1e-4
+#XL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/mixed_d10/XL-D20k-C40k-mixed-lr1e-4
+#XXL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/mixed_d10/XXL-D20k-C40k-mixed-lr1e-4

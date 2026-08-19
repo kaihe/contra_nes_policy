@@ -2,13 +2,15 @@
 """Build a frozen-encoder token cache for a scaling-release prefix.
 
     python tools/build_token_cache.py \
-        --manifest ~/code/contra_nes_data/game_trace/releases/boss-spread-10k-v1/manifest.json \
-        --shard-count 13 \
+        --manifest ~/code/contra_nes_data/game_trace/releases/boss-spread-20k-v1/manifest.json \
+        --shard-count 27 \
+        --validation-sha256 84cc5c50…6f9bfc \
         --encoder runs/encoder/2026-07-31/18-00-11/checkpoints/encoder-final.pt \
-        --out cache/tokens/spread10k-d13
+        --out cache/tokens/spread20k-d27
 
-`--split val` caches the release's held-out shard instead of the training prefix.
-See `doc/0013-scaling-grid.md` §2.3.
+**Pass the release's longest prefix.** Prefixes are nested, so that one cache serves every
+smaller data cell — training selects a cell by uid, not by cache. `--split val` caches the
+release's held-out shard instead. See `doc/0015-exp-scaling-data.md` §2.
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--manifest", required=True, help="release manifest.json")
     ap.add_argument("--shard-count", type=int, required=True,
-                    help="which nested train prefix (1, 2, 4, 8, 13)")
+                    help="which nested train prefix; normally the release's longest "
+                         "(10k: 13, 20k: 27) so one cache serves every data cell")
     ap.add_argument("--encoder", required=True, help="stage-A encoder checkpoint")
     ap.add_argument("--out", required=True, help="cache directory to create")
     ap.add_argument("--split", choices=("train", "val"), default="train")

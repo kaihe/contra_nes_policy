@@ -72,6 +72,42 @@ def test_repo_default_is_wsd():
             assert 0.0 < cfg.train.decay_frac < 1.0
 
 
+def test_repo_default_keeps_only_the_wsd_trunk_and_final_checkpoint():
+    from hydra import compose, initialize_config_module
+    with initialize_config_module("contra_policy", version_base=None):
+        for name in ("config_bc", "config_bc_scaling", "config_bc_scaling_lr",
+                     "config_bc_scaling_40k", "config_bc_laser"):
+            cfg = compose(config_name=name)
+            assert list(cfg.train.save_steps) == []
+            assert cfg.train.save_best is False
+            assert cfg.train.save_wsd_trunk is True
+
+
+def test_validation_tracks_best_without_saving_when_disabled():
+    class Fake:
+        args = OmegaConf.create({"train": {"save_best": False}})
+        best = math.inf
+        step = 10
+        saved = False
+
+        def validate(self, _batches):
+            return {"loss": 0.75}
+
+        def _accounting_metrics(self):
+            return {}
+
+        def _emit(self, _row, _tag):
+            return None
+
+        def save(self, **_kwargs):
+            self.saved = True
+
+    trainer = Fake()
+    BCTrainer._run_val(trainer, 0)
+    assert trainer.best == pytest.approx(0.75)
+    assert trainer.saved is False
+
+
 # ── extending a run: the point of the switch ─────────────────────────────────
 
 class _FakeTrainer:

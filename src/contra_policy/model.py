@@ -3,7 +3,7 @@
     [interaction, goal, frame_1, frame_2, …, frame_T]  ->  action_t at each frame
 
 One `contra_encoder.encode` per image — agent frames and the goal frame alike — then a
-causal transformer over the result. See ``doc/0002-gpt-policy.md``.
+causal transformer over the result. See ``doc/0002-design-gpt-policy.md``.
 
 What is *not* here, and why, because their absence is the design:
 
@@ -100,7 +100,7 @@ class ContraPolicy(nn.Module):
 
         # `nn.Identity` at d_core == d_enc carries **no parameters**, so every checkpoint
         # trained before the ladder keeps its exact state-dict shape and the M cell stays
-        # bit-identical to the 0006/0009/0010 anchor. See doc/0013 §2.1.
+        # bit-identical to the 0006/0009/0010 anchor. See doc/0013 §2.
         self.in_proj = (nn.Identity() if d_core == d_enc
                         else nn.Linear(d_enc, d_core, bias=False))
 

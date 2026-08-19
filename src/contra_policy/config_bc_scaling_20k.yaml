@@ -1,0 +1,38 @@
+# The 0015 data axis on `boss-spread-20k-v1` — six cells, 58k → 1.57M frames.
+#
+#   python -m contra_policy.train_bc --config-name config_bc_scaling_20k
+#   python -m contra_policy.train_bc --config-name config_bc_scaling_20k \
+#       boss_scaling.shard_count=4
+#
+# **This is a new axis, not an extension of the 10k one.** doc/0013 predeclared the
+# 20k snapshot as two more points on the existing curve, "provided they keep the same
+# 100-task validation and prefix scheme". They did not: the release is a full
+# regeneration — 19,900 episodes with *zero* uid overlap with boss-spread-10k-v1, and a
+# new validation shard (84cc5c50…, its own 100 tasks). So a 10k cell and a 20k cell are
+# measured against different held-out sets and their CE is not comparable. The 20k
+# release carries the whole data axis on its own; the 10k cells stay as they are.
+#
+# Still one start state (`…_i371`, all 19,900), which 0013 asked to change. The
+# in-distribution/transfer gap therefore remains a reported quantity, not a fixed problem.
+defaults:
+  - config_bc_scaling
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/scaling20k/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# doc/0015 §2. Cells are 1 / 2 / 4 / 8 / 16 / 27 shards = 737 / 1,474 / 2,949 / 5,897 / 11,793 / 19,900
+# episodes = 58,065 / 116,130 / 232,305 / 464,564 / 929,081 / 1,567,785 frames. Note 27,
+# not 32, and the top cell is 2.03x D13 — plot against log2(frames), never shard count.
+boss_scaling:
+  manifest: ~/code/contra_nes_data/game_trace/releases/boss-spread-20k-v1/manifest.json
+  shard_count: 27
+  validation_sha256: 84cc5c509bd1307048e2dee6b497691f71b6b4d3b71a093eae18e279ba6f9bfc
+
+# One cache per release, built over the *longest* prefix (27) — prefixes are nested, so
+# this single 1.63 GB directory serves all six cells and `shard_count` selects the subset
+# by uid. Six per-cell caches would re-encode the same frames 2.1x for identical tokens.
+token_cache:
+  train: ${hydra:runtime.cwd}/cache/tokens/spread20k-d27
+  val: ${hydra:runtime.cwd}/cache/tokens/spread20k-val

@@ -11,7 +11,9 @@ the thing under study::
 Every one of those encodes is *redundant*. The encoder is frozen, the loader applies no
 pixel augmentation, and a run makes 32 (D13) to 420 (D1) passes over the data — so each
 frame is decoded and encoded into the identical 512-d vector dozens to hundreds of times.
-This module computes it once and memmaps the answer. See ``doc/0013-scaling-grid.md`` §2.3.
+This module computes it once and memmaps the answer. Built for the
+``doc/0013-exp-scaling-model.md`` ladder; the one-cache-per-release rule is
+``doc/0015-exp-scaling-data.md`` §2.
 
 Layout, written by :func:`build_token_cache`::
 
@@ -46,7 +48,7 @@ bf16, whose resolution near 1.0 is ~8e-3. Tokens are LayerNorm outputs bounded t
 ±5.1, so fp16's range is never in question.
 
 **The cache key is the encoder checkpoint's sha256 plus the image size.** A mismatch raises;
-it never silently rebuilds or falls back. Training the whole 0013 grid against a stale
+it never silently rebuilds or falls back. Training a whole scaling axis against a stale
 representation would invalidate every cell in it, and that failure is invisible in the loss
 curve — it looks like a slightly worse encoder, not like a bug.
 
@@ -205,6 +207,16 @@ class CachedEpisodeDataset(Dataset):
     def __init__(self, cache: TokenCache, uids: Optional[Sequence[str]] = None):
         self.cache = cache
         self.uids = list(uids) if uids is not None else [e["uid"] for e in cache.episodes]
+        # A data cell is a *subset* of a release cache (see `build_token_cache`), so the
+        # requested uids being absent is the ordinary "wrong cache for this cell" mistake,
+        # not a corrupt file. Say which, rather than letting one KeyError name one uid.
+        missing = [u for u in self.uids if u not in cache]
+        if missing:
+            raise StaleCache(
+                f"{len(missing)} of {len(self.uids)} requested episodes are not in the "
+                f"cache at {cache.path} (it holds {len(cache)}), e.g. {missing[:3]}. "
+                f"This cache was built over a smaller prefix — or a different release — "
+                f"than the cell being trained; build it over the release's full prefix.")
         # -1 because the last frame of an episode has no action taken *from* it.
         self.lengths = [max(1, cache.length(u) - 1) for u in self.uids]
 
@@ -255,8 +267,15 @@ def build_token_cache(index: Sequence[dict], encoder, out_dir: str, *,
     decode/resize is what guarantees a cached token equals a live one. One is built here if
     not supplied.
 
+    **Build one cache per release, over its longest prefix — not one per data cell.** A
+    release's scaling prefixes are nested by shard order, so the full-prefix cache contains
+    every smaller cell's episodes, and :class:`CachedEpisodeDataset` selects a cell by uid.
+    Six caches for the 20k release's six cells would re-encode the same frames 2.1x over
+    and cost 3.49 GB instead of 1.63 GB, for tokens that are identical by construction.
+
     Writes to a temporary directory and renames on success, so an interrupted build leaves
     no half-cache that a later run would trust.
+
     """
     from contra_policy.action_space import vectors_to_indices    # local: avoids a cycle
     from contra_policy.dataset import ContraCrossViewDataset

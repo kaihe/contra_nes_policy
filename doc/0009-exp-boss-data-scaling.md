@@ -1,8 +1,8 @@
-# Measure boss-data scaling before increasing the policy or RL budget
+# Does more boss data improve the fixed base policy?
 
 Status: Implemented
 Supersedes: —
-Depends on: [0006](0006-action-only-base-policy.md) (fixed model and BC recipe)
+Depends on: [0006](0006-design-action-only-base-policy.md) (fixed model and BC recipe)
 
 **Question.** Does giving the current action-only GPT more distinct, verified boss
 demonstrations improve held-out boss play, or would a larger model and longer RL run
@@ -28,7 +28,7 @@ D4 final (67.1%) is the best base checkpoint the sweep produced. Full results:
 that doc gets wrong: the offline CE gain it reports (2.13 → 1.76) is measured at step
 20,000, but **at the CE minimum D1 and D8 are 0.713 and 0.703** — the data bought no
 generalization at all, only a slower approach to overfitting. See
-[0010](0010-dropout-regularization.md) §1.
+[0010](0010-exp-dropout-regularization.md) §1.
 
 Use `boss-mixed-v2`, not `boss-pure-v1`, for the primary result. Both contain the new
 search wins, but pure-v1 derives all 2,034 examples from four fixed emulator states and
@@ -236,4 +236,3 @@ independent variable. They belong after the fixed-compute curve.
 | natural boss episode/decision shares | the preceding counts crossed with the four manifest prefixes |
 | action-only base-v2 results and CE/checkpoint mismatch | `/home/kaihe/code/contra_nes_evaluation/doc/0010-action-only-base-v2.md` |
 | fixed model and optimizer recipe | `src/contra_policy/config_bc.yaml`; `runs/bc/2026-08-04/15-19-58/resolved_config.yaml` |
-

@@ -1,8 +1,8 @@
-# How to organise a GRPO stack: three borrowed shapes
+# Organise the GRPO stack around rollout generation
 
 Status: Proposed
 Supersedes: —
-Depends on: [0002](0002-gpt-policy.md) — the policy GRPO fine-tunes.
+Depends on: [0002](0002-design-gpt-policy.md) — the policy GRPO fine-tunes.
 
 **Question.** The previous PPO stack was 1,610 lines and was deleted. Before writing
 another, which existing project's *organisation* should we borrow — LLaMA-Factory,
@@ -69,7 +69,7 @@ the right seam — it is where `build_chunk` lived in the old stack. Callbacks a
 clean home for the per-family Wilson metrics and the memory guard.
 
 **Costs.** We measured `OnPolicyAlgorithm`'s contract as wrong for us in
-[0002](0002-gpt-policy.md) §5: it collects `while n_steps < n_rollout_steps` and
+[0002](0002-design-gpt-policy.md) §5: it collects `while n_steps < n_rollout_steps` and
 bootstraps at the window boundary, where we need **complete unbootstrapped episodes**
 with a per-task budget. Inheriting the shape means inheriting a `collect_rollouts`
 signature built around a fixed step count. And the hierarchy pays for generality —
@@ -104,7 +104,7 @@ episodes from an emulator**, G at a time from one savestate, and cannot be shuff
 pre-fetched. Sharing a `data/` registry across those means an abstraction whose two
 implementations have nothing in common but the output type. Stage dispatch also tends
 to accumulate `if stage ==` branches through shared code, which is exactly the
-`index_bias`-style bookkeeping [0002](0002-gpt-policy.md) deleted.
+`index_bias`-style bookkeeping [0002](0002-design-gpt-policy.md) deleted.
 
 ## 4. slime — generation and training as separate systems
 
@@ -140,7 +140,7 @@ naming it. That is weak evidence it fits the problem.
 **Costs.** slime's real machinery — async generation, a separate inference engine,
 multi-node data flow — solves problems we do not have. We measured the emulator at
 12.7% of wall and rejected the vLLM-style split on those grounds
-([0002](0002-gpt-policy.md) §5). Borrowing the *shape* is right; borrowing the
+([0002](0002-design-gpt-policy.md) §5). Borrowing the *shape* is right; borrowing the
 apparatus would be the same mistake as adopting SB3.
 
 ## 5. Recommendation
@@ -189,7 +189,7 @@ rejection sampling unattractive, and GRPO does not automatically escape it.
 |---|---|
 | SB3 layout and `collect_rollouts`/`train` contract | read from the installed package, `common/on_policy_algorithm.py` |
 | LLaMA-Factory, slime | **from memory — not installed here, not verified** |
-| emulator 12.7% of wall | `tools/profile_collect.py`, [0002](0002-gpt-policy.md) §1 |
+| emulator 12.7% of wall | `tools/profile_collect.py`, [0002](0002-design-gpt-policy.md) §1 |
 | item regression without reference KL | 500-update PPO run, 76.5% → 71.1% over the first and last 100 updates |
 | boss 3.5% success | `contra_nes_evaluation/doc/0005-gpt-bc.md` |
 | deleted stack's module layout | commit `b452713` |

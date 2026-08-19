@@ -1,8 +1,8 @@
-# No reweighting of validation CE proxies closed-loop play — close the branch
+# Can regularisation or reweighted validation CE predict closed-loop play?
 
 Status: Implemented
 Supersedes: —
-Depends on: [0009](0009-boss-data-scaling.md) (the D1–D8 runs this measures), [0006](0006-action-only-base-policy.md) (fixed recipe)
+Depends on: [0009](0009-exp-boss-data-scaling.md) (the D1–D8 runs this measures), [0006](0006-design-action-only-base-policy.md) (fixed recipe)
 
 **Question.** Validation CE bottoms at step 3,000 and then triples by step 20,000, so the
 action-only policy is plainly overfitting. Does regularizing that away improve closed-loop
@@ -132,8 +132,8 @@ smoothing, per-family CE — each is a reweighting of a quantity measured to be 
 uninformative here. Fitting held-out expert actions is simply not what closed-loop
 survival measures.
 
-This is also the general form of the failure [0003](0003-grpo-code-layout.md),
-[0005](0005-graded-reward.md) and evaluation 0011 §4 each hit separately.
+This is also the general form of the failure [0003](0003-design-grpo-code-layout.md),
+[0005](0005-design-graded-reward.md) and evaluation 0011 §4 each hit separately.
 
 ### Correcting evaluation 0011
 
@@ -174,7 +174,7 @@ measurement.
 
 ## 3. How the registered predictions resolved
 
-Recorded before the runs, in the style of [0004](0004-grpo-experiment-plan.md) §4:
+Recorded before the runs, in the style of [0004](0004-exp-grpo.md) §4:
 
 | prediction | outcome |
 |---|---|
@@ -256,7 +256,7 @@ Not much, as a finding; quite a lot, as a checkpoint.
 - **Single seed**, finals only.
 
 So dropout 0.2's 69.0% is the best *point estimate* in the project for pure BC and a
-reasonable RL init — [0011](0011-boss-grpo.md) §2 gates it on a seed-1 replication before
+reasonable RL init — [0011](0011-exp-boss-grpo.md) §2 gates it on a seed-1 replication before
 spending 10 GPU-hours on it — but it is not evidence that regularization is the lever, and
 it does not reopen the offline-CE axis.
 
@@ -277,7 +277,7 @@ intervention tried: BC at four data scales, all three checkpoint positions, both
 temperatures, and GRPO. The lever with an actual mechanism is the graded boss-HP reward —
 data side is done (`KillBossMaker.boss_hp`, `boss_hp_start` in boss JSON) and the request
 is open at `kaihe/contra_nes_policy#1`, with the design already in
-[0005](0005-graded-reward.md). It converts ~91% of boss rollouts from a zero into a graded
+[0005](0005-design-graded-reward.md). It converts ~91% of boss rollouts from a zero into a graded
 signal, and it needs its own doc.
 
 ---

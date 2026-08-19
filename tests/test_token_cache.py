@@ -1,4 +1,4 @@
-"""The frozen-encoder token cache — doc/0013 §2.3.
+"""The frozen-encoder token cache — see ``contra_policy.token_cache``.
 
 The cache exists to delete 97% of a training step, and its one dangerous failure is
 silence: a cache built by a different encoder still loads, still trains, and still
@@ -96,7 +96,7 @@ def cache(tmp_path_factory, encoder, ckpt):
 # ── the property the cache exists to preserve ────────────────────────────────
 
 def test_cached_tokens_equal_a_live_encoder_forward(cache, encoder):
-    """The whole point. If this drifts, every number in the 0013 grid is wrong."""
+    """The whole point. If this drifts, every number in the 0013 ladder is wrong."""
     out, lengths, ckpt = cache
     tc = TokenCache(out, encoder_sha256=encoder_fingerprint(ckpt), image_size=S)
     ds = _FakeDataset(lengths)
@@ -252,6 +252,37 @@ def test_a_length_one_episode_is_rejected_exactly_as_the_live_loader_rejects_it(
         ds[0]
 
 
+# ── one cache per release, selected by uid (doc/0015 §2) ─────────────────────
+
+def test_a_data_cell_is_a_uid_subset_of_the_release_cache(cache):
+    """The property the whole data axis rests on: prefixes nest, so one cache serves all.
+
+    Six per-cell caches for the 20k release would re-encode the same frames 2.1x for
+    tokens that are identical by construction. Instead the cache is built over the longest
+    prefix and `shard_count` selects the cell — so a subset must be exactly the same
+    episodes, in the requested order, and must not see the ones it excluded.
+    """
+    out, lengths, _ = cache
+    tc = TokenCache(out)
+    full = CachedEpisodeDataset(tc)
+    cell = CachedEpisodeDataset(tc, ["ep2", "ep0"])       # a smaller cell, reordered
+    assert len(full) == len(lengths) and len(cell) == 2
+    assert cell.uids == ["ep2", "ep0"]
+    assert torch.equal(cell[0]["action"], full[2]["action"])
+    assert torch.equal(cell[1]["tokens"], full[0]["tokens"])
+
+
+def test_a_cell_the_cache_does_not_cover_raises_before_training(cache):
+    """Pointing a 27-shard cell at a 13-shard cache is the mistake this design invites.
+
+    It must fail at construction with the count, not 40 minutes in with a bare KeyError
+    naming one uid — and not silently, by training the big cell on the small cell's data.
+    """
+    out, _, _ = cache
+    with pytest.raises(StaleCache, match="not in the cache"):
+        CachedEpisodeDataset(TokenCache(out), ["ep0", "ep_from_a_later_shard"])
+
+
 def test_forward_tokens_equals_forward_on_the_same_pixels(encoder):
     """The two model entry points must agree, or the cache changes the model."""
     from contra_policy.model import PolicyConfig, build_policy
@@ -311,6 +342,52 @@ def test_cached_batch_matches_the_live_loader():
     assert lb["image"].shape[:2] == cb["tokens"].shape[:2]
 
 
+RELEASE_20K = os.path.expanduser(
+    "~/code/contra_nes_data/game_trace/releases/boss-spread-20k-v1/manifest.json")
+VAL_SHA_20K = "84cc5c509bd1307048e2dee6b497691f71b6b4d3b71a093eae18e279ba6f9bfc"
+TRAIN_CACHE_20K = "cache/tokens/spread20k-d27"
+#: doc/0015 §2, on boss-spread-20k-v1. Note 27, not 32.
+CELLS_20K = [(1, 737), (2, 1474), (4, 2949), (8, 5897), (16, 11793), (27, 19900)]
+
+
+@pytest.mark.skipif(not (os.path.exists(RELEASE_20K) and os.path.isdir(TRAIN_CACHE_20K)),
+                    reason="needs boss-spread-20k-v1 and its built d27 cache")
+def test_the_release_cache_covers_every_data_cell():
+    """The gate on the data axis: one cache, six cells, no per-cell rebuild.
+
+    Checked against the manifest's own per-shard uid lists rather than a tar index — the
+    manifest is what `scaling_release` treats as the authority for membership, and this
+    must be answerable without re-indexing 12.6 GB of shards.
+    """
+    with open(RELEASE_20K) as fh:
+        manifest = json.load(fh)
+    shards = manifest["train_shards"]
+    tc = TokenCache(TRAIN_CACHE_20K, image_size=256)
+    for shard_count, episodes in CELLS_20K:
+        uids = [u for s in shards[:shard_count] for u in s["uids"]]
+        assert len(uids) == episodes, f"D{shard_count} manifest drift"
+        missing = [u for u in uids if u not in tc]
+        assert not missing, f"D{shard_count}: {len(missing)} uids absent from the cache"
+    assert len(tc) == CELLS_20K[-1][1]
+
+
+@pytest.mark.skipif(not (os.path.exists(RELEASE_20K) and os.path.isdir(TRAIN_CACHE_20K)),
+                    reason="needs boss-spread-20k-v1 and its built d27 cache")
+def test_the_two_releases_are_disjoint_and_must_not_share_a_cache():
+    """boss-spread-20k-v1 regenerated the data; it did not extend boss-spread-10k-v1.
+
+    Recorded as a test because the cheap reading of "the 20k release" is "the 10k release
+    plus more", under which the 10k cache would serve its first 13 shards and the two
+    curves would join. Zero uids overlap, so it would raise — but the reason it raises
+    belongs somewhere a reader can find it.
+    """
+    with open(RELEASE_20K) as fh:
+        uids_20k = {u for s in json.load(fh)["train_shards"] for u in s["uids"]}
+    with open(RELEASE) as fh:
+        uids_10k = {u for s in json.load(fh)["train_shards"] for u in s["uids"]}
+    assert not (uids_10k & uids_20k)
+
+
 def test_forward_tokens_rejects_a_sequence_over_context(encoder):
     from contra_policy.model import PolicyConfig, build_policy
     policy = build_policy(PolicyConfig(
@@ -338,14 +415,154 @@ def test_scaling_config_actually_disables_the_family_schedule():
         cfg = compose(config_name="config_bc_scaling")
     assert cfg.loader.family_draws is None
     assert list(cfg.families) == ["boss"]
-    assert cfg.loader.batch_size == 16
-    assert cfg.loader.num_workers == 0
+    assert cfg.loader.batch_size == 32
+    assert cfg.loader.num_workers == 2
     assert cfg.policy.freeze_encoder is True      # token_cache requires it
     assert cfg.boss_scaling.shard_count == 13
     assert dict(cfg.loader.family_draws or {}) == {}
 
 
-# ── the model-size ladder (doc/0013 §2.1) ────────────────────────────────────
+def test_the_20k_config_keeps_the_recipe_and_changes_only_the_release():
+    """The data axis moves to a new release; nothing else in the recipe may move with it.
+
+    A data-scaling curve is only readable if every cell shares one recipe, so this pins
+    that `config_bc_scaling_20k` inherits boss-only / batch 32 / no family schedule
+    verbatim and differs from its parent in exactly the release, its validation SHA and
+    the cache paths.
+    """
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        base = compose(config_name="config_bc_scaling")
+        cfg = compose(config_name="config_bc_scaling_20k")
+
+    assert "boss-spread-20k-v1" in str(cfg.boss_scaling.manifest)
+    assert cfg.boss_scaling.shard_count == 27
+    assert cfg.boss_scaling.validation_sha256 == VAL_SHA_20K
+    assert cfg.boss_scaling.validation_sha256 != base.boss_scaling.validation_sha256
+    # Unresolved: the paths interpolate `${hydra:runtime.cwd}`, which only exists inside a
+    # launched job, not in a bare `compose`.
+    from omegaconf import OmegaConf
+    paths = OmegaConf.to_container(cfg.token_cache, resolve=False)
+    assert str(paths["train"]).endswith("spread20k-d27")
+    assert str(paths["val"]).endswith("spread20k-val")
+
+    assert list(cfg.families) == ["boss"]
+    assert cfg.loader.family_draws is None
+    assert cfg.loader.batch_size == base.loader.batch_size == 32
+    assert cfg.loader.num_workers == base.loader.num_workers == 2
+    assert cfg.policy.freeze_encoder is True
+    assert cfg.policy.core.dropout == base.policy.core.dropout
+    assert cfg.train.steps == base.train.steps
+    assert cfg.train.lr_decay == base.train.lr_decay == "wsd"
+
+
+def test_0020_laser_config_pins_the_requested_recipe():
+    """The size ladder must not silently inherit Spread or the old LR."""
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_laser", overrides=[
+            "policy.core.d_model=1024", "policy.core.n_layer=8",
+            "policy.core.n_head=16", "policy.core.n_kv_head=16",
+        ])
+
+    assert cfg.datahouse.weapon == "laser"
+    assert cfg.datahouse.shard_count == 18
+    assert cfg.loader.batch_size == 32
+    assert cfg.loader.num_workers == 2
+    assert cfg.train.steps == 20_000
+    assert cfg.train.learning_rate == pytest.approx(1e-4)
+    assert cfg.train.lr_decay == "wsd"
+    assert cfg.policy.core.d_model == 1024
+    assert cfg.policy.core.n_layer == 8
+
+
+def test_0021_laser_20k_config_changes_only_the_data_prefix():
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        base = compose(config_name="config_bc_laser")
+        cfg = compose(config_name="config_bc_laser_20k")
+
+    assert cfg.datahouse.weapon == base.datahouse.weapon == "laser"
+    assert cfg.datahouse.shard_count == 36
+    assert base.datahouse.shard_count == 18
+    assert cfg.loader.batch_size == base.loader.batch_size == 32
+    assert cfg.train.steps == base.train.steps == 20_000
+    assert cfg.train.learning_rate == base.train.learning_rate == pytest.approx(1e-4)
+
+
+def test_0021_laser_40k_config_uses_the_full_store():
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        base = compose(config_name="config_bc_laser")
+        cfg = compose(config_name="config_bc_laser_40k")
+
+    assert cfg.datahouse.weapon == base.datahouse.weapon == "laser"
+    assert cfg.datahouse.shard_count is None
+    assert cfg.loader.batch_size == base.loader.batch_size == 32
+    assert cfg.train.steps == base.train.steps == 20_000
+    assert cfg.train.learning_rate == base.train.learning_rate == pytest.approx(1e-4)
+
+
+def test_multiweapon_prefix_selects_each_weapons_own_shards():
+    from contra_policy.datahouse import shard_prefix
+
+    class Store:
+        slice = (1, "boss", ("spread", "laser"))
+        # Catalog order is by weapon, not by a global mixed-data ordinal.
+        shard_weapons = ["laser", "laser", "laser", "spread", "spread"]
+        shard_ordinals = [0, 1, 2, 0, 1]
+        shards = list(range(5))
+        positions = {"l0": 0, "l1": 1, "l2": 2, "s0": 3, "s1": 4}
+
+        def shard_index(self, uid):
+            return self.positions[uid]
+
+    got = shard_prefix(Store(), list(Store.positions), {"laser": 2, "spread": 1})
+    assert got == ["l0", "l1", "s0"]
+
+
+def test_multiweapon_prefix_requires_one_limit_per_weapon():
+    from contra_policy.datahouse import shard_prefix
+
+    class Store:
+        slice = (1, "boss", ("spread", "laser"))
+        shard_weapons = ["laser", "spread"]
+        shard_ordinals = [0, 0]
+        shards = list(range(2))
+
+    with pytest.raises(ValueError, match="name exactly"):
+        shard_prefix(Store(), [], {"laser": 1})
+
+
+def test_0022_mixed_d10_config_pins_both_weapon_prefixes_and_final_only():
+    from hydra import compose, initialize_config_module
+
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_mixed_d10")
+
+    assert list(cfg.datahouse.weapon) == ["spread", "laser"]
+    assert cfg.datahouse.shard_count is None
+    assert dict(cfg.datahouse.shard_counts) == {"spread": 13, "laser": 18}
+    assert cfg.train.steps == 20_000
+    assert cfg.train.learning_rate == pytest.approx(1e-4)
+    assert list(cfg.train.save_steps) == []
+    assert cfg.train.save_best is False
+
+
+@pytest.mark.parametrize("shard_count,episodes", CELLS_20K)
+def test_every_20k_data_cell_composes_as_a_hydra_override(shard_count, episodes):
+    from hydra import compose, initialize_config_module
+    with initialize_config_module("contra_policy", version_base=None):
+        cfg = compose(config_name="config_bc_scaling_20k",
+                      overrides=[f"boss_scaling.shard_count={shard_count}"])
+    assert cfg.boss_scaling.shard_count == shard_count
+
+
+# ── the model-size ladder (doc/0013 §2) ──────────────────────────────────────
 
 LADDER = [("XS", 256, 2, 4), ("S", 384, 3, 6), ("M", 512, 4, 8),
           ("L", 640, 5, 10), ("XL", 768, 6, 12), ("XXL", 1024, 8, 16)]

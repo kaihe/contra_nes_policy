@@ -1,0 +1,25 @@
+# doc/0020: the M-to-XXL ladder on a D10k Laser-only prefix, using the low-LR recipe
+# that made XXL reach 97% on Spread in doc/0018. Laser has 70 shards, so 18
+# gives 9,771 training episodes after the stable full-store holdout is removed.
+defaults:
+  - config_bc_scaling_lr
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  weapon: laser
+  shard_count: 18
+
+loader:
+  batch_size: 32
+  num_workers: 2
+
+train:
+  steps: 20000
+  learning_rate: 1.0e-4
+  val_every: 500
+  save_steps: []
+  save_best: false

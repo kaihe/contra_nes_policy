@@ -1,6 +1,6 @@
 """Shared primitives and the data path for the Contra (NES) policy.
 
-The policy itself is being rebuilt (``doc/0002-gpt-policy.md``); what lives here now is
+The policy itself is being rebuilt (``doc/0002-design-gpt-policy.md``); what lives here now is
 the part that outlives any architecture:
 
 * :mod:`~contra_policy.action_space` — the 21-action space. **Frozen**: shared verbatim

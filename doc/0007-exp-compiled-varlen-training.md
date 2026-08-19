@@ -1,4 +1,4 @@
-# Compile and varlen training experiment — rejected
+# Do compilation or variable-length attention improve training throughput?
 
 Status: Implemented
 Supersedes: —

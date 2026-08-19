@@ -14,3 +14,7 @@ tmp/
 
 # training logs at the repo root
 *.log
+
+# queue state and logs are run artifacts
+queue/state.tsv
+queue/STOP

@@ -1,0 +1,34 @@
+# The throughput arms of doc/0019. **This config trains nothing** — `tools/bench_step.py`
+# runs `bench.steps` real steps and reports median `step_ms`, peak VRAM and peak host RSS.
+#
+#   python tools/bench_step.py --config-name config_bc_bench \
+#       policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 \
+#       policy.core.n_kv_head=16 bench.label=XXL-A
+#
+# Inherits `config_bc_scaling_lr.yaml`, which is what doc/0018's cells ran, so **arm A is
+# the shipped config and nothing else**: same 13-shard D10k prefix, same batch 16, same
+# `num_workers: 0`, same frozen encoder. Each arm changes exactly one declared key from
+# the command line, which is what makes a difference in `step_ms` attributable.
+#
+# `train.steps` stays at the parent's 40,000 rather than dropping to `bench.steps`: it
+# sets the WSD cooldown onset, and a 400-step budget would put every timed step inside a
+# cooldown the real run spends 90% of its life outside of. The LR is wrong for training
+# either way here — no arm's weights are kept — but the *work per step* must match.
+defaults:
+  - config_bc_scaling_lr
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/bench/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+bench:
+  # 400 steps, median over the last 300. Warmup covers cuDNN autotuning, the allocator
+  # reaching steady state, and first-touch page faults on the mmapped shards.
+  steps: 400
+  warmup: 100
+  label: bench
+  # `tools/bench_sustained.py` only: steps per reported block, so drift is visible.
+  block: 200
+  # Appended as one JSON line per arm; `tools/bench_report.py` reads it.
+  out: null
