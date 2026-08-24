@@ -149,9 +149,13 @@ class DatahouseTokens:
         if tok.get("layout") != _LAYOUT:
             raise StaleCache(f"spec token layout is {tok.get('layout')!r}, not {_LAYOUT!r} "
                              f"— `goal()` would return the wrong row")
-        if image_size is not None and int(inp.get("image_size", -1)) != int(image_size):
+        if (image_size is not None and "image_size" in inp and
+                int(inp["image_size"]) != int(image_size)):
             raise StaleCache(f"spec was encoded at image_size={inp.get('image_size')}, "
                              f"this run uses {image_size}")
+        if "height" in inp or "width" in inp:
+            if int(inp.get("height", 0)) < 1 or int(inp.get("width", 0)) < 1:
+                raise StaleCache(f"invalid rectangular input contract: {inp!r}")
         return spec
 
     def _index(self) -> None:

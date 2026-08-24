@@ -62,6 +62,12 @@ class EncoderConfig:
     recon_depth: int = 16
     view_backbone_ckpt: Optional[str] = None
     freeze_view_backbone: bool = False   # a rebuild trains the trunk
+    # Non-null only for the accepted 0019 native-resolution temporal encoder.
+    input_height: Optional[int] = None
+    input_width: Optional[int] = None
+    n_layers: Optional[int] = None
+    input_kind: str = "rgb"
+    first_frame_delta: Optional[str] = None
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -74,13 +80,21 @@ class ContraFrameEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         s, h, pc = cfg.image_size, cfg.hiddim, cfg.proj_ch
-
-        self.view_backbone = build_view_backbone(
-            size=s, depth=cfg.depth, minres=cfg.minres,
-            pretrained_path=cfg.view_backbone_ckpt,
-            freeze=cfg.freeze_view_backbone)
+        temporal = cfg.input_kind == "rgb_signed_frame_difference"
+        if temporal:
+            if not cfg.input_height or not cfg.input_width or not cfg.n_layers:
+                raise ValueError("temporal encoder requires input height, width, and layers")
+            self.view_backbone = _TemporalBackbone(
+                height=cfg.input_height, width=cfg.input_width,
+                depth=cfg.depth, n_layers=cfg.n_layers)
+        else:
+            self.view_backbone = build_view_backbone(
+                size=s, depth=cfg.depth, minres=cfg.minres,
+                pretrained_path=cfg.view_backbone_ckpt,
+                freeze=cfg.freeze_view_backbone)
         view_ch = self.view_backbone.conv_out_ch
-        cells = cfg.minres * cfg.minres
+        cells = (self.view_backbone.output_hw[0] * self.view_backbone.output_hw[1]
+                 if temporal else cfg.minres * cfg.minres)
 
         self.reduce = nn.Sequential(nn.Conv2d(view_ch, pc, 1), _gn(pc), nn.SiLU())
         self.proj = nn.Sequential(
@@ -99,9 +113,31 @@ class ContraFrameEncoder(nn.Module):
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         """``(B, S, S, 3)`` uint8 → ``(B, hiddim)``. Agent frame or goal frame alike."""
+        if self.cfg.input_kind == "rgb_signed_frame_difference":
+            return self.encode_pair(image, image)
         x = image.permute(0, 3, 1, 2).float() / 255.0
         z = self.reduce(self.view_backbone.forward_features(x))     # (B, pc, m, m)
         return self.token_ln(self.proj(z.flatten(1)))
+
+    def encode_pair(self, current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+        """Encode a current/previous pair for the 0019 temporal checkpoint."""
+        if self.cfg.input_kind != "rgb_signed_frame_difference":
+            raise ValueError("encode_pair is available only on a temporal encoder")
+        expected = (int(self.cfg.input_height), int(self.cfg.input_width), 3)
+        if (current.dtype != torch.uint8 or previous.dtype != torch.uint8 or
+                current.shape != previous.shape or tuple(current.shape[1:]) != expected):
+            raise ValueError(f"temporal inputs must be equal uint8 B{expected}")
+        cur = current.permute(0, 3, 1, 2).float().div(255)
+        prev = previous.permute(0, 3, 1, 2).float().div(255)
+        z = self.reduce(self.view_backbone.forward_features(
+            torch.cat((cur, cur - prev), dim=1)))
+        return self.token_ln(self.proj(z.flatten(1)))
+
+    def encode_sequence(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode one episode sequence, assigning zero delta to its first frame."""
+        if len(images) == 0:
+            return torch.empty((0, self.cfg.hiddim), device=images.device)
+        return self.encode_pair(images, torch.cat((images[:1], images[:-1]), dim=0))
 
     def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Token plus whatever heads are enabled.
@@ -154,3 +190,23 @@ def load_pretrained_encoder(path: str, freeze: bool = False,
             p.requires_grad = False
         enc.eval()
     return enc
+
+
+class _TemporalBackbone(nn.Module):
+    """Rectangular six-channel backbone matching data experiment 0019."""
+
+    def __init__(self, *, height: int, width: int, depth: int, n_layers: int):
+        super().__init__()
+        layers = []
+        channels = 6
+        for index in range(n_layers):
+            out = depth * 2 ** index
+            layers += [nn.Conv2d(channels, out, 4, stride=2, padding=1),
+                       _gn(out), nn.SiLU()]
+            channels = out
+        self.convs = nn.Sequential(*layers)
+        self.conv_out_ch = channels
+        self.output_hw = (height // 2 ** n_layers, width // 2 ** n_layers)
+
+    def forward_features(self, image: torch.Tensor) -> torch.Tensor:
+        return self.convs(image)

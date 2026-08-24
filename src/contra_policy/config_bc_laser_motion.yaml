@@ -1,0 +1,39 @@
+# doc/0023: matched L/D10k/C20k Laser policy with data experiment 0019 tokens.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser-motion/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  root: ~/code/contra_nes_data/game_trace/datahouse-frame-difference-0019
+  weapon: laser
+  shard_count: 18
+
+policy:
+  encoder_ckpt: ~/code/contra_nes_data/game_trace/datahouse-frame-difference-0019/encoder/6ebacbfa845e356939543f5dcaafdd643c48e1a07db9575e80f25d59059ac670/encoder.pt
+  freeze_encoder: true
+  value_head: false
+  aux_size: 0
+  core:
+    d_model: 640
+    n_layer: 5
+    n_head: 10
+    n_kv_head: 10
+    context: 1024
+    mlp_ratio: 4.0
+    rope_theta: 10000.0
+    dropout: 0.2
+
+loader:
+  batch_size: 32
+  num_workers: 2
+
+train:
+  steps: 20000
+  learning_rate: 1.0e-4
+  val_every: 500
+  save_steps: []
+  save_best: false

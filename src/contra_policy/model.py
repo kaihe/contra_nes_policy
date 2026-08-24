@@ -120,6 +120,12 @@ class ContraPolicy(nn.Module):
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
         """``(B, T, S, S, 3)`` uint8 → ``(B, T, d)``. Frozen encoders skip the graph."""
         b, t = images.shape[:2]
+        if self.encoder.cfg.input_kind == "rgb_signed_frame_difference":
+            ctx = torch.no_grad() if self.cfg.freeze_encoder else _null()
+            with ctx:
+                # Each batch row is an episode. Encoding rows independently makes the
+                # zero-delta boundary explicit and prevents temporal leakage.
+                return torch.stack([self.encoder.encode_sequence(row) for row in images])
         flat = images.reshape(b * t, *images.shape[2:])
         chunk = max(1, int(self.cfg.encode_chunk))
         ctx = torch.no_grad() if self.cfg.freeze_encoder else _null()

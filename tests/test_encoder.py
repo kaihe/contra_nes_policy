@@ -171,6 +171,26 @@ def test_freeze_on_load_disables_every_gradient(tmp_path):
                    for p in load_pretrained_encoder(path, freeze=True).parameters())
 
 
+def test_temporal_checkpoint_keeps_episode_boundary_local(tmp_path):
+    cfg = EncoderConfig(image_size=64, hiddim=16, depth=2, proj_ch=4,
+                        aux_size=8, head_depth=2, entity_classes=0,
+                        input_height=64, input_width=68, n_layers=2,
+                        input_kind="rgb_signed_frame_difference",
+                        first_frame_delta="zero")
+    encoder = build_encoder(cfg)
+    path = str(tmp_path / "temporal.pt")
+    encoder.save(path)
+    loaded = load_pretrained_encoder(path)
+    images = torch.randint(0, 256, (3, 64, 68, 3), dtype=torch.uint8)
+    with torch.no_grad():
+        sequence = loaded.encode_sequence(images)
+        first = loaded.encode(images[:1])
+        second = loaded.encode_pair(images[1:2], images[:1])
+    assert sequence.shape == (3, 16)
+    assert torch.allclose(sequence[:1], first, atol=1e-6)
+    assert torch.allclose(sequence[1:2], second, atol=1e-6)
+
+
 # ── the policy's readout, still pinned ───────────────────────────────────────
 
 def test_soft_argmax_has_no_half_cell_offset():
