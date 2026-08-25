@@ -141,9 +141,9 @@ def main(args: DictConfig) -> None:
     real_tokens: list = []
     _step = trainer.train_step
 
-    def counting_step(batch):
-        real_tokens.append(_real_tokens(batch))
-        return _step(batch)
+    def counting_step(batches):
+        real_tokens.append(sum(_real_tokens(batch) for batch in batches))
+        return _step(batches)
 
     trainer.train_step = counting_step
 
