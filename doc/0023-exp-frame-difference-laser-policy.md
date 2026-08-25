@@ -27,7 +27,7 @@ auxiliary head; seed 0; full validation every 500 cycles; final checkpoint retai
 | run | image state | encoder | data | cycles | state | dir |
 |---|---|---|---:|---:|---|---|
 | `L-D10k-C20k-laser-lr1e-4` | current RGB | static 512-D `f36041bc…1923c` | 9,771 | 20,000 | existing baseline | `runs/laser/L-D10k-C20k-laser-lr1e-4` |
-| `L-D10k-C20k-laser-frame-diff-lr1e-4` | `[RGB(t), RGB(t)-RGB(t-1)]` | accepted data 0019 512-D final | 9,771 | 20,000 | planned | `runs/laser-motion/L-D10k-C20k-laser-frame-diff-lr1e-4` |
+| `L-D10k-C20k-laser-frame-diff-lr1e-4` | `[RGB(t), RGB(t)-RGB(t-1)]` | 512-D `6ebacbfa…ac670` | 9,771 | 20,000 | done, 18 min | `runs/laser-motion/L-D10k-C20k-laser-frame-diff-lr1e-4` |
 
 The candidate datahouse uses native 224×240 consecutive frames. The first observation and
 the separate goal image use zero delta; every later decision frame uses the preceding frame
@@ -45,8 +45,8 @@ generalization.
 
 | metric | static baseline | temporal candidate | source |
 |---|---:|---:|---|
-| best validation CE | 0.7009 at 2,000 | pending | policy `metrics.csv` / `tools/scaling_report.py` |
-| final validation CE | 2.1465 | pending | same |
+| best validation CE | 0.7009 at 2,000 | 0.7130 at 2,000 | policy `metrics.csv` / `tools/scaling_report.py` |
+| final validation CE | 2.1465 | 2.1579 | same |
 | final Laser success | 19/100, 19% [12.5, 27.8] | pending | evaluation 0024 and matched candidate run |
 | mean boss damage fraction | 38.7% | pending | evaluation summary |
 
@@ -64,4 +64,4 @@ closed-loop success.
 
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+_Pending — closed-loop evaluation not yet run._
