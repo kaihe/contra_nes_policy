@@ -79,9 +79,3 @@ M-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_b
 L-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/mixed_d10/L-D20k-C40k-mixed-lr1e-4
 #XL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/mixed_d10/XL-D20k-C40k-mixed-lr1e-4
 #XXL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/mixed_d10/XXL-D20k-C40k-mixed-lr1e-4
-
-# doc/0024 — matched goal-free Laser raw-pixel cells. Physical batch 2 x 16 accumulation
-# preserves the effective batch of 32. The control runs first; the candidate changes only
-# encoder trainability and adds the encoder-specific 1e-5 LR (core remains 1e-4).
-L-D10k-C20k-laser-null-goal-frozen	python -m contra_policy.train_bc --config-name config_bc_laser_pixels hydra.run.dir=./runs/laser-unfrozen/L-D10k-C20k-laser-null-goal-frozen
-L-D10k-C20k-laser-null-goal-unfrozen	python -m contra_policy.train_bc --config-name config_bc_laser_pixels policy.freeze_encoder=false hydra.run.dir=./runs/laser-unfrozen/L-D10k-C20k-laser-null-goal-unfrozen
