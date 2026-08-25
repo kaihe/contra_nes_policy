@@ -27,9 +27,9 @@ def test_step_timer_includes_batch_acquisition():
     class Trainer:
         device = torch.device("cpu")
 
-        def train_step(self, batch):
+        def train_step(self, batches):
             events.append("train")
-            return {"loss": 1.0}, _model_tokens(batch)
+            return {"loss": 1.0}, sum(_model_tokens(batch) for batch in batches)
 
     times = iter((10.0, 10.25))
 

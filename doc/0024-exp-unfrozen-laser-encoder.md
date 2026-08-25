@@ -6,9 +6,9 @@ The matched static and temporal frozen encoders reach only 19% and 17% Laser-sta
 respectively, despite training the L core on Laser-only D10k data. The frozen visual
 representation is the remaining untested component in this recipe.
 
-Fine-tune the existing pretrained static encoder with the matched L/D10k/C20k policy while
-giving it a lower learning rate. This decides whether later Laser experiments should train
-vision end to end or retain precomputed encoder tokens.
+Remove the uninformative goal image and compare frozen versus fine-tuned static encoders in
+matched L/D10k/C20k cells, giving the trainable encoder a lower learning rate. This decides
+whether later single-task Laser experiments should train vision end to end.
 
 ## 2. Setup
 
@@ -17,14 +17,14 @@ experiments 0020, 0021, and 0023. Carve validation from the full 10,293-episode 
 first, then train on the prefix matching the frozen D10k baseline. Preserve the frame/action
 causal shift: frame `i` predicts action `i + 1`.
 
-Common recipe: L core with `d_model=640`, 5 layers, 10 heads; 20,000 optimizer cycles;
-effective batch 32; AdamW; core LR `1e-4`; encoder LR `1e-5`; 500-step warmup; WSD with
-cooldown from 18,000 to 20,000; bf16; dropout 0.2; seed 0; no value or auxiliary head.
+Common recipe: L core with `d_model=640`, 5 layers, 10 heads; learned null goal token;
+20,000 optimizer cycles; effective batch 32; AdamW; core LR `1e-4`; 500-step warmup; WSD
+with cooldown from 18,000 to 20,000; bf16; dropout 0.2; seed 0; no value or auxiliary head.
 
 | run | encoder | data | cycles | state | dir |
 |---|---|---:|---:|---|---|
-| `L-D10k-C20k-laser-lr1e-4` | frozen static `f36041bc…1923c` | 9,771 | 20,000 | existing baseline | `runs/laser/L-D10k-C20k-laser-lr1e-4` |
-| `L-D10k-C20k-laser-unfrozen` | trainable static, LR `1e-5` | matched D10k prefix | 20,000 | planned | `runs/laser-unfrozen/L-D10k-C20k-laser-unfrozen` |
+| `L-D10k-C20k-laser-null-goal-frozen` | frozen static `f36041bc…1923c` | matched D10k frame release | 20,000 | planned control | `runs/laser-unfrozen/L-D10k-C20k-laser-null-goal-frozen` |
+| `L-D10k-C20k-laser-null-goal-unfrozen` | trainable static, encoder LR `1e-5` | matched D10k frame release | 20,000 | planned candidate | `runs/laser-unfrozen/L-D10k-C20k-laser-null-goal-unfrozen` |
 
 Run 200–500 smoke-test steps before the full cell and retain checkpoints at 2,000, 5,000,
 10,000, and 20,000 cycles. If VRAM requires a smaller physical batch, use gradient
@@ -34,8 +34,8 @@ accumulation to keep effective exposure at 32 episodes per optimizer cycle.
 
 | metric | frozen static baseline | unfrozen candidate | source |
 |---|---:|---:|---|
-| final Laser success | 19/100, 19% [12.5, 27.8] | pending | evaluation 0029 and matched candidate evaluation |
-| final validation CE | 2.1465 | pending | policy metrics / `tools/scaling_report.py` |
+| final Laser success | pending | pending | matched goal-free evaluation |
+| final validation CE | pending | pending | policy metrics / `tools/scaling_report.py` |
 | throughput | token-cached baseline | pending | smoke-run `metrics.csv` and wall clock |
 | peak GPU memory | token-cached baseline | pending | smoke-run CUDA measurement |
 

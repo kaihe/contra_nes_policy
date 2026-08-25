@@ -42,6 +42,7 @@ from contra_policy.datahouse import (DatahouseTokens, datahouse_index,
                                      shard_prefix, split_uids)
 from contra_policy.token_cache import (CachedEpisodeDataset, TokenCache,
                                        encoder_fingerprint)
+from contra_policy.frame_house import FrameEpisodeDataset, FrameHouse
 
 # The dataset's most common action, and the one `tail_ce` excludes. Derived from the
 # frozen action space rather than written as an integer, so a reordering there cannot
@@ -150,12 +151,15 @@ def _timed_train_iteration(trainer, batches, loader, clock=time.perf_counter):
     if trainer.device.type == "cuda":
         torch.cuda.synchronize(trainer.device)
     t0 = clock()
-    try:
-        batch = next(batches)
-    except StopIteration:
-        batches = iter(loader)
-        batch = next(batches)
-    row, tokens = trainer.train_step(batch)
+    microbatches = []
+    for _ in range(int(getattr(trainer, "accumulate_steps", 1))):
+        try:
+            batch = next(batches)
+        except StopIteration:
+            batches = iter(loader)
+            batch = next(batches)
+        microbatches.append(batch)
+    row, tokens = trainer.train_step(microbatches)
     if trainer.device.type == "cuda":
         torch.cuda.synchronize(trainer.device)
     return row, tokens, max(1e-9, clock() - t0), batches
@@ -175,8 +179,30 @@ class BCTrainer:
         # branch has no shard tars, no `cache/` and no family schedule to assert: the
         # datahouse slice *is* the dataset. Everything below the branch is shared.
         dh_cfg = args.get("datahouse", {}) or {}
-        self.datahouse = bool(dh_cfg.get("root"))
-        if self.datahouse:
+        fh_cfg = args.get("framehouse", {}) or {}
+        self.framehouse = bool(fh_cfg.get("root"))
+        self.datahouse = bool(dh_cfg.get("root")) and not self.framehouse
+        if self.framehouse:
+            store = FrameHouse(
+                str(fh_cfg.root), level=int(fh_cfg.get("level", 1)),
+                task=str(fh_cfg.get("task", "boss")),
+                weapon=str(fh_cfg.get("weapon", "laser")))
+            train_uids, val_uids = split_uids(store, int(fh_cfg.get("val_every", 20)))
+            train_idx = datahouse_index(store, train_uids)
+            val_idx = datahouse_index(store, val_uids)
+            self.token_cache = False
+            self.train_ds = FrameEpisodeDataset(store, train_uids, int(args.image_size))
+            self.val_ds = FrameEpisodeDataset(store, val_uids, int(args.image_size))
+            train_frames = sum(store.length(u) for u in train_uids)
+            json.dump({"source": "framehouse", "slice": list(store.slice),
+                       "train_episodes": len(train_uids), "val_episodes": len(val_uids),
+                       "train_frames": int(train_frames),
+                       "store_episodes": len(store), "store_frames": int(store.declared[1]),
+                       "val_every": int(fh_cfg.get("val_every", 20))},
+                      open("dataset.json", "w"), indent=2)
+            print(f"[bc] framehouse {store.slice} · {len(train_uids)} train / "
+                  f"{len(val_uids)} val episodes ({train_frames} train frames)", flush=True)
+        elif self.datahouse:
             if not bool(args.policy.freeze_encoder):
                 raise ValueError(
                     "datahouse requires policy.freeze_encoder=true — a trainable encoder "
@@ -307,9 +333,17 @@ class BCTrainer:
         self.objective = BehaviorCloneLoss(
             diagnostics=False, modal_action=MODAL_ACTION).to(self.device)
 
+        core_params = [p for name, p in self.policy.named_parameters()
+                       if p.requires_grad and not name.startswith("encoder.")]
+        encoder_params = [p for p in self.policy.encoder.parameters() if p.requires_grad]
+        groups = [{"params": core_params, "lr": float(args.train.learning_rate)}]
+        encoder_lr = args.train.get("encoder_learning_rate")
+        if encoder_params:
+            groups.append({"params": encoder_params,
+                           "lr": float(encoder_lr if encoder_lr is not None
+                                       else args.train.learning_rate)})
         self.optimizer = torch.optim.AdamW(
-            [p for p in self.policy.parameters() if p.requires_grad],
-            lr=float(args.train.learning_rate), weight_decay=float(args.train.weight_decay))
+            groups, weight_decay=float(args.train.weight_decay))
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_scale)
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=(self.autocast_dtype is torch.float16))
@@ -320,6 +354,9 @@ class BCTrainer:
         self.best = math.inf
         self.draw_counts: Counter = Counter()
         self.token_counts: Counter = Counter()
+        self.accumulate_steps = int(args.train.get("accumulate_steps", 1))
+        if self.accumulate_steps < 1:
+            raise ValueError("train.accumulate_steps must be positive")
         self._resume(str(args.resume_from) if args.get("resume_from") else None)
 
     # -- plumbing -----------------------------------------------------------
@@ -381,24 +418,29 @@ class BCTrainer:
                 latents = self.policy.forward_tokens(
                     batch["tokens"], batch["goal_token"], batch["interaction"])
             else:
-                cv = batch["cross_view"]
-                latents = self.policy(batch["image"], cv["cross_view_image"],
-                                      cv["cross_view_obj_id"])
+                cv = batch.get("cross_view")
+                latents = self.policy(
+                    batch["image"], None if cv is None else cv["cross_view_image"],
+                    batch["interaction"] if cv is None else cv["cross_view_obj_id"])
             loss, metrics = self.objective(latents, batch)
         return loss, metrics
 
     # -- the loop -----------------------------------------------------------
 
-    def train_step(self, batch: Dict) -> tuple[Dict[str, float], int]:
+    def train_step(self, microbatches: List[Dict]) -> tuple[Dict[str, float], int]:
         self.policy.train()
         if self.policy.cfg.freeze_encoder:
             self.policy.encoder.eval()      # keep frozen norms in inference mode
-        accounting = list(zip(batch["family"].tolist(), batch["seq_len"].tolist()))
-        batch = self._to_device(batch)
-        loss, metrics = self._forward(batch)
-
         self.optimizer.zero_grad(set_to_none=True)
-        self.scaler.scale(loss).backward()
+        rows, accounting, tokens = [], [], 0
+        for raw_batch in microbatches:
+            accounting.extend(zip(raw_batch["family"].tolist(),
+                                  raw_batch["seq_len"].tolist()))
+            tokens += _model_tokens(raw_batch)
+            batch = self._to_device(raw_batch)
+            loss, metrics = self._forward(batch)
+            self.scaler.scale(loss / len(microbatches)).backward()
+            rows.append({k: float(v) for k, v in metrics.items()})
         self.scaler.unscale_(self.optimizer)
         gn = torch.nn.utils.clip_grad_norm_(
             [p for p in self.policy.parameters() if p.requires_grad],
@@ -413,9 +455,11 @@ class BCTrainer:
             self.draw_counts[family] += 1
             self.token_counts[family] += int(seq_len)
 
-        row = {k: float(v) for k, v in metrics.items()}
+        row = _mean_of(rows)
         row.update({"grad_norm": float(gn), "lr": self.optimizer.param_groups[0]["lr"]})
-        return row, _model_tokens(batch)
+        if len(self.optimizer.param_groups) > 1:
+            row["encoder_lr"] = self.optimizer.param_groups[1]["lr"]
+        return row, tokens
 
     @torch.no_grad()
     def validate(self, max_batches: int = 0) -> Dict[str, float]:

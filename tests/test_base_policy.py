@@ -36,6 +36,21 @@ def test_action_only_policy_has_one_output_and_no_dead_heads():
                    for k in policy.state_dict())
 
 
+def test_null_goal_skips_goal_image_without_changing_output_shape():
+    policy = build_policy(_config(aux_size=0, value_head=False,
+                                  use_goal_image=False)).eval()
+    images = torch.randint(0, 256, (2, 3, 64, 64, 3), dtype=torch.uint8)
+    interaction = torch.tensor([4, 4])
+
+    with torch.no_grad():
+        a = policy(images, None, interaction)["pi_logits"]
+        b = policy(images, torch.randint(0, 256, (2, 64, 64, 3), dtype=torch.uint8),
+                   interaction)["pi_logits"]
+
+    assert a.shape == (2, 3, 21)
+    assert torch.equal(a, b)
+
+
 def test_legacy_head_defaults_still_round_trip_strictly(tmp_path):
     policy = build_policy(_config())
     path = policy.save(str(tmp_path / "legacy.pt"))

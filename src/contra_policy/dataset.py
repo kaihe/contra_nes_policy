@@ -825,8 +825,10 @@ def pad_episodes(items: List[Dict]) -> Dict:
             "cross_view_obj_id": torch.stack(
                 [x["cross_view"]["cross_view_obj_id"][0] for x in items]),
         }
-    else:
+    elif "goal_token" in items[0]:
         out["goal_token"] = torch.stack([x["goal_token"] for x in items])
+        out["interaction"] = torch.stack([x["interaction"] for x in items])
+    else:
         out["interaction"] = torch.stack([x["interaction"] for x in items])
     out["family"] = torch.stack([x["family"] for x in items])
     out["seq_len"] = torch.tensor([int(x[time_key].shape[0]) for x in items])

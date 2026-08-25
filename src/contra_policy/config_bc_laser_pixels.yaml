@@ -1,0 +1,42 @@
+# doc/0024: matched goal-free raw-pixel control and unfrozen-encoder Laser cells.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser-unfrozen/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Disable the token datahouse inherited by config_bc_laser. The framehouse holds the
+# exact first-18-token-shard membership (D10k), represented as 42 frame shards.
+datahouse: null
+framehouse:
+  root: ~/code/contra_nes_data/game_trace/datahouse
+  level: 1
+  task: boss
+  weapon: laser
+  val_every: 20
+
+policy:
+  use_goal_image: false
+  encode_chunk: 64
+  core:
+    d_model: 640
+    n_layer: 5
+    n_head: 10
+    n_kv_head: 10
+
+loader:
+  # Two episodes fit with encoder gradients; 16 microbatches preserve the baseline's
+  # effective batch exposure of 32 episodes per optimizer cycle.
+  batch_size: 2
+  num_workers: 4
+
+train:
+  steps: 20000
+  learning_rate: 1.0e-4
+  encoder_learning_rate: 1.0e-5
+  accumulate_steps: 16
+  val_every: 500
+  save_steps: [2000, 5000, 10000]
+  save_best: false

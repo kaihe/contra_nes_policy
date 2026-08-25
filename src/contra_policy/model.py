@@ -62,6 +62,8 @@ class PolicyConfig:
     #: variable, so a bad validation loss is unambiguously the core's fault rather than a
     #: co-adaptation between two things that both changed.
     freeze_encoder: bool = True
+    #: Single-task policies may replace the visual goal with a learned constant.
+    use_goal_image: bool = True
     # Legacy checkpoints omit `value_head` and used aux_size=32, so these defaults must
     # preserve their exact state-dict shape. New action-only checkpoints explicitly set
     # value_head=false and aux_size=0.
@@ -103,6 +105,7 @@ class ContraPolicy(nn.Module):
         # bit-identical to the 0006/0009/0010 anchor. See doc/0013 §2.
         self.in_proj = (nn.Identity() if d_core == d_enc
                         else nn.Linear(d_enc, d_core, bias=False))
+        self.null_goal = (None if cfg.use_goal_image else nn.Parameter(torch.zeros(d_enc)))
 
         self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d_core)   # +1 for id -1
         self.pi_head = nn.Linear(d_core, NUM_ACTIONS)
@@ -151,8 +154,11 @@ class ContraPolicy(nn.Module):
                 f"{t} frames + {PREFIX} prefix exceeds context {self.context}")
 
         frames = self.encode_images(images)                      # (B, T, d)
-        goal = self.encode_images(goal_image.unsqueeze(1))       # (B, 1, d)
-        return self._heads(frames, goal.squeeze(1), interaction, attn_mask)
+        if self.cfg.use_goal_image:
+            goal = self.encode_images(goal_image.unsqueeze(1)).squeeze(1)
+        else:
+            goal = self.null_goal.unsqueeze(0).expand(b, -1)
+        return self._heads(frames, goal, interaction, attn_mask)
 
     def forward_tokens(self, frame_tokens: torch.Tensor, goal_token: torch.Tensor,
                        interaction: torch.Tensor,
