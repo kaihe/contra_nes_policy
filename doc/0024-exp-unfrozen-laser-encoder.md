@@ -1,6 +1,6 @@
 # Does adapting the static image projection improve Laser boss success?
 
-Status: Accepted
+Status: Implemented
 
 ## 1. Goal
 
@@ -32,7 +32,7 @@ auxiliary head. The trunk through `reduce` remains frozen in both cells.
 |---|---|---:|---:|---|---|
 | `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
 | `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-4` | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
-| `L-D10k-C40k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 40,000 | queued | `runs/laser-projection/L-D10k-C40k-laser-null-goal-proj-frozen` |
+| `L-D10k-C40k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 40,000 | done | `runs/laser-projection/L-D10k-C40k-laser-null-goal-proj-frozen` |
 
 The reduced cache is approximately 8.4 GB for 1.02M frames. Run a 200-step smoke test before
 the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles.
@@ -59,8 +59,17 @@ the Wilson 95% interval, death/timeout counts, boss-seen rate, damage fraction, 
 
 Closed-loop results and checkpoint provenance are recorded in evaluation
 [0030](../../contra_nes_evaluation/doc/0030-result-laser-projection-adaptation.md).
-For the C40k follow-up, report final training and validation CE and evaluate only
-`policy-final.pt` against the frozen C20k result using the same protocol.
+The matched C40k follow-up is recorded in evaluation
+[0031](../../contra_nes_evaluation/doc/0031-result-laser-projection-c40k.md).
+
+| frozen-projection compute | C20k | C40k | source |
+|---|---:|---:|---|
+| final Laser success | 25/100, 25% [17.5, 34.3] | 27/100, 27% [19.3, 36.4] | evaluation 0031 |
+| death / timeout | 74 / 1 | 73 / 0 | evaluation 0031 |
+| mean boss damage | 47.1% | 48.1% | evaluation 0031 |
+| action entropy | 2.304 bits | 2.293 bits | evaluation 0031 |
+| mean train CE over final 2k steps | 0.2378 | 0.1961 | policy `metrics.csv` |
+| final validation CE | 2.2097 | 2.5365 | policy `metrics.csv` |
 
 ## 4. Conclusion
 
@@ -76,6 +85,8 @@ one frozen-encoder cell against the current 25% baseline. This directly tests co
 error, which is consistent with low training CE and poor closed-loop success, while retaining
 the cheapest and best-performing visual setup from this experiment.
 
-Before collecting recovery data, the accepted C40k extension provides one bounded check that
-the current 25% result is not simply optimization-limited. Continue to C80k only if C40k
-improves closed-loop success; a lower training CE alone does not pass the gate.
+The C40k extension confirms that this recipe is not simply optimization-limited. Doubling
+compute lowers mean train CE over the final 2,000 steps from 0.2378 to 0.1961, while success
+moves only from 25% to 27% with strongly overlapping intervals and nearly unchanged secondary
+metrics. The predeclared gate therefore fails: do not continue this recipe to C80k. Move to
+recovery-state data rather than spending more cycles or capacity on demonstration memorization.
