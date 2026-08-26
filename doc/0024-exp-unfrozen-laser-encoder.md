@@ -1,6 +1,6 @@
 # Does adapting the static image projection improve Laser boss success?
 
-Status: Implemented
+Status: Accepted
 
 ## 1. Goal
 
@@ -11,6 +11,10 @@ encoder would perform about 55 times the arithmetic of the L temporal core per e
 Freeze the convolutional trunk but adapt its projection from the retained `4×4×256` feature
 map in matched goal-free L/D10k/C20k cells. This tests task-specific visual adaptation
 without recomputing the expensive trunk or relying on the already-compressed 512-D token.
+
+After projection tuning failed, extend the winning frozen cell to C40k as a bounded
+memorization diagnostic. This asks whether the still-falling training CE can improve the
+same in-distribution closed-loop probe; it is not a test of held-out generalization.
 
 ## 2. Setup
 
@@ -28,9 +32,13 @@ auxiliary head. The trunk through `reduce` remains frozen in both cells.
 |---|---|---:|---:|---|---|
 | `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
 | `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-4` | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
+| `L-D10k-C40k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 40,000 | queued | `runs/laser-projection/L-D10k-C40k-laser-null-goal-proj-frozen` |
 
 The reduced cache is approximately 8.4 GB for 1.02M frames. Run a 200-step smoke test before
 the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles.
+The C40k cell resumes the extendable WSD trunk at step 18,000, before any cooldown update,
+then remains at `1e-4` through step 36,000 and cools to zero by step 40,000. It saves the
+new step-36,000 trunk and final checkpoint.
 
 ## 3. Evaluation metrics
 
@@ -51,6 +59,8 @@ the Wilson 95% interval, death/timeout counts, boss-seen rate, damage fraction, 
 
 Closed-loop results and checkpoint provenance are recorded in evaluation
 [0030](../../contra_nes_evaluation/doc/0030-result-laser-projection-adaptation.md).
+For the C40k follow-up, report final training and validation CE and evaluate only
+`policy-final.pt` against the frozen C20k result using the same protocol.
 
 ## 4. Conclusion
 
@@ -65,3 +75,7 @@ Laser-policy rollouts (DAgger-style), mix them with the existing demonstrations,
 one frozen-encoder cell against the current 25% baseline. This directly tests compounding
 error, which is consistent with low training CE and poor closed-loop success, while retaining
 the cheapest and best-performing visual setup from this experiment.
+
+Before collecting recovery data, the accepted C40k extension provides one bounded check that
+the current 25% result is not simply optimization-limited. Continue to C80k only if C40k
+improves closed-loop success; a lower training CE alone does not pass the gate.

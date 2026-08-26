@@ -84,3 +84,7 @@ L-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_b
 # one 1e-4 optimizer rate; only `proj + token_ln` trainability differs.
 L-D10k-C20k-laser-null-goal-proj-frozen	python -m contra_policy.train_bc --config-name config_bc_laser_projection hydra.run.dir=./runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen
 L-D10k-C20k-laser-null-goal-proj-tuned	python -m contra_policy.train_bc --config-name config_bc_laser_projection policy.train_projection=true hydra.run.dir=./runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned
+
+# doc/0024 — bounded extra-compute diagnostic. Resume the exact frozen WSD trunk at its
+# 18k onset, before annealing, and extend the stable phase to 36k plus a 4k cooldown.
+L-D10k-C40k-laser-null-goal-proj-frozen	python -m contra_policy.train_bc --config-name config_bc_laser_projection train.steps=40000 resume_from=./runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen/checkpoints/policy-018000.pt hydra.run.dir=./runs/laser-projection/L-D10k-C40k-laser-null-goal-proj-frozen
