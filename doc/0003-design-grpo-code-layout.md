@@ -1,6 +1,6 @@
 # Organise the GRPO stack around rollout generation
 
-Status: Accepted
+Status: Implemented
 Supersedes: —
 Depends on: [0002](0002-design-gpt-policy.md) — the policy GRPO fine-tunes.
 
@@ -190,6 +190,14 @@ GRPO policy. A checkpoint missing any required continuation state fails loudly.
 The rollout actor shares the policy's prefix construction rather than assuming a visual
 goal or equal encoder/core widths. This keeps null-goal policies and learned `in_proj`
 layers bit-compatible between sequential rollout and full-episode training.
+
+The first prepared consumer is `rl/laser_projection.yaml`: binary-reward GRPO from the
+frozen-projection L/C20 checkpoint on the exact `full_laser.state` task used by
+evaluations 0030 and 0031. A one-update emulator smoke measured success 5/16, no
+zero-variance groups, `ratio_mean=0.99989`, `approx_kl=0.00019`, and no clipping. The
+broader historical 174-start Laser pool measured only 1/32 in its smoke and is not the
+same distribution as the published 25% single-start baseline, so it is deliberately not
+the first feasibility run.
 
 ## 7. Risks
 

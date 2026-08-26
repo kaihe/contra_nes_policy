@@ -1,0 +1,39 @@
+# Laser-only GRPO over the winning frozen-projection L/C20 BC checkpoint.
+# The policy uses a learned null goal, so TaskCatalog reads canonical task savestates
+# directly and does not require the retired HF prompt tar export.
+defaults:
+  - config_grpo
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/laser-projection-${now:%H-%M-%S}
+
+init_from: ${hydra:runtime.cwd}/runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen/checkpoints/policy-final.pt
+
+families: [boss]
+# Match evaluation 0030/0031 exactly. The checkpoint is 25% on this start but only ~3%
+# across the older 174-start Laser task pool; mixing those distributions would starve
+# G=8 of successful groups and would not test the published baseline.
+task_filter: {uid: [win_level1_20260630171218_i8]}
+expected_tasks: 1
+
+sampling:
+  family_multiplier: {boss: 1.0}
+
+reward:
+  # At the measured 25% success and G=8, only about 10% of binary groups have zero
+  # variance. Damage shaping previously learned chip-without-kill, so keep the actual
+  # completion objective and let group-relative successes supply the gradient.
+  progress_coef: 0.0
+
+probe:
+  every: 10
+  tasks_per_family: 1
+  repeats: 32
+
+train:
+  updates: 100
+  max_hours: 1.5
+  max_kl_ref: 0.10
+  save_every: 25

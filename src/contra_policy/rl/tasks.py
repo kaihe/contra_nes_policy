@@ -187,25 +187,32 @@ class TaskCatalog:
                  cache_dir: str = "cache", prompt_cache: int = 128,
                  segment_cache: int = 256, verbose: bool = True,
                  task_filter: Optional[Dict[str, object]] = None,
-                 expected_tasks: int = 0):
+                 expected_tasks: int = 0, require_prompt: bool = True):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
         self.split = split
         self.families = tuple(families)
         self.image_size = image_size
         self.sigma_px = sigma_px
+        self.require_prompt = bool(require_prompt)
         self.prompt_cache_size = prompt_cache
         self.segment_cache_size = segment_cache
 
-        shard_dir = os.path.expanduser(shard_dir)
-        tars = shard_paths(shard_dir, self.families, split)
-        index = load_or_build_index(tars, cache_dir)
-        self._shard: Dict[Tuple[str, str], dict] = {
-            (ep["family"], ep["uid"]): ep for ep in index}
-
         all_tasks = discover_tasks(task_root, self.families)
         in_split = [t for t in all_tasks if t.split == split]
-        self.tasks = [t for t in in_split if t.key in self._shard]
+        shard_dir = os.path.expanduser(shard_dir)
+        tars: List[str] = []
+        self._shard: Dict[Tuple[str, str], dict] = {}
+        if self.require_prompt:
+            tars = shard_paths(shard_dir, self.families, split)
+            index = load_or_build_index(tars, cache_dir)
+            self._shard = {(ep["family"], ep["uid"]): ep for ep in index}
+            self.tasks = [t for t in in_split if t.key in self._shard]
+        else:
+            # A learned-null-goal policy needs only the canonical task savestate and
+            # metadata. Do not keep an obsolete HF tar export alive merely to read a
+            # goal image the model ignores.
+            self.tasks = list(in_split)
         dropped = len(in_split) - len(self.tasks)
         if not self.tasks:
             raise RuntimeError(
@@ -220,10 +227,20 @@ class TaskCatalog:
         # policy survives a weapon-independent ~2 s, so ~40% of boss tasks are unreachable
         # and training on them spends budget at full gradient weight for nothing.
         if task_filter:
-            meta = shard_task_meta(tars)
+            if self.require_prompt:
+                meta = shard_task_meta(tars)
+            else:
+                from task_maker.base import load_task
+                meta = {t.key: dict(getattr(load_task(t.path), "meta", {}) or {})
+                        for t in self.tasks}
             before = len(self.tasks)
+            # `uid`/`family` are task identity rather than shard metadata, but making
+            # them filterable is essential for a single-start feasibility run whose
+            # evaluation baseline names one exact savestate.
             self.tasks = [t for t in self.tasks
-                          if meta_matches(meta.get(t.key, {}), task_filter)]
+                          if meta_matches({**meta.get(t.key, {}),
+                                           "uid": t.uid, "family": t.family},
+                                          task_filter)]
             if verbose:
                 print(f"[rl.tasks] task_filter {dict(task_filter)} kept "
                       f"{len(self.tasks)}/{before} {split} tasks")
@@ -292,6 +309,15 @@ class TaskCatalog:
         if hit is not None:
             self._prompts.move_to_end(task.key)
             return hit
+        if not self.require_prompt:
+            meta = dict(getattr(self.segment(task), "meta", {}) or {})
+            image = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+            prompt = GoalPrompt(
+                image=image,
+                mask=np.zeros((self.image_size, self.image_size), dtype=np.uint8),
+                interaction=int(interaction_id(meta)))
+            self._prompts[task.key] = prompt
+            return prompt
         meta = json.loads(self._read_member(task, "json"))
         bgr = cv2.imdecode(np.frombuffer(self._read_member(task, "goal.png"), np.uint8),
                            cv2.IMREAD_COLOR)

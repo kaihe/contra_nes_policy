@@ -269,6 +269,28 @@ def test_meta_matches_supports_membership_equality_and_missing_keys():
     # An unknown field matches nothing rather than being ignored, so `expected_tasks`
     # turns a mistyped filter into a hard failure instead of a silently different pool.
     assert not meta_matches(spread, {"weapno": ["Spread"]})
+    assert meta_matches({**spread, "uid": "laser-start"},
+                        {"uid": ["laser-start"]})
+
+
+def test_null_goal_catalog_builds_a_prompt_without_legacy_shards():
+    from contra_policy.goal import INTERACTIONS
+    from contra_policy.rl.tasks import GoalPrompt, RLTask, TaskCatalog
+
+    catalog = TaskCatalog.__new__(TaskCatalog)
+    catalog.require_prompt = False
+    catalog.image_size = 32
+    catalog._prompts = {}
+    catalog.prompt_cache_size = 2
+    catalog.segment = lambda _task: SimpleNamespace(meta={"goal_when": "boss"})
+    task = RLTask("/unused.npz", "boss", "boss_level1", "u", "train")
+
+    prompt = catalog.prompt(task)
+
+    assert isinstance(prompt, GoalPrompt)
+    assert prompt.interaction == INTERACTIONS.index("boss")
+    assert prompt.image.shape == (32, 32, 3) and not prompt.image.any()
+    assert prompt.mask.shape == (32, 32) and not prompt.mask.any()
 
 
 def test_shard_task_meta_keys_by_family_and_uid(tmp_path):

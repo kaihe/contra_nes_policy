@@ -129,7 +129,8 @@ class GRPOTrainer:
             cache_dir=args.cache_dir,
             task_filter=OmegaConf.to_container(args.get("task_filter", {}) or {},
                                                resolve=True),
-            expected_tasks=int(args.get("expected_tasks", 0) or 0))
+            expected_tasks=int(args.get("expected_tasks", 0) or 0),
+            require_prompt=bool(self.policy.cfg.use_goal_image))
         self.catalog.assert_split("train")
         sampler = TaskSampler(self.catalog, float(args.sampling.natural_fraction),
                               float(args.sampling.balanced_family_fraction),
