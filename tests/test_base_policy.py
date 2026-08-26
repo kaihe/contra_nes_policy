@@ -51,6 +51,27 @@ def test_null_goal_skips_goal_image_without_changing_output_shape():
     assert torch.equal(a, b)
 
 
+def test_reduced_features_reproduce_the_encoder_projection_path():
+    policy = build_policy(_config(aux_size=0, value_head=False,
+                                  freeze_encoder=True, train_projection=True,
+                                  use_goal_image=False)).eval()
+    # The tiny test encoder's reduced map has 256 values; production uses 256x4x4.
+    features = torch.randn(2, 3, 16, 4, 4)
+    interaction = torch.tensor([4, 4])
+
+    with torch.no_grad():
+        got = policy.forward_reduced_features(features, interaction)["pi_logits"]
+        frames = policy.encoder.token_ln(
+            policy.encoder.proj(features.flatten(2).reshape(6, -1))).view(2, 3, -1)
+        goal = policy.null_goal.unsqueeze(0).expand(2, -1)
+        expected = policy._heads(frames, goal, interaction, None)["pi_logits"]
+
+    assert torch.equal(got, expected)
+    assert all(p.requires_grad for p in policy.encoder.proj.parameters())
+    assert all(p.requires_grad for p in policy.encoder.token_ln.parameters())
+    assert not any(p.requires_grad for p in policy.encoder.view_backbone.parameters())
+
+
 def test_legacy_head_defaults_still_round_trip_strictly(tmp_path):
     policy = build_policy(_config())
     path = policy.save(str(tmp_path / "legacy.pt"))

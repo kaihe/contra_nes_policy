@@ -43,6 +43,8 @@ from contra_policy.datahouse import (DatahouseTokens, datahouse_index,
 from contra_policy.token_cache import (CachedEpisodeDataset, TokenCache,
                                        encoder_fingerprint)
 from contra_policy.frame_house import FrameEpisodeDataset, FrameHouse
+from contra_policy.reduced_house import (ReducedFeatureEpisodeDataset,
+                                         ReducedFeatureHouse)
 
 # The dataset's most common action, and the one `tail_ce` excludes. Derived from the
 # frozen action space rather than written as an integer, so a reordering there cannot
@@ -126,7 +128,7 @@ def _model_tokens(batch: Dict) -> int:
     tokens followed by the batch-padded frame sequence. ``frames`` remains the useful,
     unpadded counterpart, so the two rates expose padding overhead instead of hiding it.
     """
-    key = "image" if "image" in batch else "tokens"
+    key = next(key for key in ("image", "features", "tokens") if key in batch)
     batch_size, padded_frames = batch[key].shape[:2]
     return int(batch_size) * (int(padded_frames) + PREFIX)
 
@@ -180,9 +182,36 @@ class BCTrainer:
         # datahouse slice *is* the dataset. Everything below the branch is shared.
         dh_cfg = args.get("datahouse", {}) or {}
         fh_cfg = args.get("framehouse", {}) or {}
+        rh_cfg = args.get("reducedhouse", {}) or {}
+        self.reducedhouse = bool(rh_cfg.get("root"))
         self.framehouse = bool(fh_cfg.get("root"))
-        self.datahouse = bool(dh_cfg.get("root")) and not self.framehouse
-        if self.framehouse:
+        self.datahouse = (bool(dh_cfg.get("root")) and not self.framehouse
+                          and not self.reducedhouse)
+        if self.reducedhouse:
+            enc_sha = encoder_fingerprint(str(args.policy.encoder_ckpt))
+            store = ReducedFeatureHouse(
+                str(rh_cfg.root), level=int(rh_cfg.get("level", 1)),
+                task=str(rh_cfg.get("task", "boss")),
+                weapon=str(rh_cfg.get("weapon", "laser")),
+                representation=str(rh_cfg.get("representation", "reduced-view-v1")),
+                encoder_sha256=enc_sha)
+            train_uids, val_uids = split_uids(store, int(rh_cfg.get("val_every", 20)))
+            train_idx, val_idx = (datahouse_index(store, train_uids),
+                                  datahouse_index(store, val_uids))
+            self.token_cache = False
+            self.train_ds = ReducedFeatureEpisodeDataset(store, train_uids)
+            self.val_ds = ReducedFeatureEpisodeDataset(store, val_uids)
+            train_frames = sum(store.length(u) for u in train_uids)
+            json.dump({"source": "reducedhouse", "slice": list(store.slice),
+                       "encoder_sha256": store.encoder_sha256,
+                       "train_episodes": len(train_uids), "val_episodes": len(val_uids),
+                       "train_frames": int(train_frames),
+                       "store_episodes": len(store), "store_frames": int(store.declared[1]),
+                       "val_every": int(rh_cfg.get("val_every", 20))},
+                      open("dataset.json", "w"), indent=2)
+            print(f"[bc] reducedhouse {store.slice} · {len(train_uids)} train / "
+                  f"{len(val_uids)} val episodes ({train_frames} train frames)", flush=True)
+        elif self.framehouse:
             store = FrameHouse(
                 str(fh_cfg.root), level=int(fh_cfg.get("level", 1)),
                 task=str(fh_cfg.get("task", "boss")),
@@ -336,12 +365,14 @@ class BCTrainer:
         core_params = [p for name, p in self.policy.named_parameters()
                        if p.requires_grad and not name.startswith("encoder.")]
         encoder_params = [p for p in self.policy.encoder.parameters() if p.requires_grad]
-        groups = [{"params": core_params, "lr": float(args.train.learning_rate)}]
         encoder_lr = args.train.get("encoder_learning_rate")
-        if encoder_params:
+        if encoder_params and encoder_lr is not None:
+            groups = [{"params": core_params, "lr": float(args.train.learning_rate)}]
             groups.append({"params": encoder_params,
-                           "lr": float(encoder_lr if encoder_lr is not None
-                                       else args.train.learning_rate)})
+                           "lr": float(encoder_lr)})
+        else:
+            groups = [{"params": core_params + encoder_params,
+                       "lr": float(args.train.learning_rate)}]
         self.optimizer = torch.optim.AdamW(
             groups, weight_decay=float(args.train.weight_decay))
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_scale)
@@ -417,6 +448,9 @@ class BCTrainer:
             if self.token_cache:
                 latents = self.policy.forward_tokens(
                     batch["tokens"], batch["goal_token"], batch["interaction"])
+            elif "features" in batch:
+                latents = self.policy.forward_reduced_features(
+                    batch["features"], batch["interaction"])
             else:
                 cv = batch.get("cross_view")
                 latents = self.policy(

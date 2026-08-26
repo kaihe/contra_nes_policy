@@ -794,7 +794,7 @@ def pad_episodes(items: List[Dict]) -> Dict:
     padding rule, ``mask``, ``seq_len`` — is identical, which is what keeps a cached run
     and a live run comparable.
     """
-    time_key = "image" if "image" in items[0] else "tokens"
+    time_key = next(key for key in ("image", "features", "tokens") if key in items[0])
     t = max(int(x[time_key].shape[0]) for x in items)
     out: Dict = {}
 
@@ -806,7 +806,7 @@ def pad_episodes(items: List[Dict]) -> Dict:
             buf[i, :n] = x[key]
         return buf
 
-    for key in ("image", "tokens", "action", "mask", "goal_heatmap", "exist", "point",
+    for key in ("image", "features", "tokens", "action", "mask", "goal_heatmap", "exist", "point",
                 "n_goal_points", "prev_action", "prev_action_dropout", "first"):
         if key in items[0]:
             out[key] = stack(key)

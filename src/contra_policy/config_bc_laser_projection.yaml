@@ -1,0 +1,41 @@
+# doc/0024: frozen-trunk Laser projection adaptation from reduced-view-v1 features.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser-projection/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse: null
+framehouse: null
+reducedhouse:
+  root: ~/code/contra_nes_data/game_trace/datahouse
+  level: 1
+  task: boss
+  weapon: laser
+  representation: reduced-view-v1
+  val_every: 20
+
+policy:
+  freeze_encoder: true
+  train_projection: false
+  use_goal_image: false
+  core:
+    d_model: 640
+    n_layer: 5
+    n_head: 10
+    n_kv_head: 10
+
+loader:
+  batch_size: 32
+  num_workers: 2
+
+train:
+  steps: 20000
+  learning_rate: 1.0e-4
+  encoder_learning_rate: null
+  accumulate_steps: 1
+  val_every: 500
+  save_steps: [2000, 5000, 10000]
+  save_best: false

@@ -79,3 +79,8 @@ M-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_b
 L-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 policy.core.n_kv_head=10 hydra.run.dir=./runs/mixed_d10/L-D20k-C40k-mixed-lr1e-4
 #XL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=768 policy.core.n_layer=6 policy.core.n_head=12 policy.core.n_kv_head=12 hydra.run.dir=./runs/mixed_d10/XL-D20k-C40k-mixed-lr1e-4
 #XXL-D20k-C40k-mixed-lr1e-4	python -m contra_policy.train_bc --config-name config_bc_mixed_d10 train.steps=40000 policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 policy.core.n_kv_head=16 hydra.run.dir=./runs/mixed_d10/XXL-D20k-C40k-mixed-lr1e-4
+
+# doc/0024 — exact reduced-feature control followed by projection tuning. Both cells use
+# one 1e-4 optimizer rate; only `proj + token_ln` trainability differs.
+L-D10k-C20k-laser-null-goal-proj-frozen	python -m contra_policy.train_bc --config-name config_bc_laser_projection hydra.run.dir=./runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen
+L-D10k-C20k-laser-null-goal-proj-tuned	python -m contra_policy.train_bc --config-name config_bc_laser_projection policy.train_projection=true hydra.run.dir=./runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned

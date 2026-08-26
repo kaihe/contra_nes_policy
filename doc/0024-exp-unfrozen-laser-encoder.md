@@ -18,14 +18,14 @@ membership and uid-digest holdout. Preserve the causal shift: feature `i` predic
 `i + 1`. The learned null goal is shared by both cells because Laser has one task goal.
 
 Common recipe: L core with `d_model=640`, 5 layers, 10 heads; learned null goal token;
-20,000 optimizer cycles; batch 32; AdamW; core LR `1e-4`; projection LR `1e-5`; 500-step
+20,000 optimizer cycles; batch 32; AdamW at one `1e-4` rate for core and projection; 500-step
 warmup; WSD with cooldown from 18,000 to 20,000; bf16; dropout 0.2; seed 0; no value or
 auxiliary head. The trunk through `reduce` remains frozen in both cells.
 
 | run | encoder | data | cycles | state | dir |
 |---|---|---:|---:|---|---|
-| `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | planned control | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
-| `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-5` | reduced-feature D10k | 20,000 | blocked on feature release | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
+| `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | queued | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
+| `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-4` | reduced-feature D10k | 20,000 | queued | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
 
 The reduced cache is approximately 8.4 GB for 1.02M frames. Run a 200-step smoke test before
 the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles.
@@ -36,8 +36,8 @@ the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles
 |---|---:|---:|---|
 | final Laser success | pending | pending | matched goal-free evaluation |
 | final validation CE | pending | pending | policy metrics / `tools/scaling_report.py` |
-| throughput | pending | pending | smoke-run `metrics.csv` and wall clock |
-| peak GPU memory | pending | pending | smoke-run CUDA measurement |
+| median step time, batch 32 | 53.32 ms | 55.98 ms | 40-step `tools/bench_step.py`, 15 warmup, 2 workers |
+| peak GPU memory | 2.38 GiB | 2.53 GiB | same smoke benchmark |
 
 Closed-loop evaluation uses the evaluation 0029 protocol on `policy-final.pt`: Laser start,
 100 rollouts, temperature 1.0, seed 0, twice the expert budget, bf16, and batch 8. Report

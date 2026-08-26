@@ -64,6 +64,9 @@ class PolicyConfig:
     freeze_encoder: bool = True
     #: Single-task policies may replace the visual goal with a learned constant.
     use_goal_image: bool = True
+    #: Fine-tune only the pretrained ``proj`` and ``token_ln`` from cached reduced
+    #: features; the convolutional producer remains frozen.
+    train_projection: bool = False
     # Legacy checkpoints omit `value_head` and used aux_size=32, so these defaults must
     # preserve their exact state-dict shape. New action-only checkpoints explicitly set
     # value_head=false and aux_size=0.
@@ -90,6 +93,12 @@ class ContraPolicy(nn.Module):
             for p in self.encoder.parameters():
                 p.requires_grad = False
             self.encoder.eval()
+        if cfg.train_projection:
+            if not cfg.freeze_encoder:
+                raise ValueError("train_projection requires freeze_encoder=true")
+            for module in (self.encoder.proj, self.encoder.token_ln):
+                for p in module.parameters():
+                    p.requires_grad = True
 
         # The encoder's token width is fixed by stage A; the core's is the 0013 experiment
         # variable. They were the same number until the model-size ladder needed d_core to
@@ -179,6 +188,19 @@ class ContraPolicy(nn.Module):
             raise ValueError(f"{frame_tokens.shape[1]} frames + {PREFIX} prefix exceeds "
                              f"context {self.context}")
         return self._heads(frame_tokens, goal_token, interaction, attn_mask)
+
+    def forward_reduced_features(self, features: torch.Tensor,
+                                 interaction: torch.Tensor,
+                                 attn_mask: Optional[torch.Tensor] = None
+                                 ) -> Dict[str, torch.Tensor]:
+        """Run the policy-owned projection on ``(B,T,256,4,4)`` frozen features."""
+        if self.cfg.use_goal_image:
+            raise ValueError("reduced features require use_goal_image=false")
+        b, t = features.shape[:2]
+        flat = features.reshape(b * t, -1)
+        frames = self.encoder.token_ln(self.encoder.proj(flat)).view(b, t, -1)
+        goal = self.null_goal.unsqueeze(0).expand(b, -1)
+        return self._heads(frames, goal, interaction, attn_mask)
 
     def _heads(self, frames: torch.Tensor, goal: torch.Tensor,
                interaction: torch.Tensor,

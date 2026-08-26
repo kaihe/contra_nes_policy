@@ -134,14 +134,23 @@ class DatahouseTokens:
 
     def _read_spec(self, sha: str, image_size: Optional[int]) -> dict:
         """Load and enforce the data-owned encoder contract."""
-        hits = [os.path.join(dp, "spec.json")
-                for dp, _, fs in os.walk(self.path) if "spec.json" in fs and sha in dp]
+        paths = [os.path.join(dp, "spec.json")
+                 for dp, _, fs in os.walk(self.path) if "spec.json" in fs and sha in dp]
+        hits = []
+        for path in paths:
+            candidate = json.load(open(path))
+            if (candidate.get("checkpoint_sha256") == sha
+                    and isinstance(candidate.get("tokens"), dict)):
+                hits.append((path, candidate))
         if not hits:
             raise StaleCache(f"no encoder bundle spec.json for {sha[:12]} under {self.path}")
-        spec = json.load(open(hits[0]))
+        if len(hits) != 1:
+            raise StaleCache(f"found {len(hits)} token specs for encoder {sha[:12]}: "
+                             f"{[path for path, _ in hits]}")
+        path, spec = hits[0]
         got = spec.get("checkpoint_sha256")
         if got != sha:
-            raise StaleCache(f"{hits[0]} declares {got!r}, catalog says {sha!r}")
+            raise StaleCache(f"{path} declares {got!r}, catalog says {sha!r}")
         tok, inp = spec.get("tokens", {}), spec.get("input", {})
         if tok.get("dtype") != "float16" or int(tok.get("width", -1)) != _WIDTH:
             raise StaleCache(f"spec tokens are {tok!r}; this reader requires "
