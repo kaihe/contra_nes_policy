@@ -1,6 +1,6 @@
 # Organise the GRPO stack around rollout generation
 
-Status: Proposed
+Status: Accepted
 Supersedes: —
 Depends on: [0002](0002-design-gpt-policy.md) — the policy GRPO fine-tunes.
 
@@ -170,7 +170,28 @@ per-family Wilson-interval metrics, and the host-RAM preflight.
 GAE, the value head, critic warmup. All either scaffolding for a windowed model that no
 longer exists, or critic machinery GRPO removes.
 
-## 6. Risks
+## 6. Policy-ratio and resumption invariants
+
+GRPO may update only from a behaviour density it can reproduce. Rollout and update
+therefore run the trainable policy with stochastic layers disabled; `no_grad` alone is
+insufficient because it does not disable dropout. Before the first optimizer step on a
+fresh collection, recomputed action probabilities must give `ratio_mean = 1` and
+behaviour KL zero within numerical tolerance.
+
+The behaviour KL uses the non-negative k3 estimator for `KL(pi_old || pi_new)`. With
+`d = log(pi_old) - log(pi_new)`, its sampled form is `exp(-d) - 1 + d`. Reversing the
+exponent estimates a different quantity and makes `target_kl` stop the wrong updates.
+
+An exact resume restores five kinds of state together: policy weights, optimizer state,
+task/group sampling streams, action-sampling generator, and trainer minibatch RNG. The
+frozen reference remains the original BC checkpoint rather than moving to the resumed
+GRPO policy. A checkpoint missing any required continuation state fails loudly.
+
+The rollout actor shares the policy's prefix construction rather than assuming a visual
+goal or equal encoder/core widths. This keeps null-goal policies and learned `in_proj`
+layers bit-compatible between sequential rollout and full-episode training.
+
+## 7. Risks
 
 | risk | gate |
 |---|---|
