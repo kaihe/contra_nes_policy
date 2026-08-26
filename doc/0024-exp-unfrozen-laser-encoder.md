@@ -1,5 +1,7 @@
 # Does adapting the static image projection improve Laser boss success?
 
+Status: Implemented
+
 ## 1. Goal
 
 The matched static and temporal frozen encoders reach only 19% and 17% Laser-start success,
@@ -24,8 +26,8 @@ auxiliary head. The trunk through `reduce` remains frozen in both cells.
 
 | run | encoder | data | cycles | state | dir |
 |---|---|---:|---:|---|---|
-| `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | queued | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
-| `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-4` | reduced-feature D10k | 20,000 | queued | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
+| `L-D10k-C20k-laser-null-goal-proj-frozen` | frozen projection | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen` |
+| `L-D10k-C20k-laser-null-goal-proj-tuned` | trainable `proj` + `token_ln`, LR `1e-4` | reduced-feature D10k | 20,000 | done | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned` |
 
 The reduced cache is approximately 8.4 GB for 1.02M frames. Run a 200-step smoke test before
 the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles.
@@ -34,8 +36,12 @@ the full cells and retain checkpoints at 2,000, 5,000, 10,000, and 20,000 cycles
 
 | metric | frozen static baseline | unfrozen candidate | source |
 |---|---:|---:|---|
-| final Laser success | pending | pending | matched goal-free evaluation |
-| final validation CE | pending | pending | policy metrics / `tools/scaling_report.py` |
+| final Laser success | 25/100, 25% [17.5, 34.3] | 19/100, 19% [12.5, 27.8] | evaluation 0030 |
+| death / timeout | 74 / 1 | 81 / 0 | evaluation 0030 |
+| boss seen | 100% | 100% | evaluation 0030 |
+| mean boss damage | 47.1% | 43.8% | evaluation 0030 |
+| action entropy | 2.304 bits | 2.212 bits | evaluation 0030 |
+| final validation CE | 2.2097 | 2.1729 | policy `metrics.csv` |
 | median step time, batch 32 | 53.32 ms | 55.98 ms | 40-step `tools/bench_step.py`, 15 warmup, 2 workers |
 | peak GPU memory | 2.38 GiB | 2.53 GiB | same smoke benchmark |
 
@@ -43,6 +49,19 @@ Closed-loop evaluation uses the evaluation 0029 protocol on `policy-final.pt`: L
 100 rollouts, temperature 1.0, seed 0, twice the expert budget, bf16, and batch 8. Report
 the Wilson 95% interval, death/timeout counts, boss-seen rate, damage fraction, and entropy.
 
+Closed-loop results and checkpoint provenance are recorded in evaluation
+[0030](../../contra_nes_evaluation/doc/0030-result-laser-projection-adaptation.md).
+
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+Adapting `proj` and `token_ln` is not promising. It slightly lowers final validation CE
+(2.2097 to 2.1729) but lowers closed-loop success by 6 points (25% to 19%); the Wilson
+intervals overlap, and damage and action entropy also favor the frozen cell. Keep the image
+projection frozen and do not spend more compute tuning this representation.
+
+The next experiment should target the policy's closed-loop state distribution rather than
+the encoder. Collect expert-labelled recovery trajectories from states reached by failed
+Laser-policy rollouts (DAgger-style), mix them with the existing demonstrations, and compare
+one frozen-encoder cell against the current 25% baseline. This directly tests compounding
+error, which is consistent with low training CE and poor closed-loop success, while retaining
+the cheapest and best-performing visual setup from this experiment.
