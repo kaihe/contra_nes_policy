@@ -22,7 +22,7 @@ log-probabilities describe the same policy.
 
 | run | initialization | task data | reward | updates / wall clock | state | dir |
 |---|---|---|---|---:|---|---|
-| `L-D10k-C20k-laser-proj-frozen-GRPO100` | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen/checkpoints/policy-final.pt` | canonical `boss` task `win_level1_20260630171218_i8` | 1 win, 0 death/timeout; no shaping | 100 / 1.5 h maximum | planned | `runs/grpo/<launch-date>/laser-projection-<launch-time>` |
+| `L-D10k-C20k-laser-proj-frozen-GRPO100` | `runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-frozen/checkpoints/policy-final.pt` | canonical `boss` task `win_level1_20260630171218_i8` | 1 win, 0 death/timeout; no shaping | 100 / 1.5 h maximum | running | `runs/grpo/2026-08-26/laser-projection-16-40-25` |
 
 The task is the same `full_laser.state` start used by evaluations 0030 and 0031. The
 policy retains the frozen convolutional trunk and projection, L core (`d_model=640`, five
@@ -55,4 +55,4 @@ updates with 32 repeats of the same task.
 
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+_Pending — experiment in progress._
