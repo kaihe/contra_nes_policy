@@ -21,25 +21,59 @@ from contra_policy.rl.tasks import DifficultyTracker
 from contra_policy.rl.trainer import GRPOTrainer
 
 
+class _Stateful:
+    def __init__(self, value=0):
+        self.value = value
+
+    def state(self):
+        return {"value": self.value}
+
+    def load_state(self, state):
+        self.value = state["value"]
+
+
+class _Groups(_Stateful):
+    def __init__(self, tracker=None, value=0):
+        super().__init__(value)
+        self.difficulty = tracker
+
+    def state(self):
+        out = super().state()
+        if self.difficulty is not None:
+            out["difficulty"] = self.difficulty.state()
+        return out
+
+    def load_state(self, state):
+        super().load_state(state)
+        if self.difficulty is not None and state.get("difficulty"):
+            self.difficulty.load_state(state["difficulty"])
+
+
+class _Policy(torch.nn.Linear):
+    def save(self, path, **extra):
+        torch.save({"policy": self.state_dict(), "config": {}, **extra}, path)
+        return path
+
+
 def _stub(tmp_path, update=0, elapsed=0.0, tracker=None):
     """A trainer with only what save/_resume touch, per tests/test_probe.py's pattern."""
     stub = types.SimpleNamespace()
     stub.run_dir = str(tmp_path)
     (tmp_path / "checkpoints").mkdir(exist_ok=True)
-    stub.args = OmegaConf.create({})
+    stub.args = OmegaConf.create({"init_from": "/tmp/base-policy.pt"})
     stub.update, stub.elapsed = update, elapsed
     stub.rng = np.random.default_rng(0)
-    stub.groups = types.SimpleNamespace(difficulty=tracker)
-    stub.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(2))], lr=1e-5)
-    # Stand in for ContraPolicy.save, which writes weights alongside these extras.
-    stub.policy = types.SimpleNamespace(
-        save=lambda path, **extra: torch.save(dict(extra), path))
+    stub.groups = _Groups(tracker=tracker, value=17)
+    stub.collector = types.SimpleNamespace(actor=_Stateful(value=23))
+    stub.policy = _Policy(2, 2)
+    stub.policy.eval()
+    stub.optimizer = torch.optim.AdamW(stub.policy.parameters(), lr=1e-5)
     stub.save = GRPOTrainer.save.__get__(stub)
     stub._resume = GRPOTrainer._resume.__get__(stub)
     return stub
 
 
-def test_weights_only_checkpoint_is_rejected_rather_than_silently_restarting(tmp_path):
+def test_incomplete_checkpoint_is_rejected_rather_than_silently_restarting(tmp_path):
     path = tmp_path / "old.pt"
     torch.save({"policy": {}, "update": 40}, path)          # no optimizer: the old format
     stub = _stub(tmp_path)
@@ -71,6 +105,36 @@ def test_resume_restores_update_elapsed_and_curriculum(tmp_path):
     assert fresh_tracker.p_hat("boss-7", "boss_level1") == pytest.approx(before)
 
 
+def test_resume_restores_policy_group_sampler_and_actor_states(tmp_path):
+    saved = _stub(tmp_path, update=19, tracker=DifficultyTracker(group_size=8))
+    with torch.no_grad():
+        saved.policy.weight.fill_(3.25)
+    saved.groups.value = 41
+    saved.collector.actor.value = 57
+    path = saved.save()
+
+    fresh = _stub(tmp_path, tracker=DifficultyTracker(group_size=8))
+    with torch.no_grad():
+        fresh.policy.weight.zero_()
+    fresh.groups.value = fresh.collector.actor.value = -1
+    fresh._resume(path)
+
+    assert torch.equal(fresh.policy.weight, torch.full_like(fresh.policy.weight, 3.25))
+    assert fresh.groups.value == 41
+    assert fresh.collector.actor.value == 57
+    assert not fresh.policy.training
+
+
+def test_resume_refuses_to_move_the_frozen_bc_reference(tmp_path):
+    saved = _stub(tmp_path)
+    path = saved.save()
+    fresh = _stub(tmp_path)
+    fresh.args.init_from = "/tmp/a-different-policy.pt"
+
+    with pytest.raises(ValueError, match="frozen KL reference does not move"):
+        fresh._resume(path)
+
+
 def test_elapsed_is_cumulative_so_max_hours_budgets_the_experiment(tmp_path):
     """A resumed run must not get its wall-clock budget back."""
     first = _stub(tmp_path, update=50, elapsed=6.0 * 3600,
@@ -84,15 +148,20 @@ def test_elapsed_is_cumulative_so_max_hours_budgets_the_experiment(tmp_path):
     assert second.elapsed == pytest.approx(6.5 * 3600)
 
 
-def test_save_records_the_sampling_stream(tmp_path):
+def test_save_records_all_sampling_streams(tmp_path):
     stub = _stub(tmp_path, update=3, tracker=DifficultyTracker(group_size=8))
     stub.rng.random(11)                                     # advance it off its seed
     expected = stub.rng.bit_generator.state
+    stub.groups.value = 31
+    stub.collector.actor.value = 47
 
     ckpt = torch.load(stub.save(), map_location="cpu", weights_only=False)
 
-    assert ckpt["sampler_rng"] == expected
-    assert {"optimizer", "update", "difficulty", "elapsed_seconds"} <= set(ckpt)
+    assert ckpt["trainer_rng"] == expected
+    assert ckpt["group_sampler"]["value"] == 31
+    assert ckpt["actor_rng"]["value"] == 47
+    assert {"policy", "optimizer", "update", "group_sampler", "actor_rng",
+            "trainer_rng", "elapsed_seconds"} <= set(ckpt)
 
 
 def test_resume_of_a_run_without_difficulty_bias_is_not_an_error(tmp_path):

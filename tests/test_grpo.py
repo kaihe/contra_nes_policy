@@ -157,6 +157,35 @@ def test_approx_kl_is_non_negative():
         assert float(m["approx_kl"]) >= 0.0
 
 
+def test_approx_kl_uses_new_over_old_likelihood_ratio():
+    """k3(old || new) uses exp(log_new-log_old), not its reciprocal."""
+    batch = _batch()
+    logits = torch.randn(4, 6, 21)
+    logp = torch.log_softmax(logits, -1).gather(
+        -1, batch.action.unsqueeze(-1)).squeeze(-1)
+    batch.old_logprob = logp.detach() + torch.linspace(
+        -0.2, 0.8, logp.numel()).view_as(logp)
+    _loss, metrics = grpo_loss(logits, batch, GRPOConfig())
+    d = batch.old_logprob - logp
+    expected = ((torch.exp(-d) - 1 + d) * batch.mask).sum() / batch.mask.sum()
+    wrong = ((torch.exp(d) - 1 - d) * batch.mask).sum() / batch.mask.sum()
+    assert float(metrics["approx_kl"]) == pytest.approx(float(expected))
+    assert not torch.isclose(expected, wrong)
+
+
+def test_temperature_scores_actions_under_the_behaviour_distribution():
+    batch = _batch()
+    logits = torch.randn(4, 6, 21)
+    temperature = 0.6
+    scaled = torch.log_softmax(logits / temperature, -1)
+    batch.old_logprob = scaled.gather(
+        -1, batch.action.unsqueeze(-1)).squeeze(-1).detach()
+    _loss, metrics = grpo_loss(
+        logits, batch, GRPOConfig(temperature=temperature, kl_coef=0.0))
+    assert float(metrics["ratio_mean"]) == pytest.approx(1.0, abs=1e-6)
+    assert float(metrics["approx_kl"]) == pytest.approx(0.0, abs=1e-7)
+
+
 def test_padded_steps_never_reach_the_loss():
     a = _ep(6, 0, 1.0), _ep(2, 0, 0.0)
     adv, _ = group_advantages([1.0, 0.0], [0, 0])

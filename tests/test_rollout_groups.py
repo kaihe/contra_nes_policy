@@ -220,6 +220,41 @@ def test_act_uses_the_active_mask_not_a_none_test_on_the_image_array():
     assert by_mask == [0, 2]                # what it must compute
 
 
+def test_actor_matches_full_forward_with_dropout_null_goal_and_width_projection():
+    """At unchanged weights, sequential rollout and update logits must be identical."""
+    import torch
+
+    from contra_policy.model import PolicyConfig, build_policy
+    from contra_policy.rl.rollout import RolloutObservation, TokenHistoryActor
+
+    enc = dict(image_size=32, hiddim=24, depth=4, minres=4, proj_ch=8,
+               aux_size=8, head_depth=4, entity_classes=0)
+    core = dict(d_model=32, n_layer=1, n_head=4, n_kv_head=4, context=16,
+                mlp_ratio=2.0, rope_theta=10000.0, dropout=0.2)
+    model = build_policy(PolicyConfig(
+        encoder=enc, core=core, freeze_encoder=False, use_goal_image=False,
+        aux_size=0, value_head=False))
+    actor = TokenHistoryActor(model, 1, device=torch.device("cpu"), seed=7)
+    assert not model.training                    # dropout must be disabled
+
+    goal = np.zeros((32, 32, 3), np.uint8)
+    images = np.random.default_rng(4).integers(
+        0, 256, (1, 3, 32, 32, 3), dtype=np.uint8)
+    actor.begin(0, goal, interaction=4)
+    for t in range(3):
+        obs = RolloutObservation(
+            image=images[:, t], goal_image=goal[None],
+            goal_mask=np.zeros((1, 32, 32), np.uint8),
+            interaction=np.array([4]), prev_action=np.zeros(1, np.int64),
+            active=np.array([True]))
+        actor.act(obs)
+        sequential = actor._core_over_histories([0])
+        with torch.no_grad():
+            full = model(torch.from_numpy(images[:, :t + 1]), None,
+                         torch.tensor([4]))["pi_logits"][:, -1]
+        assert torch.allclose(sequential, full, atol=1e-6, rtol=1e-5)
+
+
 def test_meta_matches_supports_membership_equality_and_missing_keys():
     """doc/0012's task filter: a typo must empty the pool, never pass everything."""
     from contra_policy.rl.tasks import meta_matches
