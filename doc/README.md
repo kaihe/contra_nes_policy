@@ -1,0 +1,27 @@
+# Policy documents
+
+- [0001 Image-token compression](0001-exp-image-encoder.md) — Recorded — image encoder experiment
+- [0002 GPT policy](0002-design-gpt-policy.md) — Implemented — causal whole-episode policy
+- [0003 GRPO code layout](0003-design-grpo-code-layout.md) — Implemented — rollout-centred GRPO stack
+- [0004 GRPO](0004-exp-grpo.md) — Pending — initial GRPO experiment
+- [0005 Graded reward](0005-design-graded-reward.md) — Accepted — boss-damage failure credit
+- [0006 Action-only base policy](0006-design-action-only-base-policy.md) — Implemented — action cross-entropy objective
+- [0007 Compiled variable-length training](0007-exp-compiled-varlen-training.md) — Recorded — throughput experiment
+- [0008 Fourteen-hour GRPO](0008-exp-fourteen-hour-grpo.md) — Superseded by 0011 — long-run GRPO
+- [0009 Boss-data scaling](0009-exp-boss-data-scaling.md) — Recorded — boss-data scale experiment
+- [0010 Dropout regularization](0010-exp-dropout-regularization.md) — Recorded — regularization experiment
+- [0011 Boss-only GRPO](0011-exp-boss-grpo.md) — Recorded — graded boss feasibility run
+- [0012 Spread GRPO](0012-exp-spread-grpo.md) — Proposed — binary Spread/rapid boss GRPO
+- [0013 Model scaling](0013-exp-scaling-model.md) — Recorded — GPT size ladder
+- [0014 Compute scaling](0014-exp-scaling-compute.md) — Recorded — fixed-data compute ladder
+- [0015 Data scaling](0015-exp-scaling-data.md) — Recorded — fixed-compute data ladder
+- [0016 Joint scaling](0016-exp-scaling-joint.md) — Recorded — joint data and compute scaling
+- [0017 Mixed-weapon scaling](0017-exp-scaling-mixed-weapon.md) — Pending — second-weapon experiment
+- [0018 Learning rate](0018-exp-learning-rate.md) — Recorded — large-model learning-rate experiment
+- [0019 Training throughput](0019-exp-training-throughput.md) — Recorded — batch and worker benchmark
+- [0020 Laser model scaling](0020-exp-laser-model-scaling.md) — Recorded — Laser model-size ladder
+- [0021 Laser data scaling](0021-exp-laser-data-scaling.md) — Recorded — Laser data-size experiment
+- [0022 Mixed Spread/Laser](0022-exp-mixed-spread-laser.md) — Pending — mixed-weapon retention experiment
+- [0023 Frame-difference Laser policy](0023-exp-frame-difference-laser-policy.md) — Pending — temporal visual-token experiment
+- [0024 Laser projection adaptation](0024-exp-unfrozen-laser-encoder.md) — Recorded — frozen versus adapted projection
+- [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — Pending — single-start binary-reward GRPO
