@@ -27,4 +27,4 @@
 - [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — GRPO works, then regresses — 25% to 49% at u25, 40% final
 - [0026 Iterative Laser GRPO](0026-exp-iterative-laser-grpo.md) — No improvement — stage two does not beat the 49% reference
 - [0027 PPO critic](0027-design-ppo-critic.md) — Implemented — binary-return value head and GAE
-- [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — Pending — critic-gated binary-reward PPO
+- [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — Running — critic gate passed, binary-reward PPO active

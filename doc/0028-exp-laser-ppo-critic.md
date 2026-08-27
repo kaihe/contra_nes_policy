@@ -23,7 +23,7 @@ coefficient 0.5; reference KL coefficient 0.02; entropy coefficient 0.01.
 
 | run | initialization | critic warmup | updates / wall clock | state | dir |
 |---|---|---|---:|---|---|
-| `L-D10k-C20k-laser-GRPO25-PPO200` | stage-one `grpo-000025.pt` | 512 train + 128 fresh validation rollouts; three head-only epochs per 128-roll chunk; actor frozen | 200 / 2.5 h maximum | planned | `runs/ppo/<launch-date>/laser-critic-<launch-time>` |
+| `L-D10k-C20k-laser-GRPO25-PPO200` | stage-one `grpo-000025.pt` | 512 train + 128 fresh validation rollouts; three head-only epochs per 128-roll chunk; actor frozen | 200 / 2.5 h maximum | running | `runs/ppo/2026-08-27/laser-critic-14-56-52` |
 
 Warmup must achieve positive validation explained variance and lower Brier score than the
 constant train-success predictor before actor updates begin. Save checkpoints every 25
@@ -33,10 +33,10 @@ episodes with no reward-dependent filtering; evaluation ignores the value head.
 
 ## 3. Evaluation metrics
 
-| critic gate | constant | warmup train | warmup validation | source |
+| critic gate | constant | warmup final train chunk | warmup validation | source |
 |---|---:|---:|---:|---|
-| Brier score | pending | pending | pending | PPO warmup metrics |
-| explained variance | 0 | pending | pending | PPO warmup metrics |
+| Brier score | 0.2854 | 0.2126 | **0.2260** | run `metrics.csv`; fresh 128-roll validation is compared with the training-success constant |
+| explained variance | 0 | 0.102 | **0.122** | same PPO warmup metrics |
 
 | closed-loop metric | u25 reference | PPO u25 | u50 | u75 | u100 | u125 | u150 | u175 | u200 | source |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -47,4 +47,4 @@ episodes with no reward-dependent filtering; evaluation ignores the value head.
 
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+_Pending — experiment in progress._
