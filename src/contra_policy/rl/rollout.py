@@ -200,7 +200,9 @@ class TokenHistoryActor:
     def act(self, obs: "RolloutObservation") -> Dict[str, np.ndarray]:
         """One decision per active slot. Returns ``action`` and its ``logprob``.
 
-        No value: GRPO has no critic. The advantage arrives later, from the group.
+        No value is needed to choose an action. GRPO obtains its advantage from the
+        group; PPO recomputes behavior values over the completed histories before the
+        policy changes, keeping inference identical and the collector shared.
         """
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null_context())

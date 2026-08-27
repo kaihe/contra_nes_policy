@@ -23,7 +23,7 @@ coefficient 0.5; reference KL coefficient 0.02; entropy coefficient 0.01.
 
 | run | initialization | critic warmup | updates / wall clock | state | dir |
 |---|---|---|---:|---|---|
-| `L-D10k-C20k-laser-GRPO25-PPO200` | stage-one `grpo-000025.pt` | 512 rollouts, deterministic 80/20 split; actor frozen | 200 / 2.5 h maximum | planned | `runs/ppo/<launch-date>/laser-critic-<launch-time>` |
+| `L-D10k-C20k-laser-GRPO25-PPO200` | stage-one `grpo-000025.pt` | 512 train + 128 fresh validation rollouts; three head-only epochs per 128-roll chunk; actor frozen | 200 / 2.5 h maximum | planned | `runs/ppo/<launch-date>/laser-critic-<launch-time>` |
 
 Warmup must achieve positive validation explained variance and lower Brier score than the
 constant train-success predictor before actor updates begin. Save checkpoints every 25

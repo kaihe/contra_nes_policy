@@ -1,6 +1,6 @@
 # Add a state-value critic for binary-reward PPO
 
-Status: Proposed
+Status: Implemented
 
 **Question.** Stage-one GRPO raised fixed-start Laser success from 25% to 49%, but a
 second 200-update stage changed the policy without improving success. Should the next
@@ -99,10 +99,11 @@ better held-out Brier score is critic overfit, not successful credit assignment.
 
 ## Critic warmup must beat a constant predictor
 
-Collect 512 u25 episodes once, split them deterministically 80/20 by episode index, and
-train only the value head. Compare against a constant predictor equal to the training-set
-success rate. Proceed to actor updates only when validation Brier score beats that constant
-and explained variance is positive; otherwise stop the experiment before policy compute.
+Stream four 128-episode u25 training chunks through three head-only epochs each, then
+collect 128 fresh validation episodes. Compare against a constant predictor equal to the
+training-set success rate, with both Brier scores weighted per timestep. Proceed to actor
+updates only when validation Brier score beats that constant and explained variance is
+positive; otherwise stop the experiment before policy compute.
 
 The previous deleted PPO critic reached explained variance only about 0.33. That result is
 the prior against this design, not evidence to ignore: the new test uses a 49%-successful
@@ -112,9 +113,11 @@ larger critic.
 
 ## Checkpoints make critic training exactly resumable
 
-Save actor/core weights, value-head weights, both optimizer states, update count, elapsed
-time, task sampler state, rollout and minibatch RNG states, and Python/NumPy/Torch/CUDA RNG
-states. Save the frozen u25 reference identity and reject a resume whose reference differs.
+Save actor/core weights, value-head weights, optimizer state, update count, elapsed time,
+rollout and minibatch RNG states, and Python/NumPy/Torch/CUDA RNG states. Save the frozen
+u25 reference identity and reject a resume whose reference differs. An interrupted head-only
+warmup may restart safely because it has made no policy update; exact resume begins once the
+critic gate has passed and the first PPO checkpoint exists.
 Old BC and GRPO checkpoints remain loadable as actor initialization; a missing value head is
 initialized to the neutral 0.5 predictor only for a new PPO run, never during resume.
 
