@@ -1,0 +1,21 @@
+# Experiment 0026: treat the validated stage-one u25 checkpoint as the new policy and
+# reference. This is a new GRPO stage, not a resume: optimizer, sampling and KL all reset.
+defaults:
+  - laser_projection
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/laser-projection-stage2-${now:%H-%M-%S}
+
+init_from: ${hydra:runtime.cwd}/runs/grpo/2026-08-26/laser-projection-16-40-25/checkpoints/grpo-000025.pt
+resume_from: null
+
+train:
+  # Stage one peaked after only 25 updates at 5e-6. Use a smaller step and inspect
+  # frequent saves instead of assuming that more drift monotonically improves play.
+  learning_rate: 2.0e-6
+  updates: 200
+  max_hours: 2.5
+  max_kl_ref: 0.10
+  save_every: 25
