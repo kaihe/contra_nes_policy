@@ -25,6 +25,7 @@ import math
 import os
 import signal
 import time
+import random
 from typing import Dict, List, Optional
 
 import hydra
@@ -101,6 +102,10 @@ class GRPOTrainer:
         # -- policy, and a frozen copy of where it started ---------------------
         self.policy = load_policy(args.init_from, map_location="cpu").to(self.device)
         self.cfg = GRPOConfig(**OmegaConf.to_container(args.grpo, resolve=True))
+        self.cfg.temperature = float(args.rollout.temperature)
+        # Keep dropout disabled during both rollout and gradient recomputation. Gradients
+        # work in eval mode; only stochastic layer behaviour changes.
+        self.policy.eval()
         self.ref = None
         if self.cfg.kl_coef > 0:
             # Not optional on measured grounds: the previous PPO run left this at zero
@@ -124,7 +129,8 @@ class GRPOTrainer:
             cache_dir=args.cache_dir,
             task_filter=OmegaConf.to_container(args.get("task_filter", {}) or {},
                                                resolve=True),
-            expected_tasks=int(args.get("expected_tasks", 0) or 0))
+            expected_tasks=int(args.get("expected_tasks", 0) or 0),
+            require_prompt=bool(self.policy.cfg.use_goal_image))
         self.catalog.assert_split("train")
         sampler = TaskSampler(self.catalog, float(args.sampling.natural_fraction),
                               float(args.sampling.balanced_family_fraction),
@@ -277,6 +283,7 @@ class GRPOTrainer:
             return model(batch.image, batch.goal_image, batch.interaction)["pi_logits"]
 
     def train_on(self, episodes, advantages) -> Dict[str, float]:
+        self.policy.eval()
         agg: Dict[str, List[float]] = {}
         for _ in range(int(self.args.train.epochs)):
             for batch in iter_minibatches(
@@ -552,8 +559,12 @@ class GRPOTrainer:
                          train_config=OmegaConf.to_container(self.args, resolve=True),
                          optimizer=self.optimizer.state_dict(),
                          difficulty=tracker.state() if tracker is not None else None,
-                         sampler_rng=self.rng.bit_generator.state,
+                         group_sampler=self.groups.state(),
+                         actor_rng=self.collector.actor.state(),
+                         trainer_rng=self.rng.bit_generator.state,
                          elapsed_seconds=self.elapsed,
+                         python_rng=random.getstate(),
+                         numpy_rng=np.random.get_state(),
                          torch_rng=torch.get_rng_state(),
                          cuda_rng=torch.cuda.get_rng_state_all()
                          if torch.cuda.is_available() else [])
@@ -572,19 +583,34 @@ class GRPOTrainer:
             return
         path = os.path.abspath(os.path.expanduser(path))
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        missing = {"optimizer", "update"} - set(ckpt)
+        required = {"policy", "optimizer", "update", "train_config", "group_sampler",
+                    "actor_rng", "trainer_rng", "python_rng", "numpy_rng", "torch_rng",
+                    "cuda_rng"}
+        missing = required - set(ckpt)
         if missing:
             raise ValueError(
                 f"{path} has no {sorted(missing)} — it predates resumable checkpoints and "
                 f"can only be used as `init_from`, which restarts at update 0.")
+        previous_init = str(ckpt["train_config"].get("init_from", ""))
+        current_init = str(self.args.get("init_from", ""))
+        if os.path.abspath(os.path.expanduser(previous_init)) != \
+                os.path.abspath(os.path.expanduser(current_init)):
+            raise ValueError(
+                "resume_from must retain the original BC init_from so the frozen KL "
+                f"reference does not move: checkpoint has {previous_init!r}, current "
+                f"config has {current_init!r}")
+        self.policy.load_state_dict(ckpt["policy"], strict=True)
+        self.policy.eval()
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.update = int(ckpt["update"])
         self.elapsed = float(ckpt.get("elapsed_seconds", 0.0))
-        tracker = getattr(self.groups, "difficulty", None)
-        if tracker is not None and ckpt.get("difficulty"):
-            tracker.load_state(ckpt["difficulty"])
-        if ckpt.get("sampler_rng"):
-            self.rng.bit_generator.state = ckpt["sampler_rng"]
+        self.groups.load_state(ckpt["group_sampler"])
+        self.collector.actor.load_state(ckpt["actor_rng"])
+        self.rng.bit_generator.state = ckpt["trainer_rng"]
+        if ckpt.get("python_rng") is not None:
+            random.setstate(ckpt["python_rng"])
+        if ckpt.get("numpy_rng") is not None:
+            np.random.set_state(ckpt["numpy_rng"])
         if ckpt.get("torch_rng") is not None:
             torch.set_rng_state(ckpt["torch_rng"].cpu().to(torch.uint8))
         if ckpt.get("cuda_rng") and torch.cuda.is_available():

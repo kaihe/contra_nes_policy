@@ -37,6 +37,9 @@ class GRPOConfig:
     #: this. Distinct from `kl_coef`, which pulls towards the frozen BC reference.
     target_kl: float = 0.02
     max_grad_norm: float = 1.0
+    #: Temperature of the behaviour distribution used to collect the actions. The
+    #: update must score actions under that same distribution, not raw logits.
+    temperature: float = 1.0
 
 
 def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -54,7 +57,9 @@ def grpo_loss(logits: torch.Tensor, batch, cfg: GRPOConfig,
     default.
     """
     mask = batch.mask
-    logp_all = F.log_softmax(logits.float(), dim=-1)
+    if cfg.temperature <= 0:
+        raise ValueError("GRPO requires a positive sampling temperature")
+    logp_all = F.log_softmax(logits.float() / cfg.temperature, dim=-1)
     logp = logp_all.gather(-1, batch.action.unsqueeze(-1)).squeeze(-1)
 
     ratio = torch.exp(logp - batch.old_logprob)
@@ -73,7 +78,7 @@ def grpo_loss(logits: torch.Tensor, batch, cfg: GRPOConfig,
 
     metrics: Dict[str, torch.Tensor] = {}
     if ref_logits is not None and cfg.kl_coef > 0:
-        ref_logp = F.log_softmax(ref_logits.float(), dim=-1)
+        ref_logp = F.log_softmax(ref_logits.float() / cfg.temperature, dim=-1)
         # Forward KL(pi || pi_ref) summed over actions — the full-distribution form, not
         # the sampled-action estimate, because we already have every logit and the exact
         # value is cheaper to interpret.
@@ -86,7 +91,10 @@ def grpo_loss(logits: torch.Tensor, batch, cfg: GRPOConfig,
         # k3 estimator of KL to the *behaviour* policy: unbiased and non-negative, unlike
         # the naive mean of (old - new) which is noisy around zero and can go negative.
         d = batch.old_logprob - logp
-        approx_kl = masked_mean(torch.exp(d) - 1 - d, mask)
+        # k3 for KL(pi_old || pi_new). With d=log(old)-log(new), the likelihood
+        # ratio new/old is exp(-d), hence exp(-d)-1+d. The previous exp(d)-1-d
+        # used the reciprocal ratio and could stop an update on the wrong quantity.
+        approx_kl = masked_mean(torch.exp(-d) - 1 + d, mask)
         metrics.update({
             "policy_loss": policy_loss.detach(),
             "entropy": masked_mean(entropy, mask),

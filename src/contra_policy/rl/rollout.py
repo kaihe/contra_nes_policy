@@ -154,6 +154,11 @@ class TokenHistoryActor:
     def __init__(self, model, batch_size: int, *, device: torch.device,
                  temperature: float = 1.0, seed: int = 0, precision: str = "bf16"):
         self.model = model
+        # Policy-gradient ratios require the rollout density to be reproducible during
+        # the update. `no_grad()` does not disable dropout; eval mode does. RMSNorm and
+        # the frozen image encoder have no train/eval-dependent statistics, so gradients
+        # can still be computed later while the model remains in eval mode.
+        self.model.eval()
         self.batch_size = batch_size
         self.device = device
         self.temperature = float(temperature)
@@ -162,7 +167,7 @@ class TokenHistoryActor:
         if device.type != "cuda":
             self.autocast_dtype = None
         self.generator = torch.Generator(device=device).manual_seed(int(seed))
-        self.d = model.encoder.cfg.hiddim
+        self.d = model.core.cfg.d_model
         self.prefix = 2
         self.frames: List[Optional[torch.Tensor]] = [None] * batch_size
         self.goal: List[Optional[torch.Tensor]] = [None] * batch_size
@@ -182,7 +187,11 @@ class TokenHistoryActor:
                if self.autocast_dtype is not None else _null_context())
         g = torch.from_numpy(goal_image).to(self.device).unsqueeze(0)
         with ctx:
-            self.goal[slot] = self.model.encoder.encode(g)                      # (1, d)
+            if self.model.cfg.use_goal_image:
+                goal = self.model.encoder.encode(g)
+            else:
+                goal = self.model.null_goal.unsqueeze(0)
+            self.goal[slot] = self.model.in_proj(goal)                          # (1, d_core)
             self.inter[slot] = self.model.interaction(
                 torch.tensor([interaction + 1], device=self.device))            # (1, d)
         self.frames[slot] = None
@@ -204,7 +213,7 @@ class TokenHistoryActor:
         active = [i for i, on in enumerate(obs.active) if on]
         with ctx:
             imgs = torch.from_numpy(np.stack([obs.image[i] for i in active])).to(self.device)
-            new = self.model.encoder.encode(imgs)                               # (n, d)
+            new = self.model.in_proj(self.model.encoder.encode(imgs))            # (n, d_core)
             for k, i in enumerate(active):
                 tok = new[k:k + 1]
                 self.frames[i] = (tok if self.frames[i] is None
