@@ -24,4 +24,4 @@
 - [0022 Mixed Spread/Laser](0022-exp-mixed-spread-laser.md) — Pending — mixed-weapon retention experiment
 - [0023 Frame-difference Laser policy](0023-exp-frame-difference-laser-policy.md) — Pending — temporal visual-token experiment
 - [0024 Laser projection adaptation](0024-exp-unfrozen-laser-encoder.md) — Recorded — frozen versus adapted projection
-- [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — Running — single-start binary-reward GRPO
+- [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — Pending — single-start binary-reward GRPO metrics collected
