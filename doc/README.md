@@ -26,3 +26,4 @@
 - [0024 Laser projection adaptation](0024-exp-unfrozen-laser-encoder.md) — Recorded — frozen versus adapted projection
 - [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — GRPO works, then regresses — 25% to 49% at u25, 40% final
 - [0026 Iterative Laser GRPO](0026-exp-iterative-laser-grpo.md) — No improvement — stage two does not beat the 49% reference
+- [0027 PPO critic](0027-design-ppo-critic.md) — Proposed — binary-return value head and GAE
