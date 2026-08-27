@@ -64,4 +64,6 @@ updates with 32 repeats of the same task.
 
 ## 4. Conclusion
 
-_Pending — metrics collected, awaiting discussion._
+Fixing the previous GRPO bugs proves that post-training is effective: it raised the Laser
+boss-fight win rate from 25% to 49%. However, as the policy drifted from the reference
+policy, the win rate appeared to decline, reaching 40% at the final update.
