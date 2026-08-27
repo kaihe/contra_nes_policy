@@ -43,4 +43,4 @@ or random-number-generator state.
 
 ## 4. Conclusion
 
-_Pending — metrics collected, awaiting discussion._
+The additional 200 GRPO updates produced no improvement over the previous policy.
