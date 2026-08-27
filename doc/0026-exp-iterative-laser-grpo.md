@@ -22,7 +22,7 @@ stage-local reference KL to zero.
 
 | run | policy and reference initialization | stage-two updates / wall clock | state | dir |
 |---|---|---:|---|---|
-| `L-D10k-C20k-laser-GRPO25-GRPO200` | `runs/grpo/2026-08-26/laser-projection-16-40-25/checkpoints/grpo-000025.pt` | 200 / 2.5 h maximum | planned | `runs/grpo/<launch-date>/laser-projection-stage2-<launch-time>` |
+| `L-D10k-C20k-laser-GRPO25-GRPO200` | `runs/grpo/2026-08-26/laser-projection-16-40-25/checkpoints/grpo-000025.pt` | 200 / 2.5 h maximum | running | `runs/grpo/2026-08-27/laser-projection-stage2-09-29-52` |
 
 The image encoder, frozen projection, L core, learned null goal, task, reward, and rollout
 protocol remain unchanged from 0025. Save stage-two checkpoints every 25 updates and stop
@@ -41,4 +41,4 @@ or random-number-generator state.
 
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+_Pending — experiment in progress._
