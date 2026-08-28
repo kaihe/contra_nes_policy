@@ -56,4 +56,5 @@ filtering; evaluation ignores the value head.
 
 ## 4. Conclusion
 
-_Pending — metrics collected, awaiting discussion._
+PPO training shows remarkable progress. We should understand the value head's
+behavior before scaling up PPO training.
