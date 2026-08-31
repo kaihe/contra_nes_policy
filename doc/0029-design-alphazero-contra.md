@@ -8,12 +8,12 @@ fight? Can the existing Monte Carlo search become the first planner by replacing
 history-free rollout prior with the learned policy?
 
 **Answer.** Treat the NES emulator as the exact dynamics model and the current causal
-policy/value network as the search guide. First benchmark policy-guided rollouts inside the
-existing greedy search; do not call that AlphaZero or MCTS. If guidance improves wins found
-per emulator step, replace greedy sequence selection with a persistent PUCT tree whose root
-visit counts supervise the policy and whose completed episodes supervise the critic. Contra
-has no opponent or useful self-play symmetry, so training is repeated single-agent policy
-improvement from a controlled task-state distribution.
+policy/value network as the search guide. Proceed directly to the persistent PUCT tree
+specified by [0030](0030-design-puct-tree.md): the PPO policy already supplies a useful
+closed-loop prior, so a separate bigram-versus-policy rollout gate would not answer the
+remaining question. Root visit counts supervise the policy and completed episodes supervise
+the critic. Contra has no opponent or useful self-play symmetry, so training is repeated
+single-agent policy improvement from a controlled task-state distribution.
 
 ---
 
@@ -107,7 +107,7 @@ and backtracks when the best sequence dies. Its action generator is a legal-acti
 a previous-action bigram prior. It keeps one committed history, not per-edge visit counts or
 backed-up action values. Consequently it is greedy receding-horizon Monte Carlo search.
 
-The smallest useful bridge replaces only the proposal distribution:
+The smallest possible bridge would replace only the proposal distribution:
 
 ```text
 current image/action history -> policy probabilities
@@ -122,14 +122,18 @@ rollouts per decision, horizon, seeds, emulator-step budget, and reward configur
 gate is more wins found per emulator step and per wall-clock hour, not merely a higher shaped
 score. Neural inference cost and batched branch evaluation must be reported separately.
 
-This stage may reuse the search reward because its purpose is efficient trace discovery.
+That bridge is no longer a prerequisite: PPO already reaches 59/100 in independent
+closed-loop evaluation, and the next unknown is whether persistent tree search improves its
+decisions. It remains a useful debugging baseline if PUCT fails. Such a baseline may reuse
+the search reward because its purpose is efficient trace discovery.
 That reward includes progress, damage, death, items, and button cleanliness, so its score is
 not a probability of eventually winning. It must not silently become the critic target.
 
 ## PUCT search uses policy priors, backed-up values, and visit targets
 
-Only after policy-guided greedy search passes its gate should Contra implement a persistent
-tree. Each node owns legal edges; each edge stores the policy prior, visit count, cumulative
+Contra should now implement the persistent tree directly, as specified by
+[0030](0030-design-puct-tree.md). Each node owns legal edges; each edge stores the policy
+prior, visit count, cumulative
 value, and mean value. Selection uses a PUCT score conceptually equivalent to:
 
 ```text
@@ -158,7 +162,6 @@ improve its internal score. Evaluation therefore proceeds in three gates:
 
 | gate | comparison | pass condition |
 |---|---|---|
-| rollout guidance | bigram versus sampled policy, existing greedy search | higher fixed-start wins per emulator step and wall-clock hour |
 | leaf evaluation | terminal rollout score versus critic-assisted truncated search | critic ranking agrees with completed branch outcomes and search efficiency improves |
 | tree improvement | raw policy versus PUCT-selected actions | matched closed-loop win rate improves before any distillation |
 
