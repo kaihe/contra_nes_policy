@@ -84,6 +84,36 @@ The child node is created by restoring the parent's `emu_state`, applying the ed
 capturing the resulting observation and savestate, and appending its encoded frame token.
 Success is resolved before death and timeout, matching PPO collection and evaluation.
 
+## Tree construction alternates simulations with real action commitment
+
+Create the initial root by loading the task savestate, peeking its first valid observation
+without advancing the game clock, encoding that frame once, and attaching the committed
+history prefix. Evaluate and expand the root before the first selection. Then construct the
+tree for one real decision as follows:
+
+```text
+repeat until simulation budget is exhausted:
+  1. start at the current root
+  2. select existing edges by PUCT until reaching an unexpanded or terminal node
+  3. for an edge without a child, restore its parent savestate and execute its action
+  4. capture the child savestate, resulting frame token, and terminal status
+  5. evaluate and expand a non-terminal child once
+  6. back up the leaf value through every traversed edge
+
+normalize root visits -> save policy target -> commit selected action -> re-root
+```
+
+Every simulation restores emulator state from the selected edge's parent; speculative
+transitions never modify the committed environment state. Repeated simulations grow and
+update the same tree. If an edge already owns a child, selection reuses that child and its
+statistics rather than recreating the transition. After commitment, the chosen child becomes
+the root and its known descendants remain available for the next decision.
+
+The construction loop stops on committed success, death, or timeout. Tree depth is measured
+in policy decisions, while emulator cost is counted in skipped NES frames. A maximum node
+count and maximum search depth bound memory and latency independently of the simulation
+budget.
+
 ## PUCT selection, expansion, and backup preserve win probability
 
 One simulation begins at the root and repeatedly selects the legal edge with the greatest:
@@ -114,9 +144,22 @@ frame-token history, previous actions, legal mask, normalized root visits
 ```
 
 Choose the real environment action from that distribution, advance the committed episode,
-and reuse the selected child and its descendants as the next tree. Discard sibling subtrees.
-Continue until success, death, or the evaluation-matched decision budget. Then attach the
-same binary episode outcome to every saved decision record.
+and reuse the selected child and its descendants as the next tree. Continue until success,
+death, or the evaluation-matched decision budget. Then attach the same binary episode
+outcome to every saved decision record on that attempted trajectory.
+
+Standard PUCT does not rewind an action after commitment. An optional bounded recovery
+controller may retain a stack of recent committed roots for trace generation. If every
+examined continuation at the current root reaches a concrete death, it may restore an
+ancestor's emulator state and committed policy prefix, back up the failed continuation as
+`0`, increase that ancestor's search budget, and try another edge. A low critic estimate
+alone never triggers recovery because it is not proof of death.
+
+Recovery records abandoned and replacement continuations as separate attempts. An abandoned
+branch receives a loss value target; a later win must not relabel states that existed only on
+that branch. Root visit targets may include the failed branch's backed-up evidence. Configure
+maximum rewind depth and retries explicitly, discard roots outside that window, and report
+success both with and without recovery so backtracking cannot hide a weak online policy.
 
 Training initializes a candidate from the frozen generator and minimizes policy
 cross-entropy against root visits plus binary value loss against the completed outcome.
