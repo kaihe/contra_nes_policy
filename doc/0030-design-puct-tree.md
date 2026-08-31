@@ -31,29 +31,54 @@ behavior is deterministic under a fixed seed.
 
 ## A node binds an emulator snapshot to one causal history
 
-A node represents the state before the next action and owns:
+A node represents the state before the next action. The classes separate environment state,
+per-action statistics, and tree-level history ownership:
 
 ```text
-emu_state:        exact stable-retro savestate bytes
-frame_tokens:     immutable causal token sequence through this observation
-previous_actions: action sequence used to reach the node
-terminal:         success, death, timeout, or non-terminal
-edges:            legal actions and their search statistics
+Node
+  emu_state:        exact stable-retro savestate bytes
+  frame_token:      token for this node's observation only
+  parent:           parent node, absent at root
+  incoming_action: action taken from parent, absent at root
+  previous_action: last action, required by the legal-action mask
+  depth:            decisions below the current root
+  terminal:         success, death, timeout, or non-terminal
+  expanded:         whether the network has evaluated this node
+  edges:            action_id -> Edge
+
+Edge
+  action_id:        discrete policy action held for one environment skip
+  prior:            masked policy probability P
+  visits:           selection count N
+  value_sum:        backed-up value sum W
+  mean_value:       Q = W / N, or zero before the first visit
+  child:            resulting Node, created lazily
+
+SearchTree
+  root:             node for the current real decision
+  committed_prefix: immutable frame tokens preceding the current root
+  simulations:      completed-backup count for this root
+  model_id:         frozen PPO checkpoint identity
 ```
 
-The action history is retained for audit and reconstruction; the current model consumes the
-causal frame-token sequence rather than a recurrent hidden state. Children may share their
-parent's immutable prefix and append one token. Siblings must never mutate shared history.
+`Node` stores one token rather than copying the full causal sequence into every descendant.
+Leaf evaluation reconstructs its input as:
+
+```text
+SearchTree.committed_prefix + root-to-leaf frame tokens
+```
+
+Parent links and incoming actions make paths auditable; the current policy itself consumes
+frame tokens, while `previous_action` is needed by the search legal-action mask. Children
+share only immutable prefixes, and siblings never mutate common history. `Edge` owns `N`,
+`W`, and `Q` because those statistics describe choosing one action from one parent, not the
+child state in isolation. `SearchTree` owns operations such as `select_path`, `expand_leaf`,
+`backup`, `root_policy`, and `advance_root`; `Node` and `Edge` remain data containers.
+
 The initial implementation does not clone a transformer KV cache: the current rollout actor
 caches image tokens but reruns the causal core over the full prefix. Batched leaf evaluation
 should be implemented first; a branchable KV cache is a later optimization gated by profile
 data.
-
-An edge means holding one discrete policy action for the existing environment skip. It owns:
-
-```text
-action, prior P, visit count N, value sum W, mean value Q = W / N
-```
 
 The child node is created by restoring the parent's `emu_state`, applying the edge action,
 capturing the resulting observation and savestate, and appending its encoded frame token.
