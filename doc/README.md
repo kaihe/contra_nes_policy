@@ -28,3 +28,5 @@
 - [0026 Iterative Laser GRPO](0026-exp-iterative-laser-grpo.md) — No improvement — stage two does not beat the 49% reference
 - [0027 PPO critic](0027-design-ppo-critic.md) — Implemented — binary-return value head and GAE
 - [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — PPO progresses — inspect the value head before scaling
+- [0029 AlphaZero for Contra](0029-design-alphazero-contra.md) — Proposed — emulator search guided by the policy and critic
+- [0030 PPO-guided PUCT tree](0030-design-puct-tree.md) — Proposed — branch-safe emulator tree and search-distillation targets
