@@ -113,6 +113,12 @@ in policy decisions, while emulator cost is counted in skipped NES frames. A max
 count and maximum search depth bound memory and latency independently of the simulation
 budget.
 
+Standard PUCT does not rewind after commitment. An optional bounded recovery controller may
+retain recent committed roots for trace generation. After the committed trajectory actually
+dies, it may restore an ancestor's emulator state and policy prefix, record the abandoned
+continuation as `0`, increase that ancestor's search budget, and choose another edge. Several
+zero-valued rollouts alone do not prove that a root is dead and do not trigger recovery.
+
 ## Terminal Monte Carlo rollouts supply every backed-up value
 
 One simulation begins at the root and repeatedly selects the legal edge with the greatest:
@@ -140,7 +146,7 @@ terminal outcomes to one tree owner. Logs must separate tree nodes, rollout emul
 policy calls, terminal outcomes, and wall time. Terminal rollout cost is the primary scaling
 gate.
 
-## Root visits become policy targets and the chosen child becomes the next root
+## Root visits supervise the next policy
 
 After a fixed simulation budget, convert the root edge visits into a probability vector over
 the complete policy action space; illegal and unvisited actions receive zero. Save:
@@ -149,23 +155,9 @@ the complete policy action space; illegal and unvisited actions receive zero. Sa
 frame-token history, previous actions, legal mask, normalized root visits
 ```
 
-Choose the real environment action from that distribution, advance the committed episode,
-and reuse the selected child and its descendants as the next tree. Continue until success,
-death, or the evaluation-matched decision budget. Then attach the same binary episode
-outcome to every saved decision record on that attempted trajectory.
-
-Standard PUCT does not rewind an action after commitment. An optional bounded recovery
-controller may retain a stack of recent committed roots for trace generation. It may rewind
-after the committed trajectory actually dies, restore an ancestor's emulator state and
-policy prefix, record the failed continuation as `0`, increase that ancestor's search
-budget, and choose another edge. Several zero-valued rollouts alone do not prove that a root
-is dead and do not trigger recovery.
-
-Recovery records abandoned and replacement continuations as separate attempts. The abandoned
-branch keeps its terminal outcome `0`; a later win must not relabel states that existed only
-on that branch. Root visit targets may include the failed branch's backed-up evidence. Configure
-maximum rewind depth and retries explicitly, discard roots outside that window, and report
-success both with and without recovery so backtracking cannot hide a weak online policy.
+Recovery records abandoned and replacement continuations as separate attempts. A later win
+must not relabel states that existed only on an abandoned branch. Root visit targets may
+include that branch's backed-up `0` evidence.
 
 Training initializes a candidate from the frozen generator and minimizes policy
 cross-entropy against normalized root visits. The first experiment does not train or use the
