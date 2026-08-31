@@ -8,11 +8,11 @@ fight? Can the existing Monte Carlo search become the first planner by replacing
 history-free rollout prior with the learned policy?
 
 **Answer.** Treat the NES emulator as the exact dynamics model and the current causal
-policy/value network as the search guide. Proceed directly to the persistent PUCT tree
+policy network as the search guide. Proceed directly to the persistent PUCT tree
 specified by [0030](0030-design-puct-tree.md): the PPO policy already supplies a useful
 closed-loop prior, so a separate bigram-versus-policy rollout gate would not answer the
-remaining question. Root visit counts supervise the policy and completed episodes supervise
-the critic. Contra has no opponent or useful self-play symmetry, so training is repeated
+remaining question. PPO supplies priors and terminal rollout actions; root visit counts
+supervise the next policy. Contra has no opponent or useful self-play symmetry, so training is repeated
 single-agent policy improvement from a controlled task-state distribution.
 
 ---
@@ -85,10 +85,10 @@ The corresponding loop is:
 
 ```text
 sample a training start state
--> run policy/value-guided emulator search at each decision
+-> run policy-guided terminal-rollout search at each decision
 -> execute an action from the improved root distribution
 -> finish the episode
--> train policy on root visits and critic on win/loss
+-> train policy on root visits
 -> repeat with the updated network
 ```
 
@@ -143,26 +143,26 @@ selection score = backed-up mean value
 ```
 
 The policy concentrates simulations on plausible controller inputs while the visit term
-still tests uncertain alternatives. At a new leaf, the PPO critic supplies estimated win
-probability. A terminal win backs up `1`; death or timeout backs up `0`. Because Contra is
+still tests uncertain alternatives. In the first implementation, the PPO policy samples a
+rollout from each new leaf to a real terminal result. A win backs up `1`; death or timeout
+backs up `0`. No critic or shaped immediate reward enters search. Because Contra is
 single-agent, values keep the same sign at every depth—there is no alternating opponent
 perspective as in board-game AlphaZero.
 
 The initial tree should advance one current action per edge and reuse the chosen child's
 subtree at the next real decision. Search output is the normalized root visit counts, not
 the single best sampled sequence. Distillation trains the action head against those soft
-targets; critic training uses completed binary outcomes. The existing PPO loss is excluded
-from this first search-distillation experiment so any gain can be attributed to planning
-targets rather than mixed optimization methods.
+targets. Critic and PPO losses are excluded from this first experiment so any gain can be
+attributed to terminal-rollout planning targets.
 
 ## Search validity is gated before policy retraining
 
-Search can exploit mistakes in a shaped reward or an inaccurate critic while appearing to
-improve its internal score. Evaluation therefore proceeds in three gates:
+Search can consume too much emulator time or overfit noisy rollout results while appearing
+to improve its internal score. Evaluation therefore uses these gates:
 
 | gate | comparison | pass condition |
 |---|---|---|
-| leaf evaluation | terminal rollout score versus critic-assisted truncated search | critic ranking agrees with completed branch outcomes and search efficiency improves |
+| leaf evaluation | PPO terminal rollouts | backups are binary terminal outcomes and throughput is affordable |
 | tree improvement | raw policy versus PUCT-selected actions | matched closed-loop win rate improves before any distillation |
 
 Only then should searched root distributions become training labels. A held-out state bank

@@ -1,27 +1,25 @@
-# Build a branch-safe PUCT tree from the PPO policy and critic
+# Build a branch-safe PUCT tree with PPO-guided terminal rollouts
 
 Status: Proposed
 
 **Question.** How should Contra construct a persistent PUCT tree using the trained PPO
-policy as its initial action prior and leaf evaluator, and how should that tree produce
-supervision for a new policy?
+policy as its action prior and rollout policy, and how should that tree train a new policy?
 
-**Answer.** Freeze the best PPO checkpoint for one generation round. Each root search runs
-PUCT over exact emulator transitions while every node preserves the matching causal policy
-history. New leaves receive legal-action priors and a win-probability estimate from the
-frozen network; simulations back that value up without opponent sign changes. The normalized
-root visit counts supervise the next policy, while completed episode outcomes supervise its
-value head. Promote a trained candidate only after independent closed-loop evaluation.
+**Answer.** Freeze the best PPO checkpoint for one generation round. It supplies action
+priors inside the tree and samples actions from each new leaf to a real terminal result.
+Stable-retro returns exact transitions; boss defeat backs up `1`, while death or timeout
+backs up `0`. No critic or immediate shaped reward is used. Normalized root visits supervise
+the next policy. Promote a trained candidate only after independent closed-loop evaluation.
 
 ---
 
 ## The frozen PPO checkpoint starts each generation round
 
 The first search model is the evaluated PPO checkpoint from experiment 0028. Its action head
-provides `P(action | history)` and its sigmoid value head estimates eventual task success.
-Both remain frozen while a dataset round is generated, so every sample in that round has one
-identifiable search policy. PPO ratios, GAE, clipping, and the PPO reference model have no
-role in this training loop.
+provides `P(action | history)` both for tree priors and rollout sampling. The checkpoint
+remains frozen while a dataset round is generated, so every edge prior and rollout comes
+from one identifiable policy. Its critic, PPO ratios, GAE, clipping, and PPO reference model
+have no role in this first search loop.
 
 At expansion, mask illegal controller actions, renormalize the remaining probabilities, and
 store them as edge priors. A zero-mass legal set falls back to uniform legal priors. Root
@@ -97,8 +95,9 @@ repeat until simulation budget is exhausted:
   2. select existing edges by PUCT until reaching an unexpanded or terminal node
   3. for an edge without a child, restore its parent savestate and execute its action
   4. capture the child savestate, resulting frame token, and terminal status
-  5. evaluate and expand a non-terminal child once
-  6. back up the leaf value through every traversed edge
+  5. evaluate the policy once and expand a non-terminal child
+  6. sample PPO actions from that child until win, death, or timeout
+  7. back up 1 for win or 0 for death/timeout through traversed tree edges
 
 normalize root visits -> save policy target -> commit selected action -> re-root
 ```
@@ -114,7 +113,7 @@ in policy decisions, while emulator cost is counted in skipped NES frames. A max
 count and maximum search depth bound memory and latency independently of the simulation
 budget.
 
-## PUCT selection, expansion, and backup preserve win probability
+## Terminal Monte Carlo rollouts supply every backed-up value
 
 One simulation begins at the root and repeatedly selects the legal edge with the greatest:
 
@@ -122,17 +121,24 @@ One simulation begins at the root and repeatedly selects the legal edge with the
 score = Q + c_puct * P * sqrt(parent visits) / (1 + N)
 ```
 
-On the first unexpanded non-terminal node, evaluate the frozen network once. Store its masked
-policy priors and use `sigmoid(value_logit)` as the leaf value. A terminal success has value
-`1`; death or timeout has value `0`. Back up that same scalar through every traversed edge,
-incrementing `N` and adding it to `W`. Contra is single-player, so backup never reverses the
-sign as two-player AlphaZero does.
+On the first unexpanded non-terminal node, evaluate the frozen policy once and store its
+masked action priors. Then continue from that node by sampling the same PPO policy until a
+real terminal result. Rollout states are transient and are not added to the tree; each
+simulation adds only its newly expanded tree node. Boss defeat has value `1`; death or
+timeout has value `0`. Back up that scalar through every traversed tree edge, incrementing
+`N` and adding it to `W`. Contra is single-player, so backup never reverses the sign.
 
-Network requests from newly reached leaves should be accumulated into a GPU batch. Emulator
-steps remain sequential within a worker because stable-retro permits one emulator instance
-per process; multiple workers may search independent roots. Each unique node is evaluated
-once. Logs must separate emulator steps, encoder calls, core calls, and wall time so a higher
-visit budget cannot hide unusable throughput.
+The emulator supplies exact transitions and terminal events, not the future value of a
+non-terminal node. Repeated terminal rollouts estimate that value empirically. One failed
+rollout therefore adds `0` but does not prove its edge is dead; a different sampled
+continuation may win. Only an action whose immediate child is concretely terminal can be
+excluded as terminal.
+
+Emulator steps remain sequential within a worker because stable-retro permits one emulator
+instance per process; multiple workers may run independent simulations and return their
+terminal outcomes to one tree owner. Logs must separate tree nodes, rollout emulator steps,
+policy calls, terminal outcomes, and wall time. Terminal rollout cost is the primary scaling
+gate.
 
 ## Root visits become policy targets and the chosen child becomes the next root
 
@@ -149,23 +155,23 @@ death, or the evaluation-matched decision budget. Then attach the same binary ep
 outcome to every saved decision record on that attempted trajectory.
 
 Standard PUCT does not rewind an action after commitment. An optional bounded recovery
-controller may retain a stack of recent committed roots for trace generation. If every
-examined continuation at the current root reaches a concrete death, it may restore an
-ancestor's emulator state and committed policy prefix, back up the failed continuation as
-`0`, increase that ancestor's search budget, and try another edge. A low critic estimate
-alone never triggers recovery because it is not proof of death.
+controller may retain a stack of recent committed roots for trace generation. It may rewind
+after the committed trajectory actually dies, restore an ancestor's emulator state and
+policy prefix, record the failed continuation as `0`, increase that ancestor's search
+budget, and choose another edge. Several zero-valued rollouts alone do not prove that a root
+is dead and do not trigger recovery.
 
-Recovery records abandoned and replacement continuations as separate attempts. An abandoned
-branch receives a loss value target; a later win must not relabel states that existed only on
-that branch. Root visit targets may include the failed branch's backed-up evidence. Configure
+Recovery records abandoned and replacement continuations as separate attempts. The abandoned
+branch keeps its terminal outcome `0`; a later win must not relabel states that existed only
+on that branch. Root visit targets may include the failed branch's backed-up evidence. Configure
 maximum rewind depth and retries explicitly, discard roots outside that window, and report
 success both with and without recovery so backtracking cannot hide a weak online policy.
 
 Training initializes a candidate from the frozen generator and minimizes policy
-cross-entropy against root visits plus binary value loss against the completed outcome.
-Search values are not critic labels, and the shaped Monte Carlo reward is not used. Candidate
-training reads stored tokens initially, so encoder weights remain frozen and search data do
-not require repeated image encoding.
+cross-entropy against normalized root visits. The first experiment does not train or use the
+critic, and it never backs up the shaped `mc_search` reward. Candidate training reads stored
+tokens initially, so encoder weights remain frozen and search data do not require repeated
+image encoding.
 
 ## Correctness gates precede scaling and model promotion
 
@@ -176,7 +182,8 @@ replay checks. Required invariants are:
 |---|---|
 | branch isolation | sibling order does not change their observations, priors, or values |
 | deterministic replay | replaying a root-to-leaf action path reproduces its RAM and terminal state |
-| backup arithmetic | hand-built trees produce expected `N`, `W`, and `Q` without sign reversal |
+| backup arithmetic | terminal outcomes produce expected `N`, `W`, and `Q` without sign reversal |
+| reward purity | every backup is exactly `0` or `1`; no shaped reward enters search |
 | legal actions | masked actions receive neither prior mass nor visits |
 | budget accounting | reported simulations equal completed backups; emulator and network calls are counted |
 | search improvement | PUCT beats direct frozen-policy play under the same start-state and episode budget |
@@ -192,8 +199,8 @@ the previous generator and dataset manifest so a bad round is reversible.
 
 | claim | source |
 |---|---|
-| root visits supervise policy and terminal outcomes supervise value | [0029](0029-design-alphazero-contra.md) and Silver et al., [AlphaZero](https://arxiv.org/abs/1712.01815) |
-| current PPO model exposes action logits and a scalar value logit | `src/contra_policy/model.py` |
+| root visits can supervise policy improvement | [0029](0029-design-alphazero-contra.md) and Silver et al., [AlphaZero](https://arxiv.org/abs/1712.01815) |
+| current PPO model exposes action logits for priors and rollout sampling | `src/contra_policy/model.py` |
 | rollout inference caches frame tokens but recomputes the full causal prefix | `src/contra_policy/rl/rollout.py`, `TokenHistoryActor` |
 | success-before-death and the task budget define terminal outcomes | `src/contra_policy/rl/rollout.py`, `classify_step` |
 | stable-retro permits one emulator per process in the current collector | `src/contra_policy/rl/rollout.py`, `claim_emulator` |
