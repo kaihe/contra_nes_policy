@@ -3,7 +3,7 @@
 The contract between generation and the objective. Everything the loss sees comes from
 here, and nothing here knows what a policy is.
 
-**Why there is no critic.** With ``gamma=1.0``, no bootstrapping and a binary episodic
+**Why GRPO has no critic.** With ``gamma=1.0``, no bootstrapping and a binary episodic
 reward, ``V(s)`` is exactly "probability of success from here" — the hardest possible
 regression target and the one the previous PPO run only partly learned
 (``explained_variance`` ~0.33 after starting negative, so two thirds of the return
@@ -12,8 +12,8 @@ empirically: G rollouts of one task, advantage = own return minus the group's.
 
 Every step of an episode gets that same scalar. There is no per-step credit assignment,
 which is honest — with a terminal-only reward there is no information about *which*
-action mattered, and GAE's apparent per-step signal was interpolating a critic that did
-not know either.
+action mattered. :class:`PPOBatch` deliberately adds that critic contract for the
+falsifiable experiment in docs 0027–0028; the GRPO path remains unchanged.
 """
 
 from __future__ import annotations
@@ -50,6 +50,11 @@ class Episode:
     #: measurable under the binary reward (doc/0012). Damage and survival move before
     #: success does, which is what makes them usable on a small task pool.
     damage_frac: float = -1.0
+    # Populated after collection by PPO while the behaviour policy is still unchanged.
+    # GRPO leaves these absent and keeps its one scalar advantage per episode.
+    values: Optional[np.ndarray] = None
+    advantages: Optional[np.ndarray] = None
+    value_targets: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
         return int(self.frames.shape[0])
@@ -180,6 +185,48 @@ class GroupBatch:
 
     def __len__(self) -> int:
         return int(self.mask.shape[0])
+
+
+class PPOBatch(GroupBatch):
+    """A :class:`GroupBatch` with timestep values, targets, and GAE advantages."""
+
+    def __init__(self, episodes: Sequence[Episode],
+                 device: Optional[torch.device] = None):
+        if any(e.values is None or e.advantages is None or e.value_targets is None
+               for e in episodes):
+            raise ValueError("PPO episodes require values, advantages, and value targets")
+        super().__init__(episodes, np.zeros(len(episodes), dtype=np.float32))
+        b, t = self.mask.shape
+        old_value = np.zeros((b, t), dtype=np.float32)
+        advantage = np.zeros((b, t), dtype=np.float32)
+        value_target = np.zeros((b, t), dtype=np.float32)
+        for i, e in enumerate(episodes):
+            n = len(e)
+            old_value[i, :n] = e.values
+            advantage[i, :n] = e.advantages
+            value_target[i, :n] = e.value_targets
+        self.old_value = torch.from_numpy(old_value)
+        self.advantage = torch.from_numpy(advantage)
+        self.value_target = torch.from_numpy(value_target)
+        if device is not None:
+            self.to(device)
+
+    def to(self, device: torch.device) -> "PPOBatch":
+        super().to(device)
+        for k in ("old_value", "value_target"):
+            setattr(self, k, getattr(self, k).to(device, non_blocking=True))
+        return self
+
+
+def iter_ppo_minibatches(episodes: Sequence[Episode], minibatch_episodes: int,
+                         rng: np.random.Generator,
+                         device: Optional[torch.device] = None):
+    """Shuffle complete PPO episodes while preserving each causal history."""
+    order = rng.permutation(len(episodes))
+    for start in range(0, len(order), minibatch_episodes):
+        idx = order[start:start + minibatch_episodes]
+        idx = idx[np.argsort([len(episodes[i]) for i in idx], kind="stable")]
+        yield PPOBatch([episodes[i] for i in idx], device=device)
 
 
 def iter_minibatches(episodes: Sequence[Episode], advantages: np.ndarray,
