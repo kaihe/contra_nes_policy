@@ -1,15 +1,17 @@
-# Build a branch-safe PUCT tree with PPO-guided terminal rollouts
+# Build PPO-guided MCTS for the Laser boss fight
 
 Status: Proposed
 
-**Question.** How should Contra construct a persistent PUCT tree using the trained PPO
-policy as its action prior and rollout policy, and how should that tree train a new policy?
+**Question.** How should Contra use the trained PPO policy to construct MCTS trees that
+produce policy-improvement data for the Laser boss fight?
 
-**Answer.** Freeze the best PPO checkpoint for one generation round. It supplies action
-priors inside the tree and samples actions from each new leaf to a real terminal result.
-Stable-retro returns exact transitions; boss defeat backs up `1`, while death or timeout
-backs up `0`. No critic or immediate shaped reward is used. Normalized root visits supervise
-the next policy. Promote a trained candidate only after independent closed-loop evaluation.
+**Answer.** Freeze PPO for one generation round. At every committed state, use PUCT and
+terminal PPO rollouts to turn its action prior into a stronger root-visit distribution, then
+save that distribution as one training target. The tree is a temporary teacher: re-rooting
+may discard explored branches after their outcomes affect visits. The objective is neither a
+large final tree nor a few winning traces, but many state-to-search-policy records from many
+episodes. Policy optimization is specified separately after search data pass correctness and
+closed-loop improvement gates.
 
 ---
 
@@ -46,9 +48,9 @@ create root(previous_action = task start value, emu_state = restored state)
 evaluate root once, apply the legal-action mask, and create its 21-action edge table
 ```
 
-Before search begins, replay the restored state once in a second emulator instance and
-require identical initial observation and terminal flags. This catches a mismatched task,
-ROM, or savestate before generating tree data.
+Before search begins, restore and peek the state a second time in the same emulator and
+require identical savestate, RAM, and observation. Stable Retro permits only one emulator
+per process; the repeated restore still catches a mismatched or unstable task before search.
 
 At expansion, mask illegal controller actions, renormalize the remaining probabilities, and
 store them as edge priors. A zero-mass legal set falls back to uniform legal priors. Root
@@ -111,98 +113,81 @@ The child node is created by restoring the parent's `emu_state`, applying the ed
 capturing the resulting observation and savestate, and appending its encoded frame token.
 Success is resolved before death and timeout, matching PPO collection and evaluation.
 
-## The main loop searches, commits one action, and re-roots
+## One loop searches a state, saves its target, and commits one action
 
-Create the initial root by loading the task savestate, peeking its first valid observation
-without advancing the game clock, and encoding that frame once. The episode loop contains a
-simulation loop:
-
-```text
-create and expand initial root
-
-while committed episode is not terminal:
-  repeat until simulation budget or live-node limit is exhausted:
-    1. start at the current root
-    2. select by PUCT until an edge has no child or its child is terminal
-    3. if no child exists, restore the parent, execute the action, and create it
-    4. expand a new non-terminal child with PPO action priors
-    5. use a terminal child's result; otherwise run a temporary PPO rollout
-    6. back up 1 for win or 0 for death/timeout through traversed tree edges
-
-  normalize root visits and save the policy-training record
-  choose one root edge and commit its action
-
-  if the committed child is terminal:
-    finish the episode or invoke bounded recovery
-  else:
-    append the old root token to committed_prefix
-    detach the selected child from its parent
-    make that child the new root
-    prune sibling subtrees not retained for recovery
-```
-
-Every simulation restores emulator state from the selected edge's parent; speculative
-transitions never modify the committed environment state. Repeated simulations grow and
-update the same tree. If an edge already owns a child, selection reuses that child and its
-statistics rather than recreating the transition. Re-rooting preserves the chosen child's
-known descendants, `previous_action`, and savestate while removing its obsolete parent link.
-
-The construction loop stops on committed success, death, or timeout. Tree depth is measured
-in policy decisions, while emulator cost is counted in skipped NES frames. A maximum node
-count and maximum search depth bound memory and latency independently of the simulation
-budget.
-
-Standard PUCT does not rewind after commitment. An optional bounded recovery controller may
-retain recent committed roots for trace generation. After the committed trajectory actually
-dies, it may restore an ancestor's emulator state and policy prefix, record the abandoned
-continuation as `0`, increase that ancestor's search budget, and choose another edge. Several
-zero-valued rollouts alone do not prove that a root is dead and do not trigger recovery.
-
-## Terminal Monte Carlo rollouts supply every backed-up value
-
-One simulation begins at the root and repeatedly selects the legal edge with the greatest:
+Load the task state, capture its first frame, and expand the root with PPO action priors.
+Then run one loop until the committed episode wins, dies, or times out:
 
 ```text
-score = Q + c_puct * P * sqrt(parent visits) / (1 + N)
+while episode is active:
+
+  run 16 simulations from the current root:
+
+    1. Start at the root.
+
+    2. Follow existing edges with the greatest PUCT score:
+
+         score = Q + c_puct * P * sqrt(parent visits) / (1 + N)
+
+       P = frozen PPO prior
+       N = visits to this edge
+       Q = mean terminal result backed up through this edge
+
+    3. Stop at the first edge with no child, or at an existing terminal child.
+       For a missing child, execute its one action and add one permanent node.
+
+    4. If the child is non-terminal, evaluate PPO there and create its legal edges.
+
+    5. Use an existing terminal child's result directly. Otherwise, from the new
+       child sample temporary PPO actions until:
+
+         boss win     -> value 1
+         death/timeout -> value 0
+
+       These rollout states are temporary and are not added to the tree.
+
+    6. Back up the value through the permanent edges selected in steps 2-3.
+
+  after 16 simulations:
+
+    7. Normalize the current root's edge visits.
+       Save them as one policy-training target.
+
+    8. Commit the most-visited root action in the real episode.
+
+    9. Make its child the new root and discard unused sibling branches.
 ```
 
-On the first unexpanded non-terminal node, evaluate the frozen policy once and store its
-masked action priors. Then continue from that node by sampling the same PPO policy until a
-real terminal result. Rollout states are transient and are not added to the tree; each
-simulation adds only its newly expanded tree node. Boss defeat has value `1`; death or
-timeout has value `0`. Back up that scalar through every traversed tree edge, incrementing
-`N` and adding it to `W`. Contra is single-player, so backup never reverses the sign.
+One simulation adds at most one permanent node. Its terminal rollout may execute many
+temporary actions, but those actions only contribute the backed-up `0` or `1`. A failed
+rollout is evidence, not proof that its edge can never win.
 
-The emulator supplies exact transitions and terminal events, not the future value of a
-non-terminal node. Repeated terminal rollouts estimate that value empirically. One failed
-rollout therefore adds `0` but does not prove its edge is dead; a different sampled
-continuation may win. Only an action whose immediate child is concretely terminal can be
-excluded as terminal.
-
-Emulator steps remain sequential within a worker because stable-retro permits one emulator
-instance per process; multiple workers may run independent simulations and return their
-terminal outcomes to one tree owner. Logs must separate tree nodes, rollout emulator steps,
-policy calls, terminal outcomes, and wall time. Terminal rollout cost is the primary scaling
-gate.
-
-## Root visits supervise the next policy
-
-After a fixed simulation budget, convert the root edge visits into a probability vector over
-the complete policy action space; illegal and unvisited actions receive zero. Save:
+One committed decision produces one durable record:
 
 ```text
-frame-token history, previous actions, legal mask, normalized root visits
+episode header:
+  format version 2
+  task and generator IDs
+  search seed and configuration
+  committed action sequence
+
+root record:
+  step index
+  legal-action mask and frozen-PPO prior
+  raw root visits and normalized visit target
+  rollout terminal counts and committed action
 ```
 
-Recovery records abandoned and replacement continuations as separate attempts. A later win
-must not relabel states that existed only on an abandoned branch. Root visit targets may
-include that branch's backed-up `0` evidence.
+Reconstruct root `t` from the task's initial savestate and
+`committed_actions[:t]`. Do not copy that prefix into every root record.
 
-Training initializes a candidate from the frozen generator and minimizes policy
-cross-entropy against normalized root visits. The first experiment does not train or use the
-critic, and it never backs up the shaped `mc_search` reward. Candidate training reads stored
-tokens initially, so encoder weights remain frozen and search data do not require repeated
-image encoding.
+Re-rooting moves the old root's frame token into `committed_prefix`, retains the selected
+child's subtree, and prunes only the old root and its unselected branches. The prefix remains
+the causal policy context; the root record separately preserves what search learned at the
+old state. Thus a 75-decision episode produces 75 training targets, not one winning trace.
+Keep records from losing episodes too. Run many independently seeded episodes to build a
+dataset of `(causal context, search visit distribution)` pairs. The next design owns policy
+loss, dataset weighting, and candidate promotion.
 
 ## Correctness gates precede scaling and model promotion
 
@@ -217,12 +202,11 @@ replay checks. Required invariants are:
 | reward purity | every backup is exactly `0` or `1`; no shaped reward enters search |
 | legal actions | masked actions receive neither prior mass nor visits |
 | budget accounting | reported simulations equal completed backups; emulator and network calls are counted |
-| search improvement | PUCT beats direct frozen-policy play under the same start-state and episode budget |
+| search improvement | PPO-guided MCTS beats direct frozen PPO under the same start state and episode budget |
 
-Only after these pass should generated visits train a candidate. Compare the candidate,
-generator, and generator-plus-PUCT with independent closed-loop trials. Promote the candidate
-as the next frozen generator only when it does not regress the declared task metric; retain
-the previous generator and dataset manifest so a bad round is reversible.
+The implementation lives in `src/contra_policy/mcts/`. `core.py` owns generic tree mechanics;
+`policy.py` adapts the frozen causal policy; and `laser.py` owns Stable-Retro task execution.
+Only after these gates pass should a separate policy-update design consume generated visits.
 
 ---
 

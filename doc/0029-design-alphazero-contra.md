@@ -9,7 +9,7 @@ history-free rollout prior with the learned policy?
 
 **Answer.** Treat the NES emulator as the exact dynamics model and the current causal
 policy network as the search guide. Proceed directly to the persistent PUCT tree
-specified by [0030](0030-design-puct-tree.md): the PPO policy already supplies a useful
+specified by [0030](0030-design-ppo-guided-mcts.md): the PPO policy already supplies a useful
 closed-loop prior, so a separate bigram-versus-policy rollout gate would not answer the
 remaining question. PPO supplies priors and terminal rollout actions; root visit counts
 supervise the next policy. Contra has no opponent or useful self-play symmetry, so training is repeated
@@ -132,7 +132,7 @@ not a probability of eventually winning. It must not silently become the critic 
 ## PUCT search uses policy priors, backed-up values, and visit targets
 
 Contra should now implement the persistent tree directly, as specified by
-[0030](0030-design-puct-tree.md). Each node owns legal edges; each edge stores the policy
+[0030](0030-design-ppo-guided-mcts.md). Each node owns legal edges; each edge stores the policy
 prior, visit count, cumulative
 value, and mean value. Selection uses a PUCT score conceptually equivalent to:
 
