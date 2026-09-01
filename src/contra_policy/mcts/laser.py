@@ -106,11 +106,10 @@ class LaserEnvironment:
         return Transition(state, observation, current_ram, terminal)
 
 
-def target_record(target, action_prefix) -> dict:
-    """JSON-safe search record whose prefix can reproduce its causal context."""
+def target_record(target) -> dict:
+    """JSON-safe per-root search record; episode history is stored once outside it."""
     return {
         "step": target.step,
-        "action_prefix": [int(action) for action in action_prefix],
         "previous_action": target.previous_action,
         "legal_mask": target.legal_mask.tolist(),
         "ppo_prior": target.priors.tolist(),
@@ -140,7 +139,7 @@ def run(args: argparse.Namespace) -> dict:
     cfg = SearchConfig(args.simulations, args.max_live_nodes, args.c_puct,
                        args.temperature, args.seed)
     targets = []
-    action_prefix = []
+    committed_actions = []
     try:
         with LaserEnvironment(catalog, task, image_size=args.image_size) as environment:
             policy = TorchSearchPolicy(model, prompt.interaction, device=device,
@@ -160,16 +159,17 @@ def run(args: argparse.Namespace) -> dict:
                 if completed == 0:
                     raise RuntimeError("search reached the live-node limit before a backup")
                 target = tree.commit()
-                targets.append(target_record(target, action_prefix))
-                action_prefix.append(target.chosen_action)
+                targets.append(target_record(target))
+                committed_actions.append(target.chosen_action)
             result = {
-                "format_version": 1,
+                "format_version": 2,
                 "task_uid": task.uid,
                 "model_id": tree.model_id,
                 "outcome": tree.root.terminal.value,
                 "steps": tree.root.steps,
                 "completed_simulations": tree.completed_simulations,
                 "config": asdict(cfg),
+                "committed_actions": committed_actions,
                 "targets": targets,
             }
     finally:

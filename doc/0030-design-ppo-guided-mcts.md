@@ -165,13 +165,21 @@ rollout is evidence, not proof that its edge can never win.
 One committed decision produces one durable record:
 
 ```text
-task and generator IDs
-search seed and configuration
-causal context or reproducible action prefix
-legal-action mask and frozen-PPO prior
-raw root visits and normalized visit target
-rollout terminal counts and committed action
+episode header:
+  format version 2
+  task and generator IDs
+  search seed and configuration
+  committed action sequence
+
+root record:
+  step index
+  legal-action mask and frozen-PPO prior
+  raw root visits and normalized visit target
+  rollout terminal counts and committed action
 ```
+
+Reconstruct root `t` from the task's initial savestate and
+`committed_actions[:t]`. Do not copy that prefix into every root record.
 
 Re-rooting moves the old root's frame token into `committed_prefix`, retains the selected
 child's subtree, and prunes only the old root and its unselected branches. The prefix remains

@@ -114,8 +114,8 @@ def test_commit_re_roots_and_preserves_only_selected_subtree_context():
     assert tree.context(tree.root) == [old_root.frame_token, tree.root.frame_token]
     assert tree.live_nodes == tree._count_nodes(tree.root)
 
-    record = target_record(target, [2, 1])
-    assert record["action_prefix"] == [2, 1]
+    record = target_record(target)
+    assert "action_prefix" not in record
     assert len(record["ppo_prior"]) == tree.policy.num_actions
     assert set(record["terminal_counts"]) == {"success", "death", "timeout"}
     totals = np.sum(list(record["terminal_counts"].values()), axis=0)
