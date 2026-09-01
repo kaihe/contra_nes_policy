@@ -2,14 +2,16 @@
 
 Status: Proposed
 
-**Question.** How should Contra construct a persistent PUCT tree using the trained PPO
-policy as its action prior and rollout policy, and how should that tree train a new policy?
+**Question.** How should Contra use the trained PPO policy to construct MCTS trees that
+produce policy-improvement data for the Laser boss fight?
 
-**Answer.** Freeze the best PPO checkpoint for one generation round. It supplies action
-priors inside the tree and samples actions from each new leaf to a real terminal result.
-Stable-retro returns exact transitions; boss defeat backs up `1`, while death or timeout
-backs up `0`. No critic or immediate shaped reward is used. Normalized root visits supervise
-the next policy. Promote a trained candidate only after independent closed-loop evaluation.
+**Answer.** Freeze PPO for one generation round. At every committed state, use PUCT and
+terminal PPO rollouts to turn its action prior into a stronger root-visit distribution, then
+save that distribution as one training target. The tree is a temporary teacher: re-rooting
+may discard explored branches after their outcomes affect visits. The objective is neither a
+large final tree nor a few winning traces, but many state-to-search-policy records from many
+episodes. Policy optimization is specified separately after search data pass correctness and
+closed-loop improvement gates.
 
 ---
 
@@ -147,13 +149,18 @@ update the same tree. If an edge already owns a child, selection reuses that chi
 statistics rather than recreating the transition. Re-rooting preserves the chosen child's
 known descendants, `previous_action`, and savestate while removing its obsolete parent link.
 
+Before re-rooting, the normalized visits at the old root are durable data. Its sibling trees
+and temporary rollout paths may then be discarded: their purpose was to change those visits,
+not to become saved demonstrations. One episode with 75 committed decisions therefore emits
+75 policy targets, regardless of whether the committed episode ultimately wins or loses.
+
 The construction loop stops on committed success, death, or timeout. Tree depth is measured
 in policy decisions, while emulator cost is counted in skipped NES frames. A maximum node
 count and maximum search depth bound memory and latency independently of the simulation
 budget.
 
 Standard PUCT does not rewind after commitment. An optional bounded recovery controller may
-retain recent committed roots for trace generation. After the committed trajectory actually
+retain recent committed roots for dataset generation. After the committed trajectory actually
 dies, it may restore an ancestor's emulator state and policy prefix, record the abandoned
 continuation as `0`, increase that ancestor's search budget, and choose another edge. Several
 zero-valued rollouts alone do not prove that a root is dead and do not trigger recovery.
@@ -188,15 +195,32 @@ gate.
 ## Root visits are the durable search output
 
 After a fixed simulation budget, convert the root edge visits into a probability vector over
-the complete policy action space; illegal and unvisited actions receive zero. Save:
+the complete policy action space; illegal and unvisited actions receive zero. Save one episode
+header and one record per committed root:
 
 ```text
-frame-token history, previous actions, legal mask, normalized root visits
+episode header:
+  task UID, generator checkpoint ID, search config, seed, final outcome
+
+root record:
+  committed step and reproducible action prefix
+  frame-token context or a key from which it can be reproduced
+  previous action and legal-action mask
+  frozen-PPO prior
+  raw root visits and normalized visit target
+  rollout win/death/timeout counts
+  committed action
 ```
 
 Recovery records abandoned and replacement continuations as separate attempts. A later win
 must not relabel states that existed only on an abandoned branch. Root visit targets may
-include that branch's backed-up `0` evidence. Policy optimization, dataset weighting, and
+include that branch's backed-up `0` evidence. Keep losing committed episodes too; filtering
+for wins would turn search data into success-only behavior cloning and discard decisions that
+MCTS identified as unsafe.
+
+Run many independent search episodes with different sampling seeds. The resulting dataset is
+a collection of `(causal context, search visit distribution)` pairs, not a collection of tree
+objects or winning action traces. Policy loss, record weighting, generation-round size, and
 candidate promotion belong to the next design; 0030 ends at producing replayable records.
 
 ## Correctness gates precede scaling and model promotion
@@ -212,7 +236,7 @@ replay checks. Required invariants are:
 | reward purity | every backup is exactly `0` or `1`; no shaped reward enters search |
 | legal actions | masked actions receive neither prior mass nor visits |
 | budget accounting | reported simulations equal completed backups; emulator and network calls are counted |
-| search improvement | PUCT beats direct frozen-policy play under the same start-state and episode budget |
+| search improvement | PPO-guided MCTS beats direct frozen PPO under the same start state and episode budget |
 
 The implementation lives in `src/contra_policy/mcts/`. `core.py` owns generic tree mechanics;
 `policy.py` adapts the frozen causal policy; and `laser.py` owns Stable-Retro task execution.
