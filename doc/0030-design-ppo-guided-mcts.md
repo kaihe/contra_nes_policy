@@ -1,4 +1,4 @@
-# Build a branch-safe PUCT tree with PPO-guided terminal rollouts
+# Build PPO-guided MCTS for the Laser boss fight
 
 Status: Proposed
 
@@ -46,9 +46,9 @@ create root(previous_action = task start value, emu_state = restored state)
 evaluate root once, apply the legal-action mask, and create its 21-action edge table
 ```
 
-Before search begins, replay the restored state once in a second emulator instance and
-require identical initial observation and terminal flags. This catches a mismatched task,
-ROM, or savestate before generating tree data.
+Before search begins, restore and peek the state a second time in the same emulator and
+require identical savestate, RAM, and observation. Stable Retro permits only one emulator
+per process; the repeated restore still catches a mismatched or unstable task before search.
 
 At expansion, mask illegal controller actions, renormalize the remaining probabilities, and
 store them as edge priors. A zero-mass legal set falls back to uniform legal priors. Root
@@ -185,7 +185,7 @@ terminal outcomes to one tree owner. Logs must separate tree nodes, rollout emul
 policy calls, terminal outcomes, and wall time. Terminal rollout cost is the primary scaling
 gate.
 
-## Root visits supervise the next policy
+## Root visits are the durable search output
 
 After a fixed simulation budget, convert the root edge visits into a probability vector over
 the complete policy action space; illegal and unvisited actions receive zero. Save:
@@ -196,13 +196,8 @@ frame-token history, previous actions, legal mask, normalized root visits
 
 Recovery records abandoned and replacement continuations as separate attempts. A later win
 must not relabel states that existed only on an abandoned branch. Root visit targets may
-include that branch's backed-up `0` evidence.
-
-Training initializes a candidate from the frozen generator and minimizes policy
-cross-entropy against normalized root visits. The first experiment does not train or use the
-critic, and it never backs up the shaped `mc_search` reward. Candidate training reads stored
-tokens initially, so encoder weights remain frozen and search data do not require repeated
-image encoding.
+include that branch's backed-up `0` evidence. Policy optimization, dataset weighting, and
+candidate promotion belong to the next design; 0030 ends at producing replayable records.
 
 ## Correctness gates precede scaling and model promotion
 
@@ -219,10 +214,9 @@ replay checks. Required invariants are:
 | budget accounting | reported simulations equal completed backups; emulator and network calls are counted |
 | search improvement | PUCT beats direct frozen-policy play under the same start-state and episode budget |
 
-Only after these pass should generated visits train a candidate. Compare the candidate,
-generator, and generator-plus-PUCT with independent closed-loop trials. Promote the candidate
-as the next frozen generator only when it does not regress the declared task metric; retain
-the previous generator and dataset manifest so a bad round is reversible.
+The implementation lives in `src/contra_policy/mcts/`. `core.py` owns generic tree mechanics;
+`policy.py` adapts the frozen causal policy; and `laser.py` owns Stable-Retro task execution.
+Only after these gates pass should a separate policy-update design consume generated visits.
 
 ---
 
