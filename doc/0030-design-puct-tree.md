@@ -74,39 +74,49 @@ child state in isolation. `SearchTree` owns operations such as `select_path`, `e
 `backup`, `root_policy`, and `advance_root`; `Node` and `Edge` remain data containers.
 
 The initial implementation does not clone a transformer KV cache: the current rollout actor
-caches image tokens but reruns the causal core over the full prefix. Batched leaf evaluation
-should be implemented first; a branchable KV cache is a later optimization gated by profile
-data.
+caches image tokens but reruns the causal core over the full prefix. Batch policy inference
+for newly expanded leaves first; a branchable KV cache is a later optimization gated by
+profile data.
 
 The child node is created by restoring the parent's `emu_state`, applying the edge action,
 capturing the resulting observation and savestate, and appending its encoded frame token.
 Success is resolved before death and timeout, matching PPO collection and evaluation.
 
-## Tree construction alternates simulations with real action commitment
+## The main loop searches, commits one action, and re-roots
 
 Create the initial root by loading the task savestate, peeking its first valid observation
-without advancing the game clock, encoding that frame once, and attaching the committed
-history prefix. Evaluate and expand the root before the first selection. Then construct the
-tree for one real decision as follows:
+without advancing the game clock, and encoding that frame once. The episode loop contains a
+simulation loop:
 
 ```text
-repeat until simulation budget is exhausted:
-  1. start at the current root
-  2. select existing edges by PUCT until reaching an unexpanded or terminal node
-  3. for an edge without a child, restore its parent savestate and execute its action
-  4. capture the child savestate, resulting frame token, and terminal status
-  5. evaluate the policy once and expand a non-terminal child
-  6. sample PPO actions from that child until win, death, or timeout
-  7. back up 1 for win or 0 for death/timeout through traversed tree edges
+create and expand initial root
 
-normalize root visits -> save policy target -> commit selected action -> re-root
+while committed episode is not terminal:
+  repeat until simulation budget or live-node limit is exhausted:
+    1. start at the current root
+    2. select by PUCT until an edge has no child or its child is terminal
+    3. if no child exists, restore the parent, execute the action, and create it
+    4. expand a new non-terminal child with PPO action priors
+    5. use a terminal child's result; otherwise run a temporary PPO rollout
+    6. back up 1 for win or 0 for death/timeout through traversed tree edges
+
+  normalize root visits and save the policy-training record
+  choose one root edge and commit its action
+
+  if the committed child is terminal:
+    finish the episode or invoke bounded recovery
+  else:
+    append the old root token to committed_prefix
+    detach the selected child from its parent
+    make that child the new root
+    prune sibling subtrees not retained for recovery
 ```
 
 Every simulation restores emulator state from the selected edge's parent; speculative
 transitions never modify the committed environment state. Repeated simulations grow and
 update the same tree. If an edge already owns a child, selection reuses that child and its
-statistics rather than recreating the transition. After commitment, the chosen child becomes
-the root and its known descendants remain available for the next decision.
+statistics rather than recreating the transition. Re-rooting preserves the chosen child's
+known descendants, `previous_action`, and savestate while removing its obsolete parent link.
 
 The construction loop stops on committed success, death, or timeout. Tree depth is measured
 in policy decisions, while emulator cost is counted in skipped NES frames. A maximum node
