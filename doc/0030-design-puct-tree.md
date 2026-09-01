@@ -21,6 +21,35 @@ remains frozen while a dataset round is generated, so every edge prior and rollo
 from one identifiable policy. Its critic, PPO ratios, GAE, clipping, and PPO reference model
 have no role in this first search loop.
 
+The first Laser implementation pins one small, matched setup:
+
+| setting | initial value |
+|---|---|
+| generator | `runs/ppo/2026-08-27/laser-critic-14-56-52/checkpoints/ppo-final.pt` (u158) |
+| task | `win_level1_20260630171218_i8`, exact `full_laser.state` start |
+| policy input | 256px frame, learned null goal, causal frame/action history |
+| action execution | the task's 21-action vocabulary; one action per task-defined skip |
+| episode limit | 216 policy decisions, matching evaluation's `max(24, 2 * 108)` |
+| search limit | 16 completed simulations per committed decision; 2,048 live nodes |
+| sampling | temperature 1.0, seed 0, no root noise |
+| commit | greatest root visit count; fixed action-id tie break |
+| recovery | disabled for the first correctness run |
+
+Initialization is explicit:
+
+```text
+load frozen PPO checkpoint and task metadata
+create emulator and restore full_laser.state
+capture the initial observation without advancing the emulator
+encode that frame and start an empty committed_prefix
+create root(previous_action = task start value, emu_state = restored state)
+evaluate root once, apply the legal-action mask, and create its 21-action edge table
+```
+
+Before search begins, replay the restored state once in a second emulator instance and
+require identical initial observation and terminal flags. This catches a mismatched task,
+ROM, or savestate before generating tree data.
+
 At expansion, mask illegal controller actions, renormalize the remaining probabilities, and
 store them as edge priors. A zero-mass legal set falls back to uniform legal priors. Root
 Dirichlet noise and visit-temperature sampling are configurable exploration mechanisms, but
