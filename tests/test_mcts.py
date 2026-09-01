@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from contra_policy.mcts import Node, SearchConfig, SearchTree, Terminal, Transition
+from contra_policy.mcts.laser import target_record
 
 
 class FakePolicy:
@@ -75,8 +76,15 @@ def test_one_simulation_adds_only_one_permanent_node_and_backs_up_win():
 def test_backup_is_binary_and_has_no_two_player_sign_flip():
     tree, _ = make_tree()
     path = [tree.root.edges[0], tree.root.edges[1]]
-    tree.backup(path, 1.0)
+    tree.backup(path, Terminal.SUCCESS)
     assert [(edge.visits, edge.value_sum) for edge in path] == [(1, 1.0), (1, 1.0)]
+    assert [(edge.successes, edge.deaths, edge.timeouts) for edge in path] == [
+        (1, 0, 0), (1, 0, 0)]
+
+    tree.backup(path, Terminal.TIMEOUT)
+    assert [(edge.visits, edge.value_sum) for edge in path] == [(2, 1.0), (2, 1.0)]
+    assert [(edge.successes, edge.deaths, edge.timeouts) for edge in path] == [
+        (1, 0, 1), (1, 0, 1)]
 
 
 def test_root_visits_form_policy_target():
@@ -96,12 +104,22 @@ def test_commit_re_roots_and_preserves_only_selected_subtree_context():
     target = tree.commit()
     assert target.chosen_action == 0
     assert isinstance(target.chosen_action, int)
+    assert np.isclose(target.priors.sum(), 1.0)
+    assert np.array_equal(target.successes + target.deaths + target.timeouts,
+                          target.visits)
     assert tree.root is old_root.edges[0].child
     assert tree.root.parent is None
     assert tree.root.incoming_action is None
     assert tree.committed_prefix == [old_root.frame_token]
     assert tree.context(tree.root) == [old_root.frame_token, tree.root.frame_token]
     assert tree.live_nodes == tree._count_nodes(tree.root)
+
+    record = target_record(target, [2, 1])
+    assert record["action_prefix"] == [2, 1]
+    assert len(record["ppo_prior"]) == tree.policy.num_actions
+    assert set(record["terminal_counts"]) == {"success", "death", "timeout"}
+    totals = np.sum(list(record["terminal_counts"].values()), axis=0)
+    assert np.array_equal(totals, record["visits"])
 
 
 def test_same_action_at_different_nodes_has_independent_edge_statistics():

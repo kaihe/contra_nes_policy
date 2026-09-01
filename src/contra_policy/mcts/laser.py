@@ -106,6 +106,26 @@ class LaserEnvironment:
         return Transition(state, observation, current_ram, terminal)
 
 
+def target_record(target, action_prefix) -> dict:
+    """JSON-safe search record whose prefix can reproduce its causal context."""
+    return {
+        "step": target.step,
+        "action_prefix": [int(action) for action in action_prefix],
+        "previous_action": target.previous_action,
+        "legal_mask": target.legal_mask.tolist(),
+        "ppo_prior": target.priors.tolist(),
+        "visits": target.visits.tolist(),
+        "probabilities": target.probabilities.tolist(),
+        "terminal_counts": {
+            "success": target.successes.tolist(),
+            "death": target.deaths.tolist(),
+            "timeout": target.timeouts.tolist(),
+        },
+        "chosen_action": target.chosen_action,
+        "chosen_action_name": ACTION_NAMES[target.chosen_action],
+    }
+
+
 def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     checkpoint = os.path.abspath(os.path.expanduser(args.checkpoint))
@@ -120,6 +140,7 @@ def run(args: argparse.Namespace) -> dict:
     cfg = SearchConfig(args.simulations, args.max_live_nodes, args.c_puct,
                        args.temperature, args.seed)
     targets = []
+    action_prefix = []
     try:
         with LaserEnvironment(catalog, task, image_size=args.image_size) as environment:
             policy = TorchSearchPolicy(model, prompt.interaction, device=device,
@@ -139,16 +160,10 @@ def run(args: argparse.Namespace) -> dict:
                 if completed == 0:
                     raise RuntimeError("search reached the live-node limit before a backup")
                 target = tree.commit()
-                targets.append({
-                    "step": target.step,
-                    "previous_action": target.previous_action,
-                    "legal_mask": target.legal_mask.tolist(),
-                    "visits": target.visits.tolist(),
-                    "probabilities": target.probabilities.tolist(),
-                    "chosen_action": target.chosen_action,
-                    "chosen_action_name": ACTION_NAMES[target.chosen_action],
-                })
+                targets.append(target_record(target, action_prefix))
+                action_prefix.append(target.chosen_action)
             result = {
+                "format_version": 1,
                 "task_uid": task.uid,
                 "model_id": tree.model_id,
                 "outcome": tree.root.terminal.value,

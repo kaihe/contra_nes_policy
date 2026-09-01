@@ -45,6 +45,9 @@ class Edge:
     prior: float
     visits: int = 0
     value_sum: float = 0.0
+    successes: int = 0
+    deaths: int = 0
+    timeouts: int = 0
     child: Optional["Node"] = None
 
     @property
@@ -92,8 +95,12 @@ class PolicyTarget:
     step: int
     previous_action: int
     legal_mask: np.ndarray
+    priors: np.ndarray
     visits: np.ndarray
     probabilities: np.ndarray
+    successes: np.ndarray
+    deaths: np.ndarray
+    timeouts: np.ndarray
     chosen_action: int
 
 
@@ -200,14 +207,14 @@ class SearchTree:
         context = self.context(node)
         if node.terminal is Terminal.ACTIVE:
             self._expand(node, context)
-            value = self._terminal_rollout(node, context)
+            outcome = self._terminal_rollout(node, context)
         else:
-            value = node.terminal.value01
-        self.backup(path, value)
+            outcome = node.terminal
+        self.backup(path, outcome)
         self.completed_simulations += 1
         return True
 
-    def _terminal_rollout(self, start: Node, context: list[Any]) -> float:
+    def _terminal_rollout(self, start: Node, context: list[Any]) -> Terminal:
         node = start
         first = True
         while node.terminal is Terminal.ACTIVE:
@@ -238,15 +245,22 @@ class SearchTree:
                 terminal=transition.terminal,
             )
             context.append(node.frame_token)
-        return node.terminal.value01
+        return node.terminal
 
     @staticmethod
-    def backup(path: Sequence[Edge], value: float) -> None:
-        if value not in (0.0, 1.0):
-            raise ValueError("design 0030 backs up only binary terminal values")
+    def backup(path: Sequence[Edge], outcome: Terminal) -> None:
+        if outcome is Terminal.ACTIVE:
+            raise ValueError("cannot back up a non-terminal outcome")
+        value = outcome.value01
         for edge in path:
             edge.visits += 1
             edge.value_sum += value
+            if outcome is Terminal.SUCCESS:
+                edge.successes += 1
+            elif outcome is Terminal.DEATH:
+                edge.deaths += 1
+            else:
+                edge.timeouts += 1
 
     def search(self, simulations: Optional[int] = None) -> int:
         target = simulations or self.config.simulations_per_move
@@ -269,6 +283,15 @@ class SearchTree:
     def commit(self) -> PolicyTarget:
         """Choose the most-visited root edge, preserve its subtree, and re-root."""
         mask, visits, probabilities = self.root_target()
+        priors = np.zeros(self.policy.num_actions, dtype=np.float64)
+        successes = np.zeros(self.policy.num_actions, dtype=np.int64)
+        deaths = np.zeros(self.policy.num_actions, dtype=np.int64)
+        timeouts = np.zeros(self.policy.num_actions, dtype=np.int64)
+        for action, edge in self.root.edges.items():
+            priors[action] = edge.prior
+            successes[action] = edge.successes
+            deaths[action] = edge.deaths
+            timeouts[action] = edge.timeouts
         chosen = min(
             (edge for edge in self.root.edges.values() if edge.visits == visits.max()),
             key=lambda edge: edge.action_id,
@@ -276,8 +299,8 @@ class SearchTree:
         if chosen.child is None:
             raise RuntimeError("the most-visited edge has no child")
         old_root = self.root
-        target = PolicyTarget(old_root.steps, old_root.previous_action, mask, visits,
-                              probabilities, chosen.action_id)
+        target = PolicyTarget(old_root.steps, old_root.previous_action, mask, priors, visits,
+                              probabilities, successes, deaths, timeouts, chosen.action_id)
         self.committed_prefix.append(old_root.frame_token)
         self.root = chosen.child
         self.root.parent = None

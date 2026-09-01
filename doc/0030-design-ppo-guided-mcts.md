@@ -173,8 +173,10 @@ raw root visits and normalized visit target
 rollout terminal counts and committed action
 ```
 
-Re-rooting may discard the tree because the root record already contains what search learned
-at that state. Thus a 75-decision episode produces 75 training targets, not one winning trace.
+Re-rooting moves the old root's frame token into `committed_prefix`, retains the selected
+child's subtree, and prunes only the old root and its unselected branches. The prefix remains
+the causal policy context; the root record separately preserves what search learned at the
+old state. Thus a 75-decision episode produces 75 training targets, not one winning trace.
 Keep records from losing episodes too. Run many independently seeded episodes to build a
 dataset of `(causal context, search visit distribution)` pairs. The next design owns policy
 loss, dataset weighting, and candidate promotion.
