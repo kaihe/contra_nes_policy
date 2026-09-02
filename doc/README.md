@@ -30,3 +30,4 @@
 - [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — PPO progresses — inspect the value head before scaling
 - [0029 AlphaZero for Contra](0029-design-alphazero-contra.md) — Proposed — emulator search guided by the policy and critic
 - [0030 PPO-guided MCTS](0030-design-ppo-guided-mcts.md) — Proposed — temporary Laser trees produce root-visit policy targets
+- [0031 PPO versus bigram MCTS](0031-exp-mcts-ppo-vs-bigram.md) — Pending — compare search quality and throughput at 16 simulations
