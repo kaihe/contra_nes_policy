@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from dataclasses import asdict
 from typing import Optional
 
@@ -14,7 +15,7 @@ import torch
 
 from contra_policy.action_space import ACTION_NAMES, actions_np
 from contra_policy.mcts.core import Node, SearchConfig, SearchTree, Terminal, Transition
-from contra_policy.mcts.policy import TorchSearchPolicy
+from contra_policy.mcts.policy import BigramSearchPolicy, TorchSearchPolicy
 from contra_policy.model import load_policy
 from contra_policy.rl.rollout import (IDLE_ACTION, budget_for, claim_emulator,
                                       classify_step, release_emulator)
@@ -37,7 +38,8 @@ def _sha256(path: str) -> str:
 class LaserEnvironment:
     """Exact one-action transitions for one fixed boss task."""
 
-    def __init__(self, catalog: TaskCatalog, task, *, image_size: int = 256,
+    def __init__(self, catalog: TaskCatalog, task, *, action_vectors=None,
+                 image_size: int = 256,
                  budget_mult: float = 2.0, min_budget: int = 24):
         from agent.action_mask import legal_mask
         from env.event import make_terminal_events
@@ -51,7 +53,9 @@ class LaserEnvironment:
         self.maker = KillBossMaker()
         self.image_size = image_size
         self.budget = budget_for(self.seg, budget_mult, min_budget)
-        self.vectors = actions_np(np.uint8)
+        self.vectors = (actions_np(np.uint8) if action_vectors is None
+                        else np.asarray(action_vectors, dtype=np.uint8))
+        self.step_calls = 0
         self.die = next((event for event in make_terminal_events() if event.tag == "die"), None)
         if self.die is None:
             self.close()
@@ -91,6 +95,7 @@ class LaserEnvironment:
         from util.replay import rewind_state
 
         rewind_state(self.env, node.emu_state)
+        self.step_calls += 1
         previous_ram = np.asarray(node.state_data)
         for _ in range(self.seg.skip):
             self.env.step(self.vectors[action_id])
@@ -106,13 +111,13 @@ class LaserEnvironment:
         return Transition(state, observation, current_ram, terminal)
 
 
-def target_record(target) -> dict:
+def target_record(target, action_names=ACTION_NAMES) -> dict:
     """JSON-safe per-root search record; episode history is stored once outside it."""
     return {
         "step": target.step,
         "previous_action": target.previous_action,
         "legal_mask": target.legal_mask.tolist(),
-        "ppo_prior": target.priors.tolist(),
+        "guide_prior": target.priors.tolist(),
         "visits": target.visits.tolist(),
         "probabilities": target.probabilities.tolist(),
         "terminal_counts": {
@@ -121,14 +126,15 @@ def target_record(target) -> dict:
             "timeout": target.timeouts.tolist(),
         },
         "chosen_action": target.chosen_action,
-        "chosen_action_name": ACTION_NAMES[target.chosen_action],
+        "chosen_action_name": action_names[target.chosen_action],
     }
 
 
 def run(args: argparse.Namespace) -> dict:
+    init_started = time.perf_counter()
     device = torch.device(args.device)
     checkpoint = os.path.abspath(os.path.expanduser(args.checkpoint))
-    model = load_policy(checkpoint, map_location="cpu")
+    model = load_policy(checkpoint, map_location="cpu") if args.guide == "ppo" else None
     catalog = TaskCatalog(
         task_root=args.task_root, shard_dir=args.shard_dir, families=["boss"], split="train",
         image_size=args.image_size, require_prompt=False,
@@ -141,9 +147,21 @@ def run(args: argparse.Namespace) -> dict:
     targets = []
     committed_actions = []
     try:
-        with LaserEnvironment(catalog, task, image_size=args.image_size) as environment:
+        if args.guide == "ppo":
             policy = TorchSearchPolicy(model, prompt.interaction, device=device,
                                        precision=args.precision)
+            action_vectors = actions_np(np.uint8)
+            model_id = _sha256(checkpoint)
+        else:
+            from agent.sampler import ActionSampler
+
+            sampler = ActionSampler.for_level(1)
+            policy = BigramSearchPolicy(sampler.prior_pmf, sampler.names)
+            action_vectors = sampler.actions
+            model_id = sampler.prior_sha256
+        idle_action = policy.action_names.index("_")
+        with LaserEnvironment(catalog, task, action_vectors=action_vectors,
+                              image_size=args.image_size) as environment:
             initial = environment.initial_transition()
             replayed = environment.initial_transition()
             if (initial.emu_state != replayed.emu_state
@@ -151,23 +169,33 @@ def run(args: argparse.Namespace) -> dict:
                     or not np.array_equal(initial.state_data, replayed.state_data)):
                 raise RuntimeError("restoring the task twice did not reproduce its root state")
             root = Node(initial.emu_state, policy.encode(initial.observation),
-                        initial.state_data, IDLE_ACTION, 0)
+                        initial.state_data, idle_action, 0)
             tree = SearchTree(root, policy, environment, cfg,
-                              model_id=_sha256(checkpoint))
+                              model_id=model_id)
+            initialization_seconds = time.perf_counter() - init_started
+            search_started = time.perf_counter()
             while tree.root.terminal is Terminal.ACTIVE:
                 completed = tree.search()
                 if completed == 0:
                     raise RuntimeError("search reached the live-node limit before a backup")
                 target = tree.commit()
-                targets.append(target_record(target))
+                targets.append(target_record(target, policy.action_names))
                 committed_actions.append(target.chosen_action)
+            search_seconds = time.perf_counter() - search_started
             result = {
-                "format_version": 2,
+                "format_version": 3,
+                "guide": args.guide,
                 "task_uid": task.uid,
                 "model_id": tree.model_id,
                 "outcome": tree.root.terminal.value,
                 "steps": tree.root.steps,
                 "completed_simulations": tree.completed_simulations,
+                "created_nodes": tree.created_nodes,
+                "emulator_decisions": environment.step_calls,
+                "temporary_emulator_decisions": max(
+                    0, environment.step_calls - (tree.created_nodes - 1)),
+                "initialization_seconds": initialization_seconds,
+                "search_seconds": search_seconds,
                 "config": asdict(cfg),
                 "committed_actions": committed_actions,
                 "targets": targets,
@@ -183,6 +211,7 @@ def run(args: argparse.Namespace) -> dict:
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--guide", choices=["ppo", "bigram"], default="ppo")
     parser.add_argument("--task-uid", default=DEFAULT_UID)
     parser.add_argument("--task-root", default="~/code/contra_nes_data/game_trace/tasks")
     parser.add_argument("--shard-dir", default="~/code/contra_nes_data/game_trace/hf")

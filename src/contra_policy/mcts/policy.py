@@ -8,13 +8,14 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-from contra_policy.action_space import NUM_ACTIONS
+from contra_policy.action_space import ACTION_NAMES, NUM_ACTIONS
 
 
 class TorchSearchPolicy:
     """Encode frames once and evaluate arbitrary causal tree histories."""
 
     num_actions = NUM_ACTIONS
+    action_names = ACTION_NAMES
 
     def __init__(self, model, interaction: int, *, device: torch.device,
                  precision: str = "bf16"):
@@ -44,7 +45,8 @@ class TorchSearchPolicy:
         return token[0].float()
 
     @torch.no_grad()
-    def priors(self, frame_tokens: Sequence[Any]) -> np.ndarray:
+    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray:
+        del previous_action
         if len(frame_tokens) + 2 > self.model.context:
             raise RuntimeError(f"MCTS history of {len(frame_tokens)} frames exceeds policy "
                                f"context {self.model.context - 2}")
@@ -54,3 +56,24 @@ class TorchSearchPolicy:
             logits = self.model.forward_tokens(
                 frames, self.goal_token, interaction)["pi_logits"][0, -1]
         return torch.softmax(logits.float(), dim=-1).cpu().numpy()
+
+
+class BigramSearchPolicy:
+    """Image-free previous-action prior published by ``mc_search``."""
+
+    def __init__(self, prior_pmf: np.ndarray, action_names: Sequence[str]):
+        prior = np.asarray(prior_pmf, dtype=np.float64)
+        names = tuple(action_names)
+        if prior.shape != (len(names), len(names)):
+            raise ValueError("bigram prior must be square and match action_names")
+        self.prior_pmf = prior
+        self.action_names = names
+        self.num_actions = len(names)
+
+    def encode(self, observation: np.ndarray) -> None:
+        del observation
+        return None
+
+    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray:
+        del frame_tokens
+        return self.prior_pmf[int(previous_action)]

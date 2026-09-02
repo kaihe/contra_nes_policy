@@ -16,7 +16,7 @@ Common to both cells: exact `full_laser.state` task `win_level1_20260630171218_i
 complete episodes with seeds 0–29; binary terminal value (`success=1`, `death/timeout=0`);
 216-decision limit; 16 new simulations per committed decision; `c_puct=1.5`; rollout
 temperature 1.0; most-visited commit with fixed action-ID tie break; no root noise or
-recovery; Stable-Retro transitions; version-2 records from design 0030.
+recovery; Stable-Retro transitions; version-3 records from design 0030.
 
 | run | tree prior | terminal rollout | action support | initialization | state | dir |
 |---|---|---|---|---|---|---|
