@@ -166,7 +166,7 @@ One committed decision produces one durable record:
 
 ```text
 episode header:
-  format version 2
+  format version 3
   task and generator IDs
   search seed and configuration
   committed action sequence

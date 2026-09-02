@@ -106,10 +106,11 @@ class PolicyTarget:
 
 class SearchPolicy(Protocol):
     num_actions: int
+    action_names: Sequence[str]
 
     def encode(self, observation: np.ndarray) -> Any: ...
 
-    def priors(self, frame_tokens: Sequence[Any]) -> np.ndarray: ...
+    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray: ...
 
 
 class SearchEnvironment(Protocol):
@@ -131,6 +132,7 @@ class SearchTree:
         self.committed_prefix: list[Any] = []
         self.completed_simulations = 0
         self.live_nodes = 1
+        self.created_nodes = 1
         self.rng = np.random.default_rng(config.seed)
         if root.terminal is Terminal.ACTIVE and not root.expanded:
             self._expand(root, self.context(root))
@@ -148,7 +150,8 @@ class SearchTree:
         if node.terminal is not Terminal.ACTIVE:
             return
         mask = np.asarray(self.environment.legal_mask(node), dtype=bool)
-        priors = np.asarray(self.policy.priors(context), dtype=np.float64)
+        priors = np.asarray(
+            self.policy.priors(context, node.previous_action), dtype=np.float64)
         if mask.shape != (self.policy.num_actions,) or priors.shape != mask.shape:
             raise ValueError("legal mask and priors must match the policy action space")
         if not mask.any():
@@ -198,6 +201,7 @@ class SearchTree:
                 )
                 edge.child = child
                 self.live_nodes += 1
+                self.created_nodes += 1
                 node = child
                 break
             node = edge.child
@@ -227,7 +231,8 @@ class SearchTree:
                     probs[action] = edge.prior
                 first = False
             else:
-                probs = np.asarray(self.policy.priors(context), dtype=np.float64)
+                probs = np.asarray(
+                    self.policy.priors(context, node.previous_action), dtype=np.float64)
             probs = np.where(mask, probs, 0.0)
             total = float(probs.sum())
             probs = probs / total if total > 0 else mask.astype(np.float64) / mask.sum()

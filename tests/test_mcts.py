@@ -6,16 +6,18 @@ import numpy as np
 
 from contra_policy.mcts import Node, SearchConfig, SearchTree, Terminal, Transition
 from contra_policy.mcts.laser import target_record
+from contra_policy.mcts.policy import BigramSearchPolicy
 
 
 class FakePolicy:
     num_actions = 3
+    action_names = ("a", "b", "c")
 
     def encode(self, observation):
         return int(np.asarray(observation).item())
 
-    def priors(self, frame_tokens):
-        del frame_tokens
+    def priors(self, frame_tokens, previous_action):
+        del frame_tokens, previous_action
         return np.array([0.6, 0.3, 0.1])
 
 
@@ -116,7 +118,7 @@ def test_commit_re_roots_and_preserves_only_selected_subtree_context():
 
     record = target_record(target)
     assert "action_prefix" not in record
-    assert len(record["ppo_prior"]) == tree.policy.num_actions
+    assert len(record["guide_prior"]) == tree.policy.num_actions
     assert set(record["terminal_counts"]) == {"success", "death", "timeout"}
     totals = np.sum(list(record["terminal_counts"].values()), axis=0)
     assert np.array_equal(totals, record["visits"])
@@ -138,3 +140,10 @@ def test_node_limit_stops_before_unbacked_expansion():
     before = tree.completed_simulations
     assert not tree.simulate()
     assert tree.completed_simulations == before
+
+
+def test_bigram_uses_the_previous_action_row_without_images():
+    prior = np.array([[0.8, 0.2], [0.1, 0.9]])
+    policy = BigramSearchPolicy(prior, ("_", "R"))
+    assert policy.encode(np.zeros((2, 2, 3), np.uint8)) is None
+    assert np.array_equal(policy.priors([None, None], 1), prior[1])
