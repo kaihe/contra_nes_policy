@@ -118,14 +118,14 @@ sample a declared training start state
 run MCTS at each decision and store the root sample
 advance the emulator with an action from root visits
 finish the episode and compute each sample's reward-to-go
-add samples to a bounded replay buffer
-train all heads jointly on shuffled recent samples
+train all heads jointly on the current iteration's shuffled samples
+discard the iteration's samples before generating the next batch
 compare the candidate with the accepted network using fresh RNG seeds
 promote only after the candidate passes the declared gates
 ```
 
 The first loop always restores the same Laser boss savestate. This deliberately tests
-whether search generation, reward backup, replay, and joint improvement work under the
+whether search generation, reward backup, sample training, and joint improvement work under the
 smallest controlled state distribution; it does not test state or weapon generalization.
 Evaluation also starts from that state but uses fresh episode/search RNG seeds and no
 training exploration noise. A later design revision may introduce separate state banks
@@ -138,6 +138,11 @@ win rate over the accepted network. Report both emulator decisions and wall-cloc
 Tree reuse, cached image
 tokens, per-node GPT caches, and batched leaf evaluation are permitted optimizations only
 when they preserve search results within declared numerical tolerance.
+
+Training is iteration-local: samples produced by an older network are not reused by a
+newer iteration. This keeps the policy target aligned with the current search policy and
+makes each update attributable to one network/data pair. A replay window is deferred
+unless measured sample inefficiency or instability justifies stale targets.
 
 ---
 

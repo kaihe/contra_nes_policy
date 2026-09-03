@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import deque
 
 import numpy as np
 import torch
@@ -21,7 +20,6 @@ def run(args: argparse.Namespace) -> str:
     model = initialize_alphazero_policy(args.checkpoint, seed=args.seed).to(device)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                   lr=args.lr, weight_decay=args.weight_decay)
-    replay = deque(maxlen=args.replay_episodes)
     os.makedirs(args.output, exist_ok=True)
     catalog = TaskCatalog(task_root=args.task_root, shard_dir=args.shard_dir,
                           families=["boss"], split="train", image_size=args.image_size,
@@ -39,15 +37,13 @@ def run(args: argparse.Namespace) -> str:
                     seed=args.seed + generation * args.episodes_per_generation + episode_index,
                     precision=args.precision, image_size=args.image_size)
                 episodes.append(episode)
-                replay.append(episode)
             train_metrics = {}
             for epoch in range(args.epochs):
                 train_metrics = train_epoch(
-                    model, list(replay), optimizer, device=device,
+                    model, episodes, optimizer, device=device,
                     batch_episodes=args.batch_episodes,
                     seed=args.seed + generation * args.epochs + epoch)
             row = {"generation": generation, "episodes": len(episodes),
-                   "replay_episodes": len(replay),
                    "return_mean": float(np.mean([e.rewards.sum() for e in episodes])),
                    "win_rate": float(np.mean([e.outcome == "success" for e in episodes])),
                    **train_metrics}
@@ -76,7 +72,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--simulations", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-episodes", type=int, default=2)
-    parser.add_argument("--replay-episodes", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=0)

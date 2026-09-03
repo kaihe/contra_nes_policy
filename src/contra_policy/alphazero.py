@@ -1,4 +1,4 @@
-"""Replay records and joint policy/value/state training for design 0029."""
+"""Searched-episode records and joint policy/value/state training for design 0029."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def alphazero_loss(out: dict[str, torch.Tensor], batch: AlphaZeroBatch,
 def train_epoch(model, episodes: Sequence[SearchEpisode], optimizer,
                 *, device: torch.device, batch_episodes: int = 4,
                 weights: LossWeights = LossWeights(), seed: int = 0) -> dict[str, float]:
-    """Train once over a replay snapshot, batching whole episodes."""
+    """Train once over one iteration's episodes, batching whole episodes."""
     model.train()
     order = np.random.default_rng(seed).permutation(len(episodes))
     sums, batches = {}, 0

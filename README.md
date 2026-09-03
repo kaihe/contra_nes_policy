@@ -149,8 +149,9 @@ python -m contra_policy.train_alphazero \
 ```
 
 Every generation expands a leaf, evaluates its policy and value once, and backs that value
-up with exact transition rewards. There are no terminal simulation rollouts. Checkpoints
-and `metrics.jsonl` are written under `runs/alphazero/laser-fixed/` by default.
+up with exact transition rewards. There are no terminal simulation rollouts and no
+cross-iteration replay buffer: each iteration trains only on the episodes it generated.
+Checkpoints and `metrics.jsonl` are written under `runs/alphazero/laser-fixed/` by default.
 
 21 tests over the real shards, skipping cleanly if the data is absent. They target the
 silent failure modes rather than crashes: unshifted PPU coordinates, aux targets
