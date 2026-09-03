@@ -66,14 +66,12 @@ class SearchConfig:
     max_live_nodes: int = 2048
     c_puct: float = 1.5
     visit_temperature: float = 1.0
-    rollout_temperature: float = 1.0
-    bootstrap_rollouts: bool = False
     seed: int = 0
 
     def __post_init__(self) -> None:
         if self.simulations_per_move < 1 or self.max_live_nodes < 2:
             raise ValueError("simulation and node budgets must be positive")
-        if self.c_puct < 0 or self.visit_temperature <= 0 or self.rollout_temperature <= 0:
+        if self.c_puct < 0 or self.visit_temperature <= 0:
             raise ValueError("PUCT and temperatures must be positive")
 
 
@@ -168,34 +166,12 @@ class SearchTree:
 
         if node.terminal is Terminal.ACTIVE:
             evaluation = self._expand(node, self.context(node))
-            if self.config.bootstrap_rollouts:
-                leaf_value, outcome = self._rollout(node, self.context(node))
-            else:
-                leaf_value, outcome = float(evaluation.value), None
+            leaf_value = float(evaluation.value)
         else:
-            leaf_value, outcome = 0.0, node.terminal
+            leaf_value = 0.0
         self.backup(path, leaf_value)
         self.completed_simulations += 1
         return True
-
-    def _rollout(self, node: Node, context: list[Any]) -> tuple[float, Terminal]:
-        total = 0.0
-        while node.terminal is Terminal.ACTIVE:
-            evaluation = self.policy.evaluate(context, node.previous_action)
-            mask = np.asarray(self.environment.legal_mask(node), dtype=bool)
-            probs = np.where(mask, evaluation.priors, 0.0).astype(np.float64)
-            probs = probs / probs.sum() if probs.sum() else mask.astype(float) / mask.sum()
-            if self.config.rollout_temperature != 1.0:
-                probs = probs ** (1.0 / self.config.rollout_temperature)
-                probs /= probs.sum()
-            action = int(self.rng.choice(self.policy.num_actions, p=probs))
-            transition = self.environment.step(node, action)
-            total += float(transition.reward)
-            node = Node(transition.emu_state, transition.observation,
-                        self.policy.encode(transition.observation), transition.state_data,
-                        action, node.steps + 1, transition.terminal)
-            context.append(node.frame_token)
-        return total, node.terminal
 
     @staticmethod
     def backup(path: Sequence[Edge], leaf_value: float) -> None:

@@ -120,7 +120,7 @@ class LaserEnvironment:
 
 
 def generate_episode(model, catalog, task, *, device, simulations: int = 16,
-                     bootstrap: bool = False, sample: bool = True, seed: int = 0,
+                     sample: bool = True, seed: int = 0,
                      precision: str = "bf16", image_size: int = 256) -> SearchEpisode:
     """Generate one complete searched episode from the task's exact initial state."""
     prompt = catalog.prompt(task)
@@ -131,8 +131,7 @@ def generate_episode(model, catalog, task, *, device, simulations: int = 16,
         root = Node(initial.emu_state, initial.observation, policy.encode(initial.observation),
                     initial.state_data, IDLE_ACTION, 0)
         tree = SearchTree(root, policy, environment,
-                          SearchConfig(simulations_per_move=simulations,
-                                       bootstrap_rollouts=bootstrap, seed=seed))
+                          SearchConfig(simulations_per_move=simulations, seed=seed))
         while tree.root.terminal is Terminal.ACTIVE:
             if tree.search() == 0:
                 raise RuntimeError("MCTS exhausted its live-node budget")

@@ -35,7 +35,7 @@ def run(args: argparse.Namespace) -> str:
             for episode_index in range(args.episodes_per_generation):
                 episode = generate_episode(
                     model, catalog, task, device=device, simulations=args.simulations,
-                    bootstrap=(generation == 0), sample=True,
+                    sample=True,
                     seed=args.seed + generation * args.episodes_per_generation + episode_index,
                     precision=args.precision, image_size=args.image_size)
                 episodes.append(episode)

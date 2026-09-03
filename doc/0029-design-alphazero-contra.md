@@ -43,7 +43,7 @@ run and kept small enough that policy and value validation do not regress.
 The existing GPT-policy checkpoint initializes the CNN, GPT, and action head. The value,
 `dx`/`dy`, weapon, and rapid-fire heads are newly and randomly initialized; no PPO critic
 or previous auxiliary-head weights are loaded. Record the initialization seed. The value
-head is therefore unreliable until the bootstrap phase has fitted completed episodes.
+head begins untrained and improves from completed searched episodes.
 
 ## Every search node restores an exact emulator and causal policy state
 
@@ -84,12 +84,11 @@ most-visited action during evaluation. The chosen child's subtree is retained fo
 next decision. Exploration noise, visit temperature, simulation budget, and PUCT constant
 are run configuration, not hidden defaults.
 
-Leaf value replaces full terminal rollouts after bootstrap. Generation zero must use
-complete policy rollouts from expanded leaves because the randomly initialized value head
-has no meaning. Those completed episodes train value and auxiliary heads and provide the
-first root-visit targets. Generation one then switches to learned-value leaf evaluation.
-Records must identify the evaluator generation so rollout targets and learned-value search
-are not conflated.
+Every generation uses the same AlphaZero expansion protocol: expand one new leaf, evaluate
+its policy and value once, and back up its value together with exact edge rewards. There
+are no terminal policy rollouts. Generation zero therefore searches with a pretrained
+action prior and a random value head; completed real episodes provide the first value and
+auxiliary targets.
 
 ## The value predicts `mc_search` reward-to-go under searched play
 

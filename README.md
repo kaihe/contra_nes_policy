@@ -148,8 +148,8 @@ python -m contra_policy.train_alphazero \
   --checkpoint runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned/checkpoints/policy-final.pt
 ```
 
-Generation zero evaluates leaves with complete policy rollouts while the randomly
-initialized value head is untrained. Later generations use the learned value. Checkpoints
+Every generation expands a leaf, evaluates its policy and value once, and backs that value
+up with exact transition rewards. There are no terminal simulation rollouts. Checkpoints
 and `metrics.jsonl` are written under `runs/alphazero/laser-fixed/` by default.
 
 21 tests over the real shards, skipping cleanly if the data is absent. They target the

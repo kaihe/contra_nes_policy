@@ -56,13 +56,6 @@ def test_dense_backup_accumulates_reward_to_go_without_sign_flip():
     assert first.value_sum == 5.0
 
 
-def test_bootstrap_rollout_ignores_random_leaf_value():
-    tree, env = make_tree(bootstrap_rollouts=True)
-    assert tree.simulate()
-    assert len(env.transitions) == 3
-    assert tree.root.edges[0].value_sum != 42.0
-
-
 def test_root_visits_form_masked_policy_target_and_commit_reuses_child():
     tree, _ = make_tree()
     tree.search(4)
