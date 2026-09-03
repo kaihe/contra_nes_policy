@@ -1,149 +1,81 @@
-"""Correctness gates for the environment-independent design-0030 MCTS core."""
-
-from __future__ import annotations
+"""Correctness gates for design-0029 dense-reward MCTS."""
 
 import numpy as np
 
-from contra_policy.mcts import Node, SearchConfig, SearchTree, Terminal, Transition
-from contra_policy.mcts.laser import target_record
-from contra_policy.mcts.policy import BigramSearchPolicy
+from contra_policy.mcts import Evaluation, Node, SearchConfig, SearchTree, Terminal, Transition
 
 
 class FakePolicy:
-    num_actions = 3
-    action_names = ("a", "b", "c")
+    num_actions = 2
 
     def encode(self, observation):
         return int(np.asarray(observation).item())
 
-    def priors(self, frame_tokens, previous_action):
+    def evaluate(self, frame_tokens, previous_action):
         del frame_tokens, previous_action
-        return np.array([0.6, 0.3, 0.1])
+        return Evaluation(np.array([0.75, 0.25]), value=40.0)
 
 
 class FakeEnvironment:
-    """Action 0 wins after two steps; the others fail immediately."""
-
     def __init__(self):
         self.transitions = []
 
     def legal_mask(self, node):
-        return np.array([True, True, node.steps == 0])
+        return np.ones(2, dtype=bool)
 
     def step(self, node, action_id):
-        self.transitions.append((node.emu_state, action_id))
+        self.transitions.append((node.steps, action_id))
         step = node.steps + 1
-        if action_id != 0:
-            terminal = Terminal.DEATH
-        elif step >= 2:
-            terminal = Terminal.SUCCESS
-        else:
-            terminal = Terminal.ACTIVE
-        state = f"{node.emu_state.decode()}-{action_id}".encode()
-        return Transition(state, np.array(step), step, terminal)
+        terminal = Terminal.SUCCESS if step >= 3 else Terminal.ACTIVE
+        reward = 2.0 if action_id == 0 else -1.0
+        return Transition(f"s{step}".encode(), np.array(step), step, reward, terminal)
 
 
 def make_tree(**overrides):
-    policy, environment = FakePolicy(), FakeEnvironment()
-    root = Node(b"s0", 0, 0, previous_action=0, steps=0)
-    cfg = SearchConfig(**{"simulations_per_move": 8, "seed": 3, **overrides})
-    return SearchTree(root, policy, environment, cfg, model_id="fake"), environment
+    env = FakeEnvironment()
+    root = Node(b"s0", np.array(0), 0, 0, previous_action=0, steps=0)
+    cfg = SearchConfig(**{"simulations_per_move": 4, "seed": 2, **overrides})
+    return SearchTree(root, FakePolicy(), env, cfg), env
 
 
-def test_expansion_masks_and_normalizes_policy_priors():
+def test_leaf_value_is_added_to_exact_edge_reward():
     tree, _ = make_tree()
-    assert set(tree.root.edges) == {0, 1, 2}
-    assert np.isclose(sum(edge.prior for edge in tree.root.edges.values()), 1.0)
-
-    tree.simulate()  # action 0 creates the non-terminal child
-    child = tree.root.edges[0].child
-    assert set(child.edges) == {0, 1}
-    assert np.isclose(child.edges[0].prior, 2 / 3)
-    assert np.isclose(child.edges[1].prior, 1 / 3)
-
-
-def test_one_simulation_adds_only_one_permanent_node_and_backs_up_win():
-    tree, environment = make_tree()
     assert tree.simulate()
-    assert tree.live_nodes == 2
     edge = tree.root.edges[0]
+    assert edge.reward == 2.0
     assert edge.visits == 1
-    assert edge.value_sum == 1.0
-    assert edge.child is not None
-    # One permanent transition plus at least one transient rollout transition.
-    assert len(environment.transitions) >= 2
-    assert all(child.child is None for child in edge.child.edges.values())
+    assert edge.value_sum == 42.0
 
 
-def test_backup_is_binary_and_has_no_two_player_sign_flip():
+def test_dense_backup_accumulates_reward_to_go_without_sign_flip():
     tree, _ = make_tree()
-    path = [tree.root.edges[0], tree.root.edges[1]]
-    tree.backup(path, Terminal.SUCCESS)
-    assert [(edge.visits, edge.value_sum) for edge in path] == [(1, 1.0), (1, 1.0)]
-    assert [(edge.successes, edge.deaths, edge.timeouts) for edge in path] == [
-        (1, 0, 0), (1, 0, 0)]
-
-    tree.backup(path, Terminal.TIMEOUT)
-    assert [(edge.visits, edge.value_sum) for edge in path] == [(2, 1.0), (2, 1.0)]
-    assert [(edge.successes, edge.deaths, edge.timeouts) for edge in path] == [
-        (1, 0, 1), (1, 0, 1)]
+    first, second = tree.root.edges[0], tree.root.edges[1]
+    first.reward, second.reward = 2.0, -1.0
+    tree.backup([first, second], leaf_value=4.0)
+    assert second.value_sum == 3.0
+    assert first.value_sum == 5.0
 
 
-def test_root_visits_form_policy_target():
+def test_bootstrap_rollout_ignores_random_leaf_value():
+    tree, env = make_tree(bootstrap_rollouts=True)
+    assert tree.simulate()
+    assert len(env.transitions) == 3
+    assert tree.root.edges[0].value_sum != 42.0
+
+
+def test_root_visits_form_masked_policy_target_and_commit_reuses_child():
     tree, _ = make_tree()
-    assert tree.search(6) == 6
-    mask, visits, probabilities = tree.root_target()
-    assert mask.tolist() == [True, True, True]
-    assert visits.sum() == 6
-    assert np.isclose(probabilities.sum(), 1.0)
-    assert np.all(probabilities[~mask] == 0)
-
-
-def test_commit_re_roots_and_preserves_only_selected_subtree_context():
-    tree, _ = make_tree()
-    tree.search(6)
-    old_root = tree.root
-    target = tree.commit()
-    assert target.chosen_action == 0
-    assert isinstance(target.chosen_action, int)
-    assert np.isclose(target.priors.sum(), 1.0)
-    assert np.array_equal(target.successes + target.deaths + target.timeouts,
-                          target.visits)
-    assert tree.root is old_root.edges[0].child
+    tree.search(4)
+    old = tree.root
+    target = tree.commit(sample=False)
+    assert target.visits.sum() == 4
+    assert np.isclose(target.probabilities.sum(), 1.0)
+    assert target.chosen_action == int(np.argmax(target.visits))
+    assert tree.root is old.edges[target.chosen_action].child
     assert tree.root.parent is None
-    assert tree.root.incoming_action is None
-    assert tree.committed_prefix == [old_root.frame_token]
-    assert tree.context(tree.root) == [old_root.frame_token, tree.root.frame_token]
-    assert tree.live_nodes == tree._count_nodes(tree.root)
-
-    record = target_record(target)
-    assert "action_prefix" not in record
-    assert len(record["guide_prior"]) == tree.policy.num_actions
-    assert set(record["terminal_counts"]) == {"success", "death", "timeout"}
-    totals = np.sum(list(record["terminal_counts"].values()), axis=0)
-    assert np.array_equal(totals, record["visits"])
-
-
-def test_same_action_at_different_nodes_has_independent_edge_statistics():
-    tree, _ = make_tree()
-    tree.simulate()
-    root_edge = tree.root.edges[0]
-    child_edge = root_edge.child.edges[0]
-    assert root_edge is not child_edge
-    assert root_edge.visits == 1
-    assert child_edge.visits == 0
 
 
 def test_node_limit_stops_before_unbacked_expansion():
     tree, _ = make_tree(max_live_nodes=2)
     assert tree.simulate()
-    before = tree.completed_simulations
     assert not tree.simulate()
-    assert tree.completed_simulations == before
-
-
-def test_bigram_uses_the_previous_action_row_without_images():
-    prior = np.array([[0.8, 0.2], [0.1, 0.9]])
-    policy = BigramSearchPolicy(prior, ("_", "R"))
-    assert policy.encode(np.zeros((2, 2, 3), np.uint8)) is None
-    assert np.array_equal(policy.priors([None, None], 1), prior[1])

@@ -72,6 +72,10 @@ class PolicyConfig:
     # value_head=false and aux_size=0.
     value_head: bool = True
     aux_size: int = 32                      # 0 disables the legacy goal-heatmap head
+    #: AlphaZero state-decoding heads. Disabled by default so legacy checkpoints retain
+    #: their exact architecture; design 0029 enables them explicitly.
+    state_heads: bool = False
+    weapon_classes: int = 6
     #: Images per encoder forward. A whole-episode batch is batch x T frames — 4 x 321
     #: is 1,284 at 256px, which peaks near the 16 GB card. Chunking bounds the encoder's
     #: activation peak independently of how long the episodes in a batch happen to be,
@@ -119,6 +123,10 @@ class ContraPolicy(nn.Module):
         self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, d_core)   # +1 for id -1
         self.pi_head = nn.Linear(d_core, NUM_ACTIONS)
         self.value_head = nn.Linear(d_core, 1) if cfg.value_head else None
+        self.motion_head = nn.Linear(d_core, 2) if cfg.state_heads else None
+        self.weapon_head = (nn.Linear(d_core, cfg.weapon_classes)
+                            if cfg.state_heads else None)
+        self.rapid_head = nn.Linear(d_core, 1) if cfg.state_heads else None
         # Grounding lives here now, not in the encoder: predicting where the goal is
         # requires comparing this frame against the goal token, which is what attention
         # upstream has just done.
@@ -221,6 +229,10 @@ class ContraPolicy(nn.Module):
         out = {"pi_logits": self.pi_head(h)}
         if self.value_head is not None:
             out["vpred"] = self.value_head(h).squeeze(-1)
+        if self.motion_head is not None:
+            out["motion"] = self.motion_head(h)
+            out["weapon_logits"] = self.weapon_head(h)
+            out["rapid_logit"] = self.rapid_head(h).squeeze(-1)
         if self.aux_head is not None:
             heat = self.aux_head(h).view(b, t, self.cfg.aux_size, self.cfg.aux_size)
             point, exist = heatmap_readout(heat)
@@ -264,4 +276,33 @@ def load_policy(path: str, map_location: str = "cpu",
     model = ContraPolicy(PolicyConfig(**{**cfg.to_dict(),
                                          "encoder_ckpt": None, "encoder": enc_cfg}))
     model.load_state_dict(ckpt["policy"], strict=strict)
+    return model
+
+
+def initialize_alphazero_policy(path: str, *, seed: int = 0,
+                                map_location: str = "cpu") -> ContraPolicy:
+    """Build design 0029 from a GPT-policy checkpoint.
+
+    Only the visual encoder, causal GPT, input/interaction projections, null goal, and
+    action head are transferred. Value and decoded-state heads are freshly initialized
+    from ``seed`` even when the source checkpoint happens to contain an old PPO critic or
+    grounding head.
+    """
+    source = load_policy(path, map_location=map_location)
+    cfg = PolicyConfig(**{**source.cfg.to_dict(), "value_head": True, "aux_size": 0,
+                          "state_heads": True})
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(int(seed))
+        model = ContraPolicy(cfg)
+    prefixes = ("encoder.", "core.", "in_proj.", "interaction.", "pi_head.")
+    transferable = {
+        key: value for key, value in source.state_dict().items()
+        if key.startswith(prefixes) or key == "null_goal"
+    }
+    missing, unexpected = model.load_state_dict(transferable, strict=False)
+    allowed_missing = ("value_head.", "motion_head.", "weapon_head.", "rapid_head.")
+    if unexpected or any(not key.startswith(allowed_missing) for key in missing):
+        raise RuntimeError(f"invalid AlphaZero initialization: missing={missing}, "
+                           f"unexpected={unexpected}")
     return model

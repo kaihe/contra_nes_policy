@@ -1,10 +1,4 @@
-"""Environment-independent MCTS with policy-guided PUCT selection.
-
-One simulation grows at most one permanent node. From that node it samples a
-temporary policy rollout to a real terminal and backs the binary result through
-the permanent path. The environment and neural policy are protocols so all tree
-invariants can be tested without Stable Retro or CUDA.
-"""
+"""PUCT search with exact emulator transitions and dense reward backup."""
 
 from __future__ import annotations
 
@@ -22,32 +16,29 @@ class Terminal(str, Enum):
     DEATH = "death"
     TIMEOUT = "timeout"
 
-    @property
-    def value01(self) -> float:
-        if self is Terminal.ACTIVE:
-            raise ValueError("a non-terminal state has no Monte Carlo value")
-        return float(self is Terminal.SUCCESS)
-
 
 @dataclass(frozen=True)
 class Transition:
-    """Environment result after one policy action."""
-
     emu_state: bytes
     observation: np.ndarray
     state_data: Any
+    reward: float
     terminal: Terminal = Terminal.ACTIVE
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    priors: np.ndarray
+    value: float
 
 
 @dataclass
 class Edge:
     action_id: int
     prior: float
+    reward: Optional[float] = None
     visits: int = 0
     value_sum: float = 0.0
-    successes: int = 0
-    deaths: int = 0
-    timeouts: int = 0
     child: Optional["Node"] = None
 
     @property
@@ -58,13 +49,13 @@ class Edge:
 @dataclass
 class Node:
     emu_state: bytes
+    observation: np.ndarray
     frame_token: Any
     state_data: Any
     previous_action: int
     steps: int
     terminal: Terminal = Terminal.ACTIVE
     parent: Optional["Node"] = field(default=None, repr=False)
-    incoming_action: Optional[int] = None
     expanded: bool = False
     edges: Dict[int, Edge] = field(default_factory=dict)
 
@@ -74,114 +65,88 @@ class SearchConfig:
     simulations_per_move: int = 16
     max_live_nodes: int = 2048
     c_puct: float = 1.5
-    temperature: float = 1.0
+    visit_temperature: float = 1.0
+    rollout_temperature: float = 1.0
+    bootstrap_rollouts: bool = False
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if self.simulations_per_move < 1:
-            raise ValueError("simulations_per_move must be positive")
-        if self.max_live_nodes < 2:
-            raise ValueError("max_live_nodes must be at least 2")
-        if self.c_puct < 0:
-            raise ValueError("c_puct must be nonnegative")
-        if self.temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if self.simulations_per_move < 1 or self.max_live_nodes < 2:
+            raise ValueError("simulation and node budgets must be positive")
+        if self.c_puct < 0 or self.visit_temperature <= 0 or self.rollout_temperature <= 0:
+            raise ValueError("PUCT and temperatures must be positive")
 
 
 @dataclass(frozen=True)
 class PolicyTarget:
-    """Compact output at one committed decision; training is outside design 0030."""
-
     step: int
-    previous_action: int
     legal_mask: np.ndarray
     priors: np.ndarray
     visits: np.ndarray
     probabilities: np.ndarray
-    successes: np.ndarray
-    deaths: np.ndarray
-    timeouts: np.ndarray
     chosen_action: int
+    chosen_reward: float
+    observation: np.ndarray
 
 
 class SearchPolicy(Protocol):
     num_actions: int
-    action_names: Sequence[str]
 
     def encode(self, observation: np.ndarray) -> Any: ...
-
-    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray: ...
+    def evaluate(self, frame_tokens: Sequence[Any], previous_action: int) -> Evaluation: ...
 
 
 class SearchEnvironment(Protocol):
     def legal_mask(self, node: Node) -> np.ndarray: ...
-
     def step(self, node: Node, action_id: int) -> Transition: ...
 
 
 class SearchTree:
-    """Persistent tree for one committed episode."""
+    """Persistent single-agent tree; one simulation creates at most one permanent node."""
 
     def __init__(self, root: Node, policy: SearchPolicy, environment: SearchEnvironment,
-                 config: SearchConfig = SearchConfig(), *, model_id: str = ""):
-        self.root = root
-        self.policy = policy
-        self.environment = environment
-        self.config = config
-        self.model_id = model_id
-        self.committed_prefix: list[Any] = []
-        self.completed_simulations = 0
+                 config: SearchConfig = SearchConfig()):
+        self.root, self.policy, self.environment, self.config = root, policy, environment, config
+        self.committed_tokens: list[Any] = []
         self.live_nodes = 1
-        self.created_nodes = 1
+        self.completed_simulations = 0
         self.rng = np.random.default_rng(config.seed)
-        if root.terminal is Terminal.ACTIVE and not root.expanded:
+        if root.terminal is Terminal.ACTIVE:
             self._expand(root, self.context(root))
 
     def context(self, node: Node) -> list[Any]:
-        suffix: list[Any] = []
+        suffix = []
         cur: Optional[Node] = node
         while cur is not None:
             suffix.append(cur.frame_token)
             cur = cur.parent
-        suffix.reverse()
-        return [*self.committed_prefix, *suffix]
+        return [*self.committed_tokens, *reversed(suffix)]
 
-    def _expand(self, node: Node, context: Sequence[Any]) -> None:
-        if node.terminal is not Terminal.ACTIVE:
-            return
+    def _expand(self, node: Node, context: Sequence[Any]) -> Evaluation:
+        evaluation = self.policy.evaluate(context, node.previous_action)
         mask = np.asarray(self.environment.legal_mask(node), dtype=bool)
-        priors = np.asarray(
-            self.policy.priors(context, node.previous_action), dtype=np.float64)
+        priors = np.asarray(evaluation.priors, dtype=np.float64)
         if mask.shape != (self.policy.num_actions,) or priors.shape != mask.shape:
-            raise ValueError("legal mask and priors must match the policy action space")
-        if not mask.any():
-            raise RuntimeError("environment returned no legal action")
-        if not np.isfinite(priors).all() or np.any(priors < 0):
-            raise ValueError("policy priors must be finite and nonnegative")
+            raise ValueError("legal mask and priors must match the action space")
+        if not mask.any() or not np.isfinite(priors).all() or np.any(priors < 0):
+            raise ValueError("invalid legal mask or policy priors")
         probs = np.where(mask, priors, 0.0)
-        total = float(probs.sum())
-        probs = probs / total if total > 0 else mask.astype(np.float64) / mask.sum()
+        probs = probs / probs.sum() if probs.sum() else mask.astype(float) / mask.sum()
         node.edges = {int(i): Edge(int(i), float(probs[i])) for i in np.flatnonzero(mask)}
         node.expanded = True
+        return evaluation
 
     def select_edge(self, node: Node) -> Edge:
         parent_visits = sum(edge.visits for edge in node.edges.values())
         scale = math.sqrt(max(1, parent_visits))
-
-        def rank(edge: Edge) -> tuple[float, int]:
-            score = (edge.mean_value
-                     + self.config.c_puct * edge.prior * scale / (1 + edge.visits))
-            return score, -edge.action_id
-
-        return max(node.edges.values(), key=rank)
+        return max(node.edges.values(), key=lambda edge: (
+            edge.mean_value + self.config.c_puct * edge.prior * scale / (1 + edge.visits),
+            -edge.action_id))
 
     def simulate(self) -> bool:
-        """Run one selection/expansion/rollout/backup; return false at node limit."""
         if self.root.terminal is not Terminal.ACTIVE:
             return False
-        node = self.root
-        path: list[Edge] = []
-
+        node, path = self.root, []
         while True:
             edge = self.select_edge(node)
             path.append(edge)
@@ -189,87 +154,61 @@ class SearchTree:
                 if self.live_nodes >= self.config.max_live_nodes:
                     return False
                 transition = self.environment.step(node, edge.action_id)
-                child = Node(
-                    emu_state=transition.emu_state,
-                    frame_token=self.policy.encode(transition.observation),
-                    state_data=transition.state_data,
-                    previous_action=edge.action_id,
-                    steps=node.steps + 1,
-                    terminal=transition.terminal,
-                    parent=node,
-                    incoming_action=edge.action_id,
-                )
+                edge.reward = float(transition.reward)
+                child = Node(transition.emu_state, transition.observation,
+                             self.policy.encode(transition.observation), transition.state_data,
+                             edge.action_id, node.steps + 1, transition.terminal, parent=node)
                 edge.child = child
                 self.live_nodes += 1
-                self.created_nodes += 1
                 node = child
                 break
             node = edge.child
             if node.terminal is not Terminal.ACTIVE:
                 break
 
-        context = self.context(node)
         if node.terminal is Terminal.ACTIVE:
-            self._expand(node, context)
-            outcome = self._terminal_rollout(node, context)
+            evaluation = self._expand(node, self.context(node))
+            if self.config.bootstrap_rollouts:
+                leaf_value, outcome = self._rollout(node, self.context(node))
+            else:
+                leaf_value, outcome = float(evaluation.value), None
         else:
-            outcome = node.terminal
-        self.backup(path, outcome)
+            leaf_value, outcome = 0.0, node.terminal
+        self.backup(path, leaf_value)
         self.completed_simulations += 1
         return True
 
-    def _terminal_rollout(self, start: Node, context: list[Any]) -> Terminal:
-        node = start
-        first = True
+    def _rollout(self, node: Node, context: list[Any]) -> tuple[float, Terminal]:
+        total = 0.0
         while node.terminal is Terminal.ACTIVE:
+            evaluation = self.policy.evaluate(context, node.previous_action)
             mask = np.asarray(self.environment.legal_mask(node), dtype=bool)
-            if first:
-                # Expansion already evaluated this leaf. Reuse its immutable priors
-                # instead of paying for the same transformer forward twice.
-                probs = np.zeros(self.policy.num_actions, dtype=np.float64)
-                for action, edge in node.edges.items():
-                    probs[action] = edge.prior
-                first = False
-            else:
-                probs = np.asarray(
-                    self.policy.priors(context, node.previous_action), dtype=np.float64)
-            probs = np.where(mask, probs, 0.0)
-            total = float(probs.sum())
-            probs = probs / total if total > 0 else mask.astype(np.float64) / mask.sum()
-            if self.config.temperature != 1.0:
-                probs = np.power(probs, 1.0 / self.config.temperature)
+            probs = np.where(mask, evaluation.priors, 0.0).astype(np.float64)
+            probs = probs / probs.sum() if probs.sum() else mask.astype(float) / mask.sum()
+            if self.config.rollout_temperature != 1.0:
+                probs = probs ** (1.0 / self.config.rollout_temperature)
                 probs /= probs.sum()
             action = int(self.rng.choice(self.policy.num_actions, p=probs))
             transition = self.environment.step(node, action)
-            node = Node(
-                emu_state=transition.emu_state,
-                frame_token=self.policy.encode(transition.observation),
-                state_data=transition.state_data,
-                previous_action=action,
-                steps=node.steps + 1,
-                terminal=transition.terminal,
-            )
+            total += float(transition.reward)
+            node = Node(transition.emu_state, transition.observation,
+                        self.policy.encode(transition.observation), transition.state_data,
+                        action, node.steps + 1, transition.terminal)
             context.append(node.frame_token)
-        return node.terminal
+        return total, node.terminal
 
     @staticmethod
-    def backup(path: Sequence[Edge], outcome: Terminal) -> None:
-        if outcome is Terminal.ACTIVE:
-            raise ValueError("cannot back up a non-terminal outcome")
-        value = outcome.value01
-        for edge in path:
+    def backup(path: Sequence[Edge], leaf_value: float) -> None:
+        value = float(leaf_value)
+        for edge in reversed(path):
+            if edge.reward is None:
+                raise RuntimeError("cannot back up an edge without an exact reward")
+            value = edge.reward + value
             edge.visits += 1
             edge.value_sum += value
-            if outcome is Terminal.SUCCESS:
-                edge.successes += 1
-            elif outcome is Terminal.DEATH:
-                edge.deaths += 1
-            else:
-                edge.timeouts += 1
 
     def search(self, simulations: Optional[int] = None) -> int:
-        target = simulations or self.config.simulations_per_move
-        done = 0
+        target, done = simulations or self.config.simulations_per_move, 0
         while done < target and self.simulate():
             done += 1
         return done
@@ -278,38 +217,28 @@ class SearchTree:
         mask = np.zeros(self.policy.num_actions, dtype=bool)
         visits = np.zeros(self.policy.num_actions, dtype=np.int64)
         for action, edge in self.root.edges.items():
-            mask[action] = True
-            visits[action] = edge.visits
-        total = int(visits.sum())
-        if total == 0:
-            raise RuntimeError("cannot form a policy target before a simulation")
-        return mask, visits, visits.astype(np.float64) / total
+            mask[action], visits[action] = True, edge.visits
+        if visits.sum() == 0:
+            raise RuntimeError("search must run before forming a root target")
+        scaled = visits.astype(np.float64) ** (1.0 / self.config.visit_temperature)
+        return mask, visits, scaled / scaled.sum()
 
-    def commit(self) -> PolicyTarget:
-        """Choose the most-visited root edge, preserve its subtree, and re-root."""
+    def commit(self, *, sample: bool = True) -> PolicyTarget:
         mask, visits, probabilities = self.root_target()
         priors = np.zeros(self.policy.num_actions, dtype=np.float64)
-        successes = np.zeros(self.policy.num_actions, dtype=np.int64)
-        deaths = np.zeros(self.policy.num_actions, dtype=np.int64)
-        timeouts = np.zeros(self.policy.num_actions, dtype=np.int64)
         for action, edge in self.root.edges.items():
             priors[action] = edge.prior
-            successes[action] = edge.successes
-            deaths[action] = edge.deaths
-            timeouts[action] = edge.timeouts
-        chosen = min(
-            (edge for edge in self.root.edges.values() if edge.visits == visits.max()),
-            key=lambda edge: edge.action_id,
-        )
-        if chosen.child is None:
-            raise RuntimeError("the most-visited edge has no child")
+        chosen = (int(self.rng.choice(self.policy.num_actions, p=probabilities)) if sample
+                  else int(np.flatnonzero(visits == visits.max())[0]))
+        edge = self.root.edges[chosen]
+        if edge.child is None:
+            raise RuntimeError("chosen action has no expanded child")
         old_root = self.root
-        target = PolicyTarget(old_root.steps, old_root.previous_action, mask, priors, visits,
-                              probabilities, successes, deaths, timeouts, chosen.action_id)
-        self.committed_prefix.append(old_root.frame_token)
-        self.root = chosen.child
+        target = PolicyTarget(old_root.steps, mask, priors, visits, probabilities, chosen,
+                              float(edge.reward), old_root.observation.copy())
+        self.committed_tokens.append(old_root.frame_token)
+        self.root = edge.child
         self.root.parent = None
-        self.root.incoming_action = None
         self.live_nodes = self._count_nodes(self.root)
         return target
 
@@ -319,6 +248,5 @@ class SearchTree:
         while stack:
             node = stack.pop()
             count += 1
-            stack.extend(edge.child for edge in node.edges.values()
-                         if edge.child is not None)
+            stack.extend(e.child for e in node.edges.values() if e.child is not None)
         return count

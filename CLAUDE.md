@@ -1,5 +1,10 @@
 # contra_nes_policy — project instructions
 
+## Chat responses
+
+Do not use LaTeX formulas in chat responses. Express formulas with plain language,
+readable pseudocode, or fenced code blocks instead.
+
 ## Experiment documents
 Every `doc/NNNN-*.md` written from now on follows `.claude/skills/experiment-writeup/`:
 one writeup per set of experiments, exactly four sections (goal, setup, evaluation

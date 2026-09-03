@@ -1,8 +1,7 @@
-"""PPO-guided Monte Carlo tree search for Contra (design 0030)."""
+"""AlphaZero-style single-agent search for design 0029."""
 
-from .core import Edge, Node, PolicyTarget, SearchConfig, SearchTree, Terminal, Transition
+from contra_policy.mcts.core import (Evaluation, Node, PolicyTarget, SearchConfig,
+                                     SearchTree, Terminal, Transition)
 
-__all__ = [
-    "Edge", "Node", "PolicyTarget", "SearchConfig", "SearchTree", "Terminal",
-    "Transition",
-]
+__all__ = ["Evaluation", "Node", "PolicyTarget", "SearchConfig", "SearchTree",
+           "Terminal", "Transition"]

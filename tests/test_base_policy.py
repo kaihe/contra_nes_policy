@@ -6,7 +6,8 @@ import torch
 
 from contra_policy.dataset import shard_paths
 from contra_policy.loss import BehaviorCloneLoss
-from contra_policy.model import PolicyConfig, build_policy, load_policy
+from contra_policy.model import (PolicyConfig, build_policy,
+                                 initialize_alphazero_policy, load_policy)
 from contra_policy.train_bc import _require_family_counts
 
 
@@ -81,6 +82,36 @@ def test_legacy_head_defaults_still_round_trip_strictly(tmp_path):
     assert loaded.value_head is not None
     assert loaded.aux_head is not None
     assert set(loaded.state_dict()) == set(policy.state_dict())
+
+
+def test_alphazero_heads_have_the_declared_shapes():
+    policy = build_policy(_config(aux_size=0, value_head=True, state_heads=True)).eval()
+    images = torch.randint(0, 256, (2, 3, 64, 64, 3), dtype=torch.uint8)
+    goals = torch.randint(0, 256, (2, 64, 64, 3), dtype=torch.uint8)
+
+    with torch.no_grad():
+        out = policy(images, goals, torch.tensor([0, 1]))
+
+    assert set(out) == {"pi_logits", "vpred", "motion", "weapon_logits", "rapid_logit"}
+    assert out["vpred"].shape == (2, 3)
+    assert out["motion"].shape == (2, 3, 2)
+    assert out["weapon_logits"].shape == (2, 3, 6)
+    assert out["rapid_logit"].shape == (2, 3)
+
+
+def test_alphazero_initialization_transfers_only_policy_weights(tmp_path):
+    source = build_policy(_config(aux_size=0, value_head=False, state_heads=False))
+    path = source.save(str(tmp_path / "gpt.pt"))
+
+    first = initialize_alphazero_policy(path, seed=7)
+    second = initialize_alphazero_policy(path, seed=7)
+
+    assert torch.equal(first.pi_head.weight, source.pi_head.weight)
+    assert torch.equal(first.core.blocks[0].attn.q.weight,
+                       source.core.blocks[0].attn.q.weight)
+    assert torch.equal(first.value_head.weight, second.value_head.weight)
+    assert first.value_head is not None and first.motion_head is not None
+    assert first.aux_head is None
 
 
 def test_action_ce_can_suppress_all_diagnostic_metrics():

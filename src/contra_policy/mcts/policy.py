@@ -1,4 +1,4 @@
-"""Frozen Contra policy adapter used by MCTS."""
+"""Neural-network adapter for policy/value MCTS evaluation."""
 
 from __future__ import annotations
 
@@ -8,30 +8,24 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 
-from contra_policy.action_space import ACTION_NAMES, NUM_ACTIONS
+from contra_policy.action_space import NUM_ACTIONS
+from contra_policy.mcts.core import Evaluation
 
 
 class TorchSearchPolicy:
-    """Encode frames once and evaluate arbitrary causal tree histories."""
-
     num_actions = NUM_ACTIONS
-    action_names = ACTION_NAMES
 
     def __init__(self, model, interaction: int, *, device: torch.device,
                  precision: str = "bf16"):
-        self.model = model.to(device).eval()
-        self.interaction = int(interaction)
-        self.device = device
-        self.autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
-                               "fp32": None}[precision]
-        if device.type != "cuda":
-            self.autocast_dtype = None
+        if model.value_head is None:
+            raise ValueError("MCTS requires a value head")
         if model.cfg.use_goal_image:
-            raise ValueError("the first Laser MCTS implementation requires a null-goal policy")
-        if model.encoder.cfg.input_kind == "rgb_signed_frame_difference":
-            raise ValueError("branch search needs paired-frame encoding for this encoder")
-        with torch.no_grad():
-            self.goal_token = model.null_goal.detach().to(device).unsqueeze(0)
+            raise ValueError("the fixed Laser loop requires a null-goal policy")
+        self.model = model.to(device).eval()
+        self.interaction, self.device = int(interaction), device
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[precision]
+        self.autocast_dtype = dtype if device.type == "cuda" else None
+        self.goal_token = model.null_goal.detach().to(device).unsqueeze(0)
 
     def _autocast(self):
         return (torch.autocast("cuda", dtype=self.autocast_dtype)
@@ -41,39 +35,16 @@ class TorchSearchPolicy:
     def encode(self, observation: np.ndarray) -> torch.Tensor:
         image = torch.from_numpy(np.ascontiguousarray(observation)).to(self.device).unsqueeze(0)
         with self._autocast():
-            token = self.model.encoder.encode(image)
-        return token[0].float()
+            return self.model.encoder.encode(image)[0].float()
 
     @torch.no_grad()
-    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray:
+    def evaluate(self, frame_tokens: Sequence[Any], previous_action: int) -> Evaluation:
         del previous_action
         if len(frame_tokens) + 2 > self.model.context:
-            raise RuntimeError(f"MCTS history of {len(frame_tokens)} frames exceeds policy "
-                               f"context {self.model.context - 2}")
+            raise RuntimeError("MCTS history exceeds the GPT context")
         frames = torch.stack(list(frame_tokens)).float().unsqueeze(0)
         interaction = torch.tensor([self.interaction], device=self.device)
         with self._autocast():
-            logits = self.model.forward_tokens(
-                frames, self.goal_token, interaction)["pi_logits"][0, -1]
-        return torch.softmax(logits.float(), dim=-1).cpu().numpy()
-
-
-class BigramSearchPolicy:
-    """Image-free previous-action prior published by ``mc_search``."""
-
-    def __init__(self, prior_pmf: np.ndarray, action_names: Sequence[str]):
-        prior = np.asarray(prior_pmf, dtype=np.float64)
-        names = tuple(action_names)
-        if prior.shape != (len(names), len(names)):
-            raise ValueError("bigram prior must be square and match action_names")
-        self.prior_pmf = prior
-        self.action_names = names
-        self.num_actions = len(names)
-
-    def encode(self, observation: np.ndarray) -> None:
-        del observation
-        return None
-
-    def priors(self, frame_tokens: Sequence[Any], previous_action: int) -> np.ndarray:
-        del frame_tokens
-        return self.prior_pmf[int(previous_action)]
+            out = self.model.forward_tokens(frames, self.goal_token, interaction)
+        priors = torch.softmax(out["pi_logits"][0, -1].float(), -1).cpu().numpy()
+        return Evaluation(priors, float(out["vpred"][0, -1].float().cpu()))

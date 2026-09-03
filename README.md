@@ -137,6 +137,21 @@ says whether cross-view grounding is working. A 60-step smoke run moves it 80 â†
 python -m pytest tests/ -q
 ```
 
+## Fixed-state AlphaZero loop
+
+Design [0029](doc/0029-design-alphazero-contra.md) trains the Laser policy from one
+boss savestate with exact emulator MCTS and the complete dense `mc_search` reward:
+
+```sh
+PYTHONPATH=../contra_nes_data/src:$PYTHONPATH \
+python -m contra_policy.train_alphazero \
+  --checkpoint runs/laser-projection/L-D10k-C20k-laser-null-goal-proj-tuned/checkpoints/policy-final.pt
+```
+
+Generation zero evaluates leaves with complete policy rollouts while the randomly
+initialized value head is untrained. Later generations use the learned value. Checkpoints
+and `metrics.jsonl` are written under `runs/alphazero/laser-fixed/` by default.
+
 21 tests over the real shards, skipping cleanly if the data is absent. They target the
 silent failure modes rather than crashes: unshifted PPU coordinates, aux targets
 regressed on frames where the goal is off-screen (59% of `traverse` frames), padding

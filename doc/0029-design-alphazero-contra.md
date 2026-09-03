@@ -1,175 +1,144 @@
-# Adapt AlphaZero's search-improvement loop to Contra
+# Train one Contra policy-value network through emulator MCTS
 
 Status: Proposed
 
-**Question.** How does AlphaZero turn a policy, value estimate, exact game rules, and
-search into a stronger agent, and which parts transfer to Contra's fixed-start Laser boss
-fight? Can the existing Monte Carlo search become the first planner by replacing its
-history-free rollout prior with the learned policy?
+**Question.** How should Contra combine the existing CNN/GPT policy, exact emulator
+search, the `mc_search` reward, and decoded game state into one iterative policy
+improvement system?
 
-**Answer.** Treat the NES emulator as the exact dynamics model and the current causal
-policy network as the search guide. Proceed directly to the persistent PUCT tree
-specified by [0030](0030-design-ppo-guided-mcts.md): the PPO policy already supplies a useful
-closed-loop prior, so a separate bigram-versus-policy rollout gate would not answer the
-remaining question. PPO supplies priors and terminal rollout actions; root visit counts
-supervise the next policy. Contra has no opponent or useful self-play symmetry, so training is repeated
-single-agent policy improvement from a controlled task-state distribution.
+**Answer.** Keep the CNN image encoder and causal GPT backbone, and train one network
+with policy, value, `dx`/`dy`, weapon, and rapid-fire heads. Every MCTS node owns an exact
+emulator savestate plus its observation history. PUCT uses the network's action
+distribution as its prior and its value prediction at newly expanded leaves. Root visit
+counts supervise the policy head; the realized `mc_search` reward-to-go supervises the
+value head; decoded emulator state supervises all auxiliary heads. Repeated search,
+episode generation, and joint network training form the policy-improvement loop.
 
 ---
 
-## AlphaZero alternates search improvement and network distillation
+## One CNN/GPT trunk emits policy, value, and game-state predictions
 
-AlphaZero's network consumes a complete game state and emits two predictions:
+The existing CNN encodes each game image and the causal GPT consumes the resulting image
+tokens in decision order. Preserve the existing action timing: one decision is one legal
+controller action held for the task's frame skip. The network consumes only information
+available to the deployed policy: image history and the existing causal context. Exact
+emulator bytes and decoded RAM labels never become network inputs.
 
-```text
-policy prior p(a | s): which legal actions deserve search effort
-state value v(s):      expected final game outcome from this state
-```
+The final hidden state feeds six outputs:
 
-For every real move, MCTS starts at the current state and repeats four operations:
+| head | target | loss | search role |
+|---|---|---|---|
+| policy | normalized MCTS root visits over legal actions | cross-entropy | PUCT prior |
+| value | cumulative future `mc_search` reward | regression | leaf evaluation |
+| `dx`, `dy` | player displacement since the preceding decision | normalized regression | none |
+| weapon | decoded current weapon class | categorical cross-entropy | none |
+| rapid fire | decoded current rapid-fire flag | binary cross-entropy | none |
 
-1. **Select:** descend through existing nodes using PUCT. An edge is attractive when its
-   backed-up mean value is high, its policy prior is high, or it has been visited less than
-   competing edges.
-2. **Expand:** on reaching an unexpanded state, query the network once and create legal
-   child edges with its policy probabilities as priors.
-3. **Evaluate:** use the network's value prediction at that leaf. AlphaZero does not need a
-   random rollout to the end of the game for every simulation.
-4. **Back up:** propagate the leaf value through every selected edge, updating visit count,
-   cumulative value, and mean value.
+The state heads are jointly trained auxiliary outputs, not a separate stage. They force
+the shared representation to retain motion and equipment information useful to policy
+and value prediction. Search does not use their predictions because the emulator already
+provides exact transitions and labels. Auxiliary loss weights must be declared before a
+run and kept small enough that policy and value validation do not regress.
 
-After a fixed simulation budget, the root visit-count distribution is the search-improved
-policy. Early in training, sampling from it and adding root Dirichlet noise preserves
-exploration; evaluation play can choose its most-visited action. A complete game stores one
-record per decision:
+The existing GPT-policy checkpoint initializes the CNN, GPT, and action head. The value,
+`dx`/`dy`, weapon, and rapid-fire heads are newly and randomly initialized; no PPO critic
+or previous auxiliary-head weights are loaded. Record the initialization seed. The value
+head is therefore unreliable until the bootstrap phase has fitted completed episodes.
 
-```text
-(state, root visit-count distribution, final outcome)
-```
+## Every search node restores an exact emulator and causal policy state
 
-The network is then trained to imitate the visit-count distribution and predict the final
-outcome. Search therefore improves the network's targets, and the improved network makes
-later search cheaper and stronger. This is policy iteration through planning and
-distillation, not PPO: there is no likelihood ratio, GAE target, or clipped policy update.
-
-## The emulator is Contra's exact model but the state is not the raw frame
-
-AlphaZero is often called model-based because search applies known game rules to generate
-successor states. Contra already has the stronger equivalent of a learned world model: an
-emulator savestate can be cloned and advanced exactly. Predicting future RGB frames would
-add approximation error without removing the need to model RAM, collision, timing, and
-hidden game state.
-
-The policy does not observe the full emulator state, however. It acts from a causal history
-of images and previous actions. A Contra search node must therefore contain both:
+A tree node contains:
 
 ```text
-exact planning state: emulator savestate
-policy state:         causal observation/action history (or an equivalent cache)
+emulator savestate
+current resized image and decoded RAM state
+causal image/action history or an equivalent GPT cache
+previous action, decision count, and terminal status
+per-action immediate reward, prior, visit count, value sum, and child reference
 ```
 
-Every speculative edge advances both states. Sibling branches must clone the policy context
-so one branch cannot leak observations into another. Two emulator savestates that look alike
-are not safely mergeable unless their policy histories are also equivalent. This makes
-Contra a partially observed planning problem from the network's perspective, even though
-the emulator transition itself is deterministic.
+The savestate is the authoritative state for branch restoration and advancement. Decoded
+RAM supplies legal-action masks, terminal/reward observations, and auxiliary labels.
+Neither is a learned world model. Sibling branches must restore their own savestate and
+causal context; observations generated on one branch cannot enter another.
 
-## Contra replaces self-play with fixed-task policy improvement
+The complete savestate stays in the live tree but need not enter the training dataset.
+Each saved sample contains the policy observation/history, legal mask, visit target,
+reward-to-go, decoded auxiliary targets, task identity, and decision index. A state
+hash may be retained for replay auditing. All label decoders must be versioned and tested
+against representative airborne, grounded, weapon, and rapid-fire states.
 
-Go, chess, and shogi have two alternating players, a compact legal-action boundary, and a
-natural terminal outcome from the current player's perspective. Contra has one learning
-agent, fixed enemies, simultaneous real-time dynamics, frame-skipped controller inputs, and
-long delayed consequences. There is no opponent network to self-play against.
+## PUCT turns network priors and leaf values into policy targets
 
-The corresponding loop is:
+At every real decision, MCTS runs a fixed number of simulations. Each simulation selects
+edges using backed-up mean value plus prior-weighted exploration, restores and advances
+the emulator, records that transition's exact `mc_search` reward, and expands at most one
+new leaf. A non-terminal leaf is evaluated once by the network. Backup adds each selected
+edge's immediate reward to the downstream leaf value. A terminal leaf has zero future
+value after its terminal transition reward. Contra is single-player, so backup never
+changes the value sign.
+
+After the simulation budget, normalized root visits are the improved action distribution.
+Episode generation samples from that distribution during exploration and may choose its
+most-visited action during evaluation. The chosen child's subtree is retained for the
+next decision. Exploration noise, visit temperature, simulation budget, and PUCT constant
+are run configuration, not hidden defaults.
+
+Leaf value replaces full terminal rollouts after bootstrap. Generation zero must use
+complete policy rollouts from expanded leaves because the randomly initialized value head
+has no meaning. Those completed episodes train value and auxiliary heads and provide the
+first root-visit targets. Generation one then switches to learned-value leaf evaluation.
+Records must identify the evaluator generation so rollout targets and learned-value search
+are not conflated.
+
+## The value predicts `mc_search` reward-to-go under searched play
+
+For a non-terminal state, value means the expected sum of future per-decision rewards from
+that state to game end when subsequent actions follow the current MCTS-improved policy.
+The initial design is undiscounted. A training sample at decision `t` receives the sum of
+the rewards generated by decisions `t` through the terminal decision. The state after the
+terminal transition has value zero.
+
+Use the complete `mc_search` reward configuration without removing its dense or
+generation-specific terms: advancement, enemy and boss damage, item events, level
+completion, death, and per-button hold costs. Consequently value is a search-utility
+estimate, not win probability. The same reward implementation and weights must score tree
+transitions, construct training returns, and report episode return. Also report win rate
+separately so optimization of dense reward cannot be mistaken for better completion.
+
+The policy named in this definition is the root-visit distribution, not the raw network
+prior. The network learns the policy produced by the preceding search generation; the
+next generation uses that approximation to guide a stronger search.
+
+## Iterations generate episodes, train jointly, and gate promotion
+
+One iteration performs:
 
 ```text
-sample a training start state
--> run policy-guided terminal-rollout search at each decision
--> execute an action from the improved root distribution
--> finish the episode
--> train policy on root visits
--> repeat with the updated network
+sample a declared training start state
+run MCTS at each decision and store the root sample
+advance the emulator with an action from root visits
+finish the episode and compute each sample's reward-to-go
+add samples to a bounded replay buffer
+train all heads jointly on shuffled recent samples
+compare the candidate with the accepted network using fresh RNG seeds
+promote only after the candidate passes the declared gates
 ```
 
-The start-state distribution becomes part of the objective. Training only from
-`full_laser.state` optimizes that one fight, which is acceptable for the current component
-validation goal but does not establish general Contra play. Later work should use a bank of
-states spanning fight phases and player conditions. Search actions initially remain the
-existing discrete controller combinations held for the existing frame skip; macro-actions
-are deferred until the fixed action version exposes its measured branching and depth cost.
+The first loop always restores the same Laser boss savestate. This deliberately tests
+whether search generation, reward backup, replay, and joint improvement work under the
+smallest controlled state distribution; it does not test state or weapon generalization.
+Evaluation also starts from that state but uses fresh episode/search RNG seeds and no
+training exploration noise. A later design revision may introduce separate state banks
+only after this loop works.
 
-## Existing MC search is a policy-guided rollout baseline, not a tree
-
-The data repository's search samples several fixed-length action sequences, scores each
-sequence with a shaped search reward, commits a random-sized prefix of the best sequence,
-and backtracks when the best sequence dies. Its action generator is a legal-action mask plus
-a previous-action bigram prior. It keeps one committed history, not per-edge visit counts or
-backed-up action values. Consequently it is greedy receding-horizon Monte Carlo search.
-
-The smallest possible bridge would replace only the proposal distribution:
-
-```text
-current image/action history -> policy probabilities
-policy probabilities * legal-action mask -> sampled rollout action
-emulator + existing search reward -> rollout score
-```
-
-Always taking the policy argmax would make candidate sequences collapse to the same path.
-The baseline must sample at a declared temperature and retain explicit exploration. Compare
-the existing bigram generator and policy-guided generator with identical start states,
-rollouts per decision, horizon, seeds, emulator-step budget, and reward configuration. The
-gate is more wins found per emulator step and per wall-clock hour, not merely a higher shaped
-score. Neural inference cost and batched branch evaluation must be reported separately.
-
-That bridge is no longer a prerequisite: PPO already reaches 59/100 in independent
-closed-loop evaluation, and the next unknown is whether persistent tree search improves its
-decisions. It remains a useful debugging baseline if PUCT fails. Such a baseline may reuse
-the search reward because its purpose is efficient trace discovery.
-That reward includes progress, damage, death, items, and button cleanliness, so its score is
-not a probability of eventually winning. It must not silently become the critic target.
-
-## PUCT search uses policy priors, backed-up values, and visit targets
-
-Contra should now implement the persistent tree directly, as specified by
-[0030](0030-design-ppo-guided-mcts.md). Each node owns legal edges; each edge stores the policy
-prior, visit count, cumulative
-value, and mean value. Selection uses a PUCT score conceptually equivalent to:
-
-```text
-selection score = backed-up mean value
-                + exploration constant * policy prior
-                  * sqrt(parent visits) / (1 + edge visits)
-```
-
-The policy concentrates simulations on plausible controller inputs while the visit term
-still tests uncertain alternatives. In the first implementation, the PPO policy samples a
-rollout from each new leaf to a real terminal result. A win backs up `1`; death or timeout
-backs up `0`. No critic or shaped immediate reward enters search. Because Contra is
-single-agent, values keep the same sign at every depth—there is no alternating opponent
-perspective as in board-game AlphaZero.
-
-The initial tree should advance one current action per edge and reuse the chosen child's
-subtree at the next real decision. Search output is the normalized root visit counts, not
-the single best sampled sequence. Distillation trains the action head against those soft
-targets. Critic and PPO losses are excluded from this first experiment so any gain can be
-attributed to terminal-rollout planning targets.
-
-## Search validity is gated before policy retraining
-
-Search can consume too much emulator time or overfit noisy rollout results while appearing
-to improve its internal score. Evaluation therefore uses these gates:
-
-| gate | comparison | pass condition |
-|---|---|---|
-| leaf evaluation | PPO terminal rollouts | backups are binary terminal outcomes and throughput is affordable |
-| tree improvement | raw policy versus PUCT-selected actions | matched closed-loop win rate improves before any distillation |
-
-Only then should searched root distributions become training labels. A held-out state bank
-must measure whether distillation reproduces search choices and whether the distilled policy
-improves without online search. The planner is unsuccessful if gains require reward-specific
-behavior that lowers actual wins, if inference removes the emulator-step saving, or if tree
-search cannot look far enough to distinguish actions within the available budget.
+Required gates are deterministic state restoration, correct masking and visit backup,
+auxiliary accuracy above constant baselines, value fit against realized reward-to-go,
+policy imitation of search visits, and improvement in both closed-loop return and reported
+win rate over the accepted network. Report both emulator decisions and wall-clock time.
+Tree reuse, cached image
+tokens, per-node GPT caches, and batched leaf evaluation are permitted optimizations only
+when they preserve search results within declared numerical tolerance.
 
 ---
 
@@ -177,8 +146,8 @@ search cannot look far enough to distinguish actions within the available budget
 
 | claim | source |
 |---|---|
-| AlphaZero uses one policy/value network, PUCT MCTS, root visit targets, and terminal outcome targets | [Silver et al., *Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm*](https://arxiv.org/abs/1712.01815) |
-| AlphaGo Zero expands leaves with policy priors, evaluates them with value, and backs values through search | [Silver et al., *Mastering the game of Go without human knowledge*](https://www.nature.com/articles/nature24270) |
-| current search samples prior-guided masked rollouts and greedily selects the highest reward | `contra_nes_data/src/agent/sampler.py`; `contra_nes_data/src/agent/mc_search.py` |
-| search reward contains progress, combat, items, terminal events, and button costs | `contra_nes_data/src/agent/reward.py` |
-| current policy critic predicts binary success and PPO u158 reaches 59/100 | [0027](0027-design-ppo-critic.md); [0028](0028-exp-laser-ppo-critic.md) |
+| current policy uses a CNN image encoder and causal GPT with action and grounding outputs | `src/contra_policy/model.py`; [0002](0002-design-gpt-policy.md) |
+| current MCTS nodes already retain emulator bytes, RAM state, and per-edge PUCT statistics | `src/contra_policy/mcts/core.py` |
+| emulator branches restore savestates and advance one frame-skipped action | `src/contra_policy/mcts/laser.py` |
+| current reward and terminal classification are implemented by the rollout stack | `src/contra_policy/rl/rollout.py`; [0005](0005-design-graded-reward.md) |
+| policy/value networks, PUCT, root visits, and final outcomes form AlphaZero's loop | Silver et al., *Mastering Chess and Shogi by Self-Play with a General Reinforcement Learning Algorithm*, arXiv:1712.01815 |
