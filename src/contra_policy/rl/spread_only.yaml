@@ -1,0 +1,48 @@
+# doc/0012 — prove GRPO can move boss at all: binary reward, Spread + rapid only.
+#
+#   python -m contra_policy.rl.trainer --config-name spread_only \
+#     init_from=<base>/checkpoints/policy-final.pt
+#
+# Overrides config_grpo.yaml. Two departures from the 0011 boss-only run, and nothing else
+# moves: the graded reward is **off**, and the pool is restricted to the weapon where a win
+# is reachable. Regular and Flamethrower scored 0 wins in 316 held-out rollouts.
+defaults:
+  - config_grpo
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/grpo/${now:%Y-%m-%d}/spread-${now:%H-%M-%S}
+
+families: [boss]
+# 120 of the 466 published boss train tasks. Asserted at startup, not trusted: a filter
+# that silently kept a different pool would read as a successful run on an easier set.
+task_filter: {weapon: [Spread], rapid: true}
+expected_tasks: 120
+
+sampling:
+  family_multiplier: {boss: 1.0}
+
+reward:
+  # Binary. At Spread's ~17% success only 22.5% of groups are degenerate at G=8 (against
+  # 61% on the pooled boss mix), and that *falls* as the policy improves — win density
+  # supplies the variance doc/0005 introduced shaping to supply. Grading is off because
+  # 0011 showed it produces chip-without-kill and hides hopeless tasks from the difficulty
+  # sampler, which keys on the group variance grading manufactures.
+  progress_coef: 0.0
+
+probe:
+  every: 10
+  tasks_per_family: 120         # the whole filtered train pool; it is small enough
+
+train:
+  # A fixed update budget, matched to the runs that worked. The control
+  # `2026-08-03/09-23-22` moved boss 3.5% -> 10.5% in exactly 100 updates and ended at
+  # kl_ref ~0.030; 0011's collapse happened far past that, at 1,619 updates and 0.245.
+  # 100 updates here carries ~2x the control's per-update boss gradient (100% boss share
+  # vs 50%), so if the effect exists it is visible inside this budget. ~22 s/update ⇒
+  # ~40 min, which is cheap enough to repeat across seeds.
+  updates: 100
+  max_hours: 1.0                # backstop only; the update count is the budget
+  max_kl_ref: 0.10              # the drift bound 0011 lacked
+  save_every: 25

@@ -1,187 +1,157 @@
-"""One token per frame, one token per goal, and the grounding head that keeps them honest.
+"""One token per image — the same function for an agent frame and for a goal frame.
 
-    encode_goal(goal_image, goal_mask)   -> (B, hiddim)                once per episode
-    encode_frame(frame, goal_token)      -> (B, hiddim), (B, C, A, A)  once per decision
+    encode(image) -> token                       (B, hiddim)
+    forward(image) -> token, entity_heatmap, [reconstruction]
 
-The frame encoder stays **goal-conditioned**, and that is not an oversight. A per-frame
-heatmap answers "where is *the goal entity* in this frame", which is unanswerable
-without the goal. What gets cheaper versus ``CrossViewContraRocket.encode_view_tokens``
-is not that the goal leaves per-frame work — it is that conditioning happens against
-**one token** (FiLM over channels) instead of spatial cross-attention over the goal's
-whole ``minres x minres`` patch grid, and that the result is one token instead of four.
+**The encoder does not know what the goal is, and that is the design** (see
+``doc/0002-symmetric-encoder.md``). It answers "what is in this image and where",
+never "where is the target". Goal matching belongs to the policy's temporal
+attention, which compares a frame token against a goal token — a strictly stronger
+mechanism than the FiLM channel modulation this replaced, and the place
+``contra_policy.model`` already computes goal grounding.
 
-Conditioning is FiLM rather than concatenation because it is O(channels) per frame and
-leaves the spatial resolution untouched, which the heatmap still needs.
+That symmetry is possible because ``goal.png`` needs no special handling: it is a real
+episode frame with the target painted into the RGB as a saturated orange blob (sampled
+at the goal points: (225, 110, 18) against an image mean of (56, 70, 14)). An image
+with the answer drawn on it is still just an image.
 
-The conv trunk is ``contra_policy.encoder.ConvEncoder``, reused unchanged so an existing
-``ae_pretrained.pt`` can still initialise it. Unlike the policy's use of it, the trunk
-here is **trainable by default** — the point of this package is to train the encoder,
-and with a frozen trunk the grounding loss would only ever reach the projection layers.
+Deleting the goal-specific path removed the mask trunk, a second projection and the
+conditioning layer — 3.65M parameters that existed only to answer a question the policy
+answers better.
+
+Supervision is occupancy, decoded **from the token**, never from the conv map: that is
+what forces spatial structure through the 512-d bottleneck rather than letting it live
+in the feature map the head could read directly.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, field
-from typing import Dict, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 
-from contra_encoder.heads import HeatmapHead, heatmap_readout
+from contra_encoder.heads import HeatmapHead, ReconstructionHead
 from contra_encoder.heads import _norm as _gn
-from contra_policy.encoder import ConvEncoder, build_view_backbone
-from contra_policy.goal import NUM_INTERACTIONS
+from contra_policy.encoder import build_view_backbone
 
 
 @dataclass
 class EncoderConfig:
-    """Everything that changes the parameter shapes, so a checkpoint can rebuild itself."""
+    """Everything that changes parameter shapes, so a checkpoint can rebuild itself."""
 
     image_size: int = 256
-    hiddim: int = 512            # token width; matches the policy's `hiddim`
+    hiddim: int = 512            # token width; must equal the policy's `hiddim`
     depth: int = 32              # ConvEncoder base width
     minres: int = 4              # conv trunk output grid
-    mask_depth: int = 8          # goal-mask trunk base width; its input is a blob map
-    # Channels after the 1x1 reduction, before flattening to a token. The trunk emits
-    # 1024 channels on a 4x4 grid at 256px, and `Linear(1024*16, 512)` alone is 8.4M
-    # parameters — more than the trunk that feeds it. Reducing channels first makes the
-    # projection 2.1M and costs 0.26M, while leaving the 4x4 layout intact for the
-    # heatmap head to invert.
+    # Channels after the 1x1 reduction, before flattening to a token. Flattening
+    # 1024x4x4 straight into a Linear is 8.4M parameters — more than the trunk feeding
+    # it; reducing first costs 0.26M and makes the projection 2.4M.
     proj_ch: int = 256
-    aux_size: int = 32           # heatmap grid, A
+    aux_size: int = 32           # occupancy grid, A
     head_depth: int = 32         # HeatmapHead base width
-    n_classes: int = 1           # channels of the *goal* head; 1 is the policy's contract
-    # Channels of a second, goal-independent head supervised by the shards' per-class
-    # entity occupancy: player, player_bullets, enemies, enemy_bullets. 0 = off.
-    #
-    # A separate head rather than extra channels on the goal head, because the two
-    # answer different questions: the goal head is conditioned on *which* entity is the
-    # target and feeds the pinned `point_err_px` gate, while entity occupancy is a
-    # property of the frame alone. Sharing a head would entangle the gate metric with a
-    # signal that has nothing to do with the task.
-    entity_classes: int = 0
+    # player / player_bullets / enemies / enemy_bullets. 0 disables the head.
+    entity_classes: int = 4
+    # Reconstruction is an open question, not a default — see 0002 §4. A full
+    # ConvDecoder at this config is 27.97M parameters, larger than everything else
+    # combined, and the precedent only shows that a recon-*only* encoder goes
+    # entity-blind, not that recon helps once an entity head exists. Settle by ablation.
+    reconstruct: bool = False
+    recon_depth: int = 16
     view_backbone_ckpt: Optional[str] = None
-    freeze_view_backbone: bool = False   # a rebuild trains the trunk; see module docstring
+    freeze_view_backbone: bool = False   # a rebuild trains the trunk
+    # Non-null only for the accepted 0019 native-resolution temporal encoder.
+    input_height: Optional[int] = None
+    input_width: Optional[int] = None
+    n_layers: Optional[int] = None
+    input_kind: str = "rgb"
+    first_frame_delta: Optional[str] = None
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
 
 class ContraFrameEncoder(nn.Module):
-    """Frame + goal → one token per frame, plus occupancy logits decoded from that token."""
+    """Image → one token, with occupancy (and optionally pixels) decoded back out."""
 
     def __init__(self, cfg: EncoderConfig):
         super().__init__()
         self.cfg = cfg
-        s, h = cfg.image_size, cfg.hiddim
-
-        # -- trunks ---------------------------------------------------------
-        # ONE RGB trunk, shared between the agent frame and the goal frame, exactly as
-        # `CrossViewContraRocket` shares `view_backbone` between obs and cross-view.
-        # Both inputs are Contra screens, so the features transfer and a second trunk
-        # would be 11.2M duplicated parameters learning the same thing from less data.
-        self.view_backbone = build_view_backbone(
-            size=s, depth=cfg.depth, minres=cfg.minres,
-            pretrained_path=cfg.view_backbone_ckpt,
-            freeze=cfg.freeze_view_backbone)
-        self.mask_backbone = ConvEncoder(size=s, in_ch=1, depth=cfg.mask_depth,
-                                         minres=cfg.minres, with_head=False)
-
+        s, h, pc = cfg.image_size, cfg.hiddim, cfg.proj_ch
+        temporal = cfg.input_kind == "rgb_signed_frame_difference"
+        if temporal:
+            if not cfg.input_height or not cfg.input_width or not cfg.n_layers:
+                raise ValueError("temporal encoder requires input height, width, and layers")
+            self.view_backbone = _TemporalBackbone(
+                height=cfg.input_height, width=cfg.input_width,
+                depth=cfg.depth, n_layers=cfg.n_layers)
+        else:
+            self.view_backbone = build_view_backbone(
+                size=s, depth=cfg.depth, minres=cfg.minres,
+                pretrained_path=cfg.view_backbone_ckpt,
+                freeze=cfg.freeze_view_backbone)
         view_ch = self.view_backbone.conv_out_ch
-        goal_ch = view_ch + self.mask_backbone.conv_out_ch
-        cells = cfg.minres * cfg.minres
-        pc = cfg.proj_ch
+        cells = (self.view_backbone.output_hw[0] * self.view_backbone.output_hw[1]
+                 if temporal else cfg.minres * cfg.minres)
 
-        # -- 1x1 channel reduction, before any flattening -------------------
-        self.frame_reduce = nn.Sequential(nn.Conv2d(view_ch, pc, 1), _gn(pc), nn.SiLU())
-        self.goal_reduce = nn.Sequential(nn.Conv2d(goal_ch, pc, 1), _gn(pc), nn.SiLU())
-
-        # -- goal token -----------------------------------------------------
-        self.goal_proj = nn.Sequential(
-            nn.Linear(pc * cells, h), nn.LayerNorm(h), nn.SiLU(), nn.Linear(h, h))
-        self.interaction = nn.Embedding(NUM_INTERACTIONS + 1, h)   # +1 for "no goal" (id -1)
-
-        # -- FiLM conditioning, applied to the *reduced* frame map -----------
-        # Zero-init so conditioning starts as identity (gamma=0 → scale 1, beta=0) and
-        # the trunk trains from a clean signal on step 0 instead of through noise.
-        self.film = nn.Linear(h, 2 * pc)
-        nn.init.zeros_(self.film.weight)
-        nn.init.zeros_(self.film.bias)
-
-        # -- frame token ----------------------------------------------------
-        self.frame_proj = nn.Sequential(
+        self.reduce = nn.Sequential(nn.Conv2d(view_ch, pc, 1), _gn(pc), nn.SiLU())
+        self.proj = nn.Sequential(
             nn.Linear(pc * cells, h), nn.LayerNorm(h), nn.SiLU(), nn.Linear(h, h))
         self.token_ln = nn.LayerNorm(h)
 
-        # -- grounding, decoded from the token ------------------------------
-        self.heatmap_head = HeatmapHead(dim=h, grid=cfg.aux_size,
-                                        n_classes=cfg.n_classes, depth=cfg.head_depth)
-        # Both heads read the same token, which is the point: the entity target's job is
-        # to force sprite-level structure into that one vector, where the goal head
-        # alone only ever demands one blob's worth.
         self.entity_head = (HeatmapHead(dim=h, grid=cfg.aux_size,
                                         n_classes=cfg.entity_classes,
                                         depth=cfg.head_depth)
                             if cfg.entity_classes > 0 else None)
+        self.recon_head = (ReconstructionHead(dim=h, size=s, depth=cfg.recon_depth,
+                                              base=cfg.minres)
+                           if cfg.reconstruct else None)
 
-    # -- goal ---------------------------------------------------------------
+    # -- the one operation -------------------------------------------------
 
-    def encode_goal(self, goal_image: torch.Tensor, goal_mask: torch.Tensor,
-                    interaction: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """``(B, S, S, 3)`` uint8 goal frame + ``(B, S, S)`` uint8 blob → ``(B, hiddim)``.
+    def encode(self, image: torch.Tensor) -> torch.Tensor:
+        """``(B, S, S, 3)`` uint8 → ``(B, hiddim)``. Agent frame or goal frame alike."""
+        if self.cfg.input_kind == "rgb_signed_frame_difference":
+            return self.encode_pair(image, image)
+        x = image.permute(0, 3, 1, 2).float() / 255.0
+        z = self.reduce(self.view_backbone.forward_features(x))     # (B, pc, m, m)
+        return self.token_ln(self.proj(z.flatten(1)))
 
-        ``interaction`` is optional: when given, its embedding is added, which is how
-        the single goal token carries "kill / pick / avoid / traverse / boss" as well as
-        the pixels. The policy keeps a separate interaction token in the sequence; this
-        one exists so the *encoder's* conditioning knows the task type too.
+    def encode_pair(self, current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+        """Encode a current/previous pair for the 0019 temporal checkpoint."""
+        if self.cfg.input_kind != "rgb_signed_frame_difference":
+            raise ValueError("encode_pair is available only on a temporal encoder")
+        expected = (int(self.cfg.input_height), int(self.cfg.input_width), 3)
+        if (current.dtype != torch.uint8 or previous.dtype != torch.uint8 or
+                current.shape != previous.shape or tuple(current.shape[1:]) != expected):
+            raise ValueError(f"temporal inputs must be equal uint8 B{expected}")
+        cur = current.permute(0, 3, 1, 2).float().div(255)
+        prev = previous.permute(0, 3, 1, 2).float().div(255)
+        z = self.reduce(self.view_backbone.forward_features(
+            torch.cat((cur, cur - prev), dim=1)))
+        return self.token_ln(self.proj(z.flatten(1)))
+
+    def encode_sequence(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode one episode sequence, assigning zero delta to its first frame."""
+        if len(images) == 0:
+            return torch.empty((0, self.cfg.hiddim), device=images.device)
+        return self.encode_pair(images, torch.cat((images[:1], images[:-1]), dim=0))
+
+    def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Token plus whatever heads are enabled.
+
+        ``entity_heatmap`` is ``(B, C, A, A)`` logits; ``reconstruction`` is
+        ``(B, S, S, 3)`` in [0, 1], matching the input's layout so a caller can compare
+        it to ``image / 255`` without transposing.
         """
-        img = goal_image.permute(0, 3, 1, 2).float() / 255.0
-        msk = goal_mask.unsqueeze(1).float() / 255.0
-        z = torch.cat([self.view_backbone.forward_features(img),
-                       self.mask_backbone.forward_features(msk)], dim=1)
-        tok = self.goal_proj(self.goal_reduce(z).flatten(1))
-        if interaction is not None:
-            tok = tok + self.interaction(interaction + 1)
-        return tok
-
-    # -- frame --------------------------------------------------------------
-
-    def encode_frame(self, frame: torch.Tensor, goal_token: torch.Tensor
-                     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """``(B, S, S, 3)`` uint8 frame + ``(B, hiddim)`` goal → ``(token, heat)``.
-
-        ``heat`` is ``(B, n_classes, A, A)`` logits, decoded from ``token`` — so the
-        token is the only path the grounding gradient has, which is what forces spatial
-        structure to survive the compression.
-        """
-        x = frame.permute(0, 3, 1, 2).float() / 255.0
-        z = self.frame_reduce(self.view_backbone.forward_features(x))   # (B, pc, m, m)
-        gamma, beta = self.film(goal_token).chunk(2, dim=-1)
-        z = z * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
-        token = self.token_ln(self.frame_proj(z.flatten(1)))
-        return token, self.heatmap_head(token)
-
-    # -- convenience --------------------------------------------------------
-
-    def forward(self, frame: torch.Tensor, goal_image: torch.Tensor,
-                goal_mask: torch.Tensor,
-                interaction: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """One-shot path for pretraining and for tests.
-
-        Returns the keys the policy's loss modules already expect — ``goal_heatmap``,
-        ``point``, ``exist`` — so ``GoalHeatmapLoss`` can score this encoder unchanged.
-        ``goal_heatmap`` drops the class axis when ``n_classes == 1``, matching the
-        policy's ``(B, A, A)`` contract; multi-class keeps it.
-        """
-        goal_token = self.encode_goal(goal_image, goal_mask, interaction)
-        token, heat = self.encode_frame(frame, goal_token)
-        single = heat[:, 0] if self.cfg.n_classes == 1 else heat
-        point, exist = heatmap_readout(heat[:, 0])
-        out = {"token": token, "goal_token": goal_token,
-               "goal_heatmap": single, "point": point, "exist": exist}
+        token = self.encode(image)
+        out = {"token": token}
         if self.entity_head is not None:
             out["entity_heatmap"] = self.entity_head(token)
+        if self.recon_head is not None:
+            out["reconstruction"] = self.recon_head(token).permute(0, 2, 3, 1)
         return out
 
     # -- persistence --------------------------------------------------------
@@ -207,7 +177,7 @@ def load_pretrained_encoder(path: str, freeze: bool = False,
     """Rebuild an encoder from its own checkpoint.
 
     The architecture comes out of the file, never from a caller's config — a mismatch
-    there loads silently wrong weights, which is the failure mode
+    there loads silently wrong weights, which is the failure
     ``contra_policy.encoder.load_pretrained_view_backbone`` documents and avoids the
     same way.
     """
@@ -220,3 +190,23 @@ def load_pretrained_encoder(path: str, freeze: bool = False,
             p.requires_grad = False
         enc.eval()
     return enc
+
+
+class _TemporalBackbone(nn.Module):
+    """Rectangular six-channel backbone matching data experiment 0019."""
+
+    def __init__(self, *, height: int, width: int, depth: int, n_layers: int):
+        super().__init__()
+        layers = []
+        channels = 6
+        for index in range(n_layers):
+            out = depth * 2 ** index
+            layers += [nn.Conv2d(channels, out, 4, stride=2, padding=1),
+                       _gn(out), nn.SiLU()]
+            channels = out
+        self.convs = nn.Sequential(*layers)
+        self.conv_out_ch = channels
+        self.output_hw = (height // 2 ** n_layers, width // 2 ** n_layers)
+
+    def forward_features(self, image: torch.Tensor) -> torch.Tensor:
+        return self.convs(image)

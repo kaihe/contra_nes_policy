@@ -1,0 +1,12 @@
+# doc/0021: D20k/C20k Laser-only ladder at LR 1e-4. Laser has 70 shards; its first
+# 36 yield 19,496 training episodes after the stable full-store holdout is removed.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser20k/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  shard_count: 36

@@ -1,0 +1,12 @@
+# doc/0021: full-store D40k/C20k Laser-only tier at LR 1e-4. A null prefix keeps
+# all 70 shards, yielding 38,007 training episodes after the stable holdout is removed.
+defaults:
+  - config_bc_laser
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/laser40k/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  shard_count: null

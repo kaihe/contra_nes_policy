@@ -1,22 +1,33 @@
-# Design docs — `contra_nes_policy`
+# Policy documents
 
-Conventions in the `contra-nes-workflow` skill. In short: `NNNN-topic.md`, sequential
-and never dated, every doc carries a `Status:` header, and this index is the first
-thing to read. A doc whose status is stale is worse than no doc.
-
-Requests to another repo are **issues on that repo**, not docs here — see the
-`contra-nes-handoff` skill.
-
-| doc | status | what it decides |
-|---|---|---|
-| [0001 One token per frame: the image encoder](0001-image-encoder.md) | Implemented — §2 superseded by 0002 | `src/contra_encoder/`, one 512-d token per frame with occupancy decoded from it; `prev_action` deleted; the gate is `peak_hit`/`pck16`, **not** `point_err_px`; SB3 and an LLM backbone rejected |
-| [0002 A goal-agnostic encoder](0002-symmetric-encoder.md) | Proposed | one symmetric `encode(image)` for frames and goals alike; goal matching moves to the policy's attention; 3.65M of goal-specific machinery deleted; reconstruction behind an ablation |
-
-## Open questions not yet in a doc
-
-- **`rollout.batch_size`.** Measured +23% end-to-end going 16 → 64 (collect throughput
-  205 → 305 decisions/s, GPU 2.86 → 1.73 ms/decision), for one config line. Needs
-  `rollout.steps` re-tuned for the larger overshoot, and host RAM checked at batch 64.
-- **The optimiser phase.** 41.7% of a training update and never profiled.
-  `recompute_old_logprobs` and `ppo_epochs: 2` are each a full forward pass, and
-  `minibatch_episodes: 4` at `seq_len: 32` peaked at 2.6 GB of a 16 GB card.
+- [0001 Image-token compression](0001-exp-image-encoder.md) — Recorded — image encoder experiment
+- [0002 GPT policy](0002-design-gpt-policy.md) — Implemented — causal whole-episode policy
+- [0003 GRPO code layout](0003-design-grpo-code-layout.md) — Implemented — rollout-centred GRPO stack
+- [0004 GRPO](0004-exp-grpo.md) — Pending — initial GRPO experiment
+- [0005 Graded reward](0005-design-graded-reward.md) — Accepted — boss-damage failure credit
+- [0006 Action-only base policy](0006-design-action-only-base-policy.md) — Implemented — action cross-entropy objective
+- [0007 Compiled variable-length training](0007-exp-compiled-varlen-training.md) — Recorded — throughput experiment
+- [0008 Fourteen-hour GRPO](0008-exp-fourteen-hour-grpo.md) — Superseded by 0011 — long-run GRPO
+- [0009 Boss-data scaling](0009-exp-boss-data-scaling.md) — Recorded — boss-data scale experiment
+- [0010 Dropout regularization](0010-exp-dropout-regularization.md) — Recorded — regularization experiment
+- [0011 Boss-only GRPO](0011-exp-boss-grpo.md) — Recorded — graded boss feasibility run
+- [0012 Spread GRPO](0012-exp-spread-grpo.md) — Proposed — binary Spread/rapid boss GRPO
+- [0013 Model scaling](0013-exp-scaling-model.md) — Recorded — GPT size ladder
+- [0014 Compute scaling](0014-exp-scaling-compute.md) — Recorded — fixed-data compute ladder
+- [0015 Data scaling](0015-exp-scaling-data.md) — Recorded — fixed-compute data ladder
+- [0016 Joint scaling](0016-exp-scaling-joint.md) — Recorded — joint data and compute scaling
+- [0017 Mixed-weapon scaling](0017-exp-scaling-mixed-weapon.md) — Pending — second-weapon experiment
+- [0018 Learning rate](0018-exp-learning-rate.md) — Recorded — large-model learning-rate experiment
+- [0019 Training throughput](0019-exp-training-throughput.md) — Recorded — batch and worker benchmark
+- [0020 Laser model scaling](0020-exp-laser-model-scaling.md) — Recorded — Laser model-size ladder
+- [0021 Laser data scaling](0021-exp-laser-data-scaling.md) — Recorded — Laser data-size experiment
+- [0022 Mixed Spread/Laser](0022-exp-mixed-spread-laser.md) — Pending — mixed-weapon retention experiment
+- [0023 Frame-difference Laser policy](0023-exp-frame-difference-laser-policy.md) — Pending — temporal visual-token experiment
+- [0024 Laser projection adaptation](0024-exp-unfrozen-laser-encoder.md) — Recorded — frozen versus adapted projection
+- [0025 Laser projection GRPO](0025-exp-laser-projection-grpo.md) — GRPO works, then regresses — 25% to 49% at u25, 40% final
+- [0026 Iterative Laser GRPO](0026-exp-iterative-laser-grpo.md) — No improvement — stage two does not beat the 49% reference
+- [0027 PPO critic](0027-design-ppo-critic.md) — Implemented — binary-return value head and GAE
+- [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — PPO progresses — inspect the value head before scaling
+- [0029 AlphaZero for Contra](0029-design-alphazero-contra.md) — Proposed — joint policy-value and game-state heads trained from emulator MCTS
+- [0030 Terminal success and progress heads](0030-design-terminal-value-progress-heads.md) — Implemented — calibrated success value with separately supervised game progress
+- [0031 AlphaZero compute scaling](0031-exp-alphazero-compute-scale.md) — Pending — one-to-two-hour search and distillation scale-up

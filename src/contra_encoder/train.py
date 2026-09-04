@@ -8,17 +8,16 @@ as the four view tokens it replaces.
     python -m contra_encoder.train
     python -m contra_encoder.train train.steps=500 loader.num_workers=0   # smoke
 
-**The gate is `peak_hit` and `pck16` per family, plus entity `dice` — not
-``point_err_px``.** That was the original gate and it was wrong: ``points_to_target``
-collapses a frame's goal centroids to their mean, and boss goals have 4.57 components
-spread ~34 px on 98.7% of frames, so the target names an empty spot and the error
-*grows* as a predictor sharpens. Measured: boss went 2.6 px to 8.8 px across one run
-while ``peak_hit`` reached 0.999 and the three single-centroid families improved 7-19x.
+**The gate is per-class entity `dice`, split by family**, against 0001's baseline
+(`enemies` 0.96, `enemy_bullets` 0.91). Goal grounding is *not* measured here: since
+0002 the encoder is goal-agnostic and goal matching belongs to the policy's attention,
+so `point_err_px` and `peak_hit` only become measurable again at stage B. That is a
+deliberate loss of diagnostic power, recorded in 0002 §3.
 
-``point_err_px`` is still reported — it is the evaluator's pinned statistic — but only
-over ``n_goal_points == 1`` frames, with ``multi_goal_frac`` saying how much was
-dropped. Do **not** gate on ``exist_acc`` either: the goal is visible on 100.0% of kill
-and boss val frames, so a constant predictor scores 100%.
+Both image kinds are trained: agent frames and the episode's goal frame, which is a
+real frame with the target painted on it. `goal_frame_idx` gives its index, so it
+carries the same 4-class entity target as any other frame — the encoder sees the
+orange-marker distribution rather than meeting it first at stage B.
 
 ``[val]`` lines are what decides whether stage B is worth starting.
 
@@ -44,7 +43,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from contra_encoder.data import FAMILIES, build_datamodule, flatten_window
 from contra_encoder.net import EncoderConfig, build_encoder
-from contra_policy.loss import GoalHeatmapLoss, point_err_px
 
 
 # ── metric plumbing ───────────────────────────────────────────────────────────
@@ -74,84 +72,6 @@ class CSVLogger:
             return list(csv.DictReader(fh))
 
 
-#: Screen-pixel radii for PCK. 8 px is roughly one NES sprite — "found the thing";
-#: 16 px is "in the right neighbourhood".
-PCK_RADII = (8.0, 16.0)
-
-
-def per_family_grounding(pred: Dict[str, torch.Tensor],
-                         batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    """Grounding quality, pooled and split by family.
-
-    Which of these to trust, and why they are not interchangeable:
-
-    ``peak_hit``          **the gate.** Does the argmax *cell* land inside a target
-                          blob. Defined for any number of goal components, so it is the
-                          one localisation number comparable across all four families.
-    ``pck16``             fraction localised within 16 screen px. Outlier-proof
-                          companion to the gate.
-    ``point_err_px``      the evaluator's pinned statistic — but **only reported over
-                          single-centroid frames**, see below. ``pck8`` likewise.
-    ``exist_acc``         **degenerate; do not gate on it.** On val the goal is visible
-                          on 100.0% of kill and 100.0% of boss frames (95.4% item,
-                          38.8% traverse), so a constant "visible" predictor scores
-                          100% on the two families that matter.
-
-    **Why point statistics exclude multi-component goals.** ``points_to_target``
-    collapses a frame's goal centroids to their *mean*. With one centroid that is the
-    thing's location. Boss goals span all live components — 4.57 per frame on average,
-    up to 7, spread ~34 px from their mean, on 98.7% of frames — so the "target point"
-    names a spot where nothing is, and error against it *grows as a predictor gets
-    sharper*: a blurry map's centre of mass sits near the cloud's centre, a confident
-    one sits on a component. That is not a hypothesis. The first trained encoder went
-    2.6 px at step 3000 to 8.8 px at step 20000 on boss while `peak_hit` reached 0.999
-    and every single-centroid family improved 7-19x.
-
-    So point statistics are masked to ``n_goal_points == 1``, which drops ~99% of boss
-    frames and none elsewhere. ``multi_goal_frac`` reports how much was excluded, so a
-    thin boss sample can never be mistaken for a good one. ``point_err_px`` itself is
-    untouched — it is a frozen interface shared with ``contra_nes_evaluation``; what
-    changed is only which frames we average it over.
-    """
-    out: Dict[str, float] = {}
-    err = point_err_px(pred["point"], batch["point"])            # (N,)
-    vis = batch["exist"] > 0
-    acc = ((pred["exist"].squeeze(-1) > 0).float() == batch["exist"]).float()
-    fam = batch["family"]
-    hit = _peak_hit(pred["goal_heatmap"], batch["goal_heatmap"])
-    # Shards written before 2026-07-31 carry no centroid count; assume single, which is
-    # what every family except boss actually is.
-    n_pts = batch.get("n_goal_points")
-    single = torch.ones_like(vis) if n_pts is None else (n_pts == 1)
-
-    def block(prefix: str, sel: torch.Tensor) -> None:
-        out[f"{prefix}exist_acc"] = float(acc[sel].mean())
-        v = sel & vis
-        if not bool(v.any()):
-            return
-        # Defined for any goal shape → the gate.
-        out[f"{prefix}peak_hit"] = float(hit[v].mean())
-        out[f"{prefix}multi_goal_frac"] = float((~single[v]).float().mean())
-        p = v & single
-        if not bool(p.any()):
-            return
-        e = err[p]
-        out[f"{prefix}point_frames"] = float(p.sum())
-        out[f"{prefix}point_err_px"] = float(e.mean())
-        out[f"{prefix}point_err_px_p50"] = float(e.median())
-        for r in PCK_RADII:
-            out[f"{prefix}pck{int(r)}"] = float((e <= r).float().mean())
-
-    block("", torch.ones_like(vis))
-    for i, name in enumerate(FAMILIES):
-        sel = fam == i
-        if not bool(sel.any()):
-            continue
-        out[f"{name}/frames"] = float(sel.sum())
-        block(f"{name}/", sel)
-    return out
-
-
 #: Channel order of the entity target, matching ``ContraCrossViewDataset.ENTITY_CLASSES``
 #: and ``env.entity.HEATMAP_CLASSES``.
 ENTITY_CLASSES = ("player", "player_bullets", "enemies", "enemy_bullets")
@@ -161,7 +81,7 @@ def entity_loss(pred: torch.Tensor, target: torch.Tensor, pos_weight: float = 10
                 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Weighted BCE over the four entity occupancy channels, plus a per-class read-out.
 
-    Same shape of objective as ``GoalHeatmapLoss`` — cell-weighted by
+    Cell-weighted by
     ``1 + pos_weight * target`` and normalised — but *not* the same module, because that
     one is tied to the ``(B, T, ...)`` masked contract and to the goal's ``point`` /
     ``exist`` readout, neither of which applies here.
@@ -274,16 +194,14 @@ class EncoderTrainer:
         n_train = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
         n_frozen = sum(p.numel() for p in self.encoder.parameters() if not p.requires_grad)
         print(f"[enc] {n_train/1e6:.1f}M trainable + {n_frozen/1e6:.1f}M frozen · "
-              f"1 token of {cfg.hiddim} per frame · heatmap {cfg.n_classes}x"
-              f"{cfg.aux_size}x{cfg.aux_size} decoded from that token", flush=True)
-        if cfg.entity_classes > 0:
-            print(f"[enc] entity head: {cfg.entity_classes} classes "
-                  f"({', '.join(ENTITY_CLASSES[:cfg.entity_classes])}) "
-                  f"@ sigma {float(args.loss.entity_sigma_px)}px, "
-                  f"weight {float(args.loss.entity_weight)}", flush=True)
-
-        self.objective = GoalHeatmapLoss(float(args.loss.heatmap_weight),
-                                         float(args.loss.pos_weight)).to(self.device)
+              f"1 token of {cfg.hiddim} per image · goal-agnostic", flush=True)
+        print(f"[enc] entity head: {cfg.entity_classes} classes "
+              f"({', '.join(ENTITY_CLASSES[:cfg.entity_classes])}) @ "
+              f"{cfg.aux_size}x{cfg.aux_size}, sigma {float(args.loss.entity_sigma_px)}px",
+              flush=True)
+        print(f"[enc] reconstruction: "
+              f"{'on, weight ' + str(float(args.loss.recon_weight)) if cfg.reconstruct else 'off (0002 §4 ablation)'}",
+              flush=True)
         self.optimizer = torch.optim.AdamW(
             [p for p in self.encoder.parameters() if p.requires_grad],
             lr=float(args.train.learning_rate),
@@ -326,29 +244,45 @@ class EncoderTrainer:
     # -- one optimisation step ---------------------------------------------
 
     def _forward(self, frames: Dict[str, torch.Tensor]):
+        """One encode over agent frames **and** goal frames, concatenated.
+
+        Goal frames go through the same function and carry the same 4-class target, so
+        they are simply more rows in the batch — which is the whole point of 0002. One
+        concatenated forward rather than two keeps the GPU batch large; the split is
+        only needed to report them separately, since a goal frame is ~1 row per window
+        against ~32 agent frames and would otherwise vanish into the mean.
+        """
+        img, goal = frames["image"], frames.get("goal_image")
+        n_frame = img.shape[0]
+        has_goal = goal is not None and "goal_entity_heatmap" in frames
+        x = torch.cat([img, goal], 0) if has_goal else img
+
         ctx = (torch.autocast("cuda", dtype=self.autocast_dtype)
                if self.autocast_dtype is not None else _null())
         with ctx:
-            out = self.encoder(frames["image"], frames["goal_image"],
-                               frames["goal_mask"], frames["interaction"])
-            # GoalHeatmapLoss works on (B, T, ...) with a mask; a frame batch is T=1
-            # with an all-ones mask. Reusing it rather than reimplementing the weighted
-            # BCE is what keeps this loss identical to the one BC optimises.
-            latents = {"goal_heatmap": out["goal_heatmap"].unsqueeze(1),
-                       "point": out["point"].unsqueeze(1),
-                       "exist": out["exist"].unsqueeze(1)}
-            target = {"goal_heatmap": frames["goal_heatmap"].unsqueeze(1),
-                      "point": frames["point"].unsqueeze(1),
-                      "exist": frames["exist"].unsqueeze(1),
-                      "mask": torch.ones_like(frames["exist"]).unsqueeze(1)}
-            loss, metrics = self.objective(latents, target)
+            out = self.encoder(x)
+            target = frames["entity_heatmap"]
+            if has_goal:
+                target = torch.cat([target, frames["goal_entity_heatmap"]], 0)
+            loss, metrics = entity_loss(
+                out["entity_heatmap"], target,
+                pos_weight=float(self.args.loss.entity_pos_weight))
 
-            if "entity_heatmap" in out and "entity_heatmap" in frames:
-                e_loss, e_metrics = entity_loss(
-                    out["entity_heatmap"], frames["entity_heatmap"],
-                    pos_weight=float(self.args.loss.entity_pos_weight))
-                loss = loss + float(self.args.loss.entity_weight) * e_loss
-                metrics.update(e_metrics)
+            if has_goal:
+                # Reported, not weighted differently: a goal frame is a frame, and its
+                # share of the loss is its share of the batch.
+                with torch.no_grad():
+                    _gl, gm = entity_loss(out["entity_heatmap"][n_frame:],
+                                          frames["goal_entity_heatmap"])
+                    metrics.update({f"goal_{k}": v for k, v in gm.items()
+                                    if k.endswith("/dice")})
+
+            if "reconstruction" in out:
+                recon = F.mse_loss(out["reconstruction"], x.float() / 255.0)
+                loss = loss + float(self.args.loss.recon_weight) * recon
+                metrics["recon_mse"] = recon.detach()
+                # PSNR is how the old dreamer AE reported this; keep it comparable.
+                metrics["recon_psnr"] = 10.0 * torch.log10(1.0 / recon.detach().clamp_min(1e-9))
         return loss, metrics, out
 
     def train_step(self, batch: Dict) -> Optional[Dict[str, float]]:
@@ -371,8 +305,28 @@ class EncoderTrainer:
         row.update({"loss": float(loss.detach()), "grad_norm": float(gn),
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "frames": float(frames["image"].shape[0])})
-        with torch.no_grad():
-            row.update(per_family_grounding(out, frames))
+        row.update(self._per_family(out, frames))
+        return row
+
+    @torch.no_grad()
+    def _per_family(self, out, frames) -> Dict[str, float]:
+        """Entity dice split by family — the gate.
+
+        Per family because the classes are not equally hard and neither are the
+        families: boss frames carry ~4.9 enemy bullets of ~2 px each against exactly one
+        player sprite, so a pooled number is carried by the easy class in the easy family.
+        """
+        row: Dict[str, float] = {}
+        pred, tgt, fam = out["entity_heatmap"], frames["entity_heatmap"], frames["family"]
+        for i, name in enumerate(FAMILIES):
+            sel = fam == i
+            if not bool(sel.any()):
+                continue
+            row[f"{name}/frames"] = float(sel.sum())
+            _l, m = entity_loss(pred[:sel.shape[0]][sel], tgt[sel])
+            for k, v in m.items():
+                if k.endswith("/dice"):
+                    row[f"{name}/{k.split('/')[1]}"] = float(v)
         return row
 
     @torch.no_grad()
@@ -395,11 +349,8 @@ class EncoderTrainer:
                 continue
             loss, metrics, out = self._forward(frames)
             row = {"loss": float(loss)}
-            # Carry the objective's own metrics through — they hold every entity number
-            # (4 of the 5 predicted channels). Dropping them made `[val]` report only
-            # goal grounding, so the entity head was trained but never validated.
             row.update({k: float(v) for k, v in metrics.items()})
-            row.update(per_family_grounding(out, frames))
+            row.update(self._per_family(out, frames))
             rows.append(row)
         return _mean_of(rows)
 
@@ -449,34 +400,27 @@ class EncoderTrainer:
             self.wandb.log({f"{phase}/{k}": v for k, v in row.items() if k != "step"},
                            step=self.step)
         head = [f"{k}={row[k]:.4g}" for k in
-                ("loss", "peak_hit", "pck16", "point_err_px", "point_err_px_p50")
-                if k in row]
+                ("loss", "recon_psnr", "entity_loss") if k in row]
         line = f"[{phase} {self.step}/{int(self.args.train.steps)}] " + " ".join(head)
         if "frames_per_s" in row:
             line += f" frames/s={row['frames_per_s']:.0f}"
         print(line, flush=True)
-        # The gate lives on this line: boss point error against the policy's 5.3 px,
-        # with pck8 beside it so a mean dragged up by a tail of confusions is visible.
-        # peak_hit is the gate: defined for any number of goal components. point_err
-        # is shown beside it only where it is meaningful, with `-` where a family's
-        # goals are multi-component and the mean-of-centroids target is ill-defined.
-        fam = []
-        for f in FAMILIES:
-            if f"{f}/peak_hit" not in row:
-                continue
-            pe = (f"{row[f'{f}/point_err_px']:.1f}px" if row.get(f"{f}/point_err_px")
-                  and row.get(f"{f}/multi_goal_frac", 0) < 0.5 else "-")
-            fam.append(f"{f}({row[f'{f}/peak_hit']:.2f}/{pe})")
-        if fam:
-            print("    peak_hit/err: " + " ".join(fam), flush=True)
+        # Per class, because a pooled number is carried by `player` — one large
+        # always-present sprite — while `enemy_bullets` is ~2 px and is the class that
+        # would help boss survival. `g:` is the goal frame's own dice, which lags if the
+        # painted marker has pushed goal frames out of distribution.
         ent = [f"{c}({row[f'entity/{c}/dice']:.2f})" for c in ENTITY_CLASSES
                if f"entity/{c}/dice" in row]
         if ent:
-            # Dice, not peak_hit: the maps are 95-98% empty, so a single-guess hit rate
-            # says nothing about whether ~5 enemy bullets were all found. Per class,
-            # because a pooled number is carried by `player` — one large always-present
-            # sprite — while `enemy_bullets` is the class that would help boss survival.
-            print("    entity dice: " + " ".join(ent), flush=True)
+            g = [f"{row[f'goal_entity/{c}/dice']:.2f}" for c in ENTITY_CLASSES
+                 if f"goal_entity/{c}/dice" in row]
+            print("    entity dice: " + " ".join(ent)
+                  + ("   g: " + " ".join(g) if g else ""), flush=True)
+        # The gate: entity dice per family, against 0001's enemies 0.96 / e_bullets 0.91.
+        fam = [f"{f}({row[f'{f}/enemies']:.2f}/{row[f'{f}/enemy_bullets']:.2f})"
+               for f in FAMILIES if f"{f}/enemies" in row and f"{f}/enemy_bullets" in row]
+        if fam:
+            print("    by family (enemies/e_bullets): " + " ".join(fam), flush=True)
 
     def save(self, final: bool = False) -> str:
         tag = "final" if final else f"{self.step:06d}"

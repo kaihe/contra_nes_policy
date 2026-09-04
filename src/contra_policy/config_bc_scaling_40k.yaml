@@ -1,0 +1,64 @@
+# The D40k cells of doc/0016: the size ladder at 4x data and 4x budget.
+#
+#   python -m contra_policy.train_bc --config-name config_bc_scaling_40k \
+#       policy.core.d_model=640 policy.core.n_layer=5 policy.core.n_head=10 \
+#       policy.core.n_kv_head=10 hydra.run.dir=./runs/scaling40k/L-D40k-C160k
+#
+# Differences from `config_bc_scaling.yaml`, all of them consequences of data owning the
+# tokens (data doc/0004, issue `kaihe/contra_nes_policy#7`):
+#
+#   datahouse        replaces `boss_scaling` *and* `token_cache`. There is no release
+#                    manifest, no shard tar under `shard_dir`, and nothing written under
+#                    `cache/`; the reader mmaps the data repo's token tars in place and
+#                    takes the episode set from `catalog.sqlite`.
+#   boss_scaling     disabled: shard-prefix selection is a property of the legacy releases,
+#                    and the datahouse slice is selected by (level, task, weapon) instead.
+#   token_cache      null: the policy-owned cache is exactly what #7 asks us to stop using.
+#   steps 160000     40,000 episodes x 64.0 epochs at batch 16 — matched to D10k-C40k's
+#                    64.6, so doc/0016's gap is read against the data and not against a
+#                    change in exposure. **The parent now defaults to batch 32 (doc/0019),
+#                    so 160,000 cycles here is 128 epochs, not 64.** Halve to 80,000 for
+#                    the exposure doc/0016 was designed around; the cells already run are
+#                    described by their own `resolved_config.yaml`, not by this file.
+#
+# **The validation split here is provisional** (`datahouse.val_every`), because the fixed
+# split data 0004 promises does not exist yet. It is deterministic in the uid digest, so it
+# is stable across runs and re-shardings — but CE from these runs is comparable *within*
+# doc/0016 only, never against the 10k or 20k tiers. See `datahouse.py`.
+defaults:
+  - config_bc_scaling
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/scaling40k/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  root: ~/code/contra_nes_data/game_trace/datahouse
+  level: 1
+  task: boss
+  weapon: spread
+  # 1 in 20 episodes held out => ~2,000 val / ~38,000 train of the 40,000.
+  val_every: 20
+
+boss_scaling:
+  enabled: false
+
+# `null`, not `{}`: OmegaConf merges mappings, so an empty dict would inherit the parent's
+# cache paths and the startup assert would demand a cache this experiment must not build.
+token_cache: null
+
+train:
+  steps: 160000
+  # **0 = score the whole validation set at every val, and this is load-bearing here.**
+  # The parent's 60 batches cap in-run validation at 960 episodes, while the end-of-run
+  # `val_full` always scores all of them — 1,976 with this split. doc/0016's metric is
+  # `val CE (final) − val CE (best)`, and `final` comes from `val_full` while `best` comes
+  # from an in-run row, so a cap would subtract two numbers computed on *different*
+  # episodes and call the difference a gap. It never bit 0013-0015 because their holdouts
+  # were 100 episodes, well inside the 960-episode cap, so both passes scored the same set.
+  # Costs ~5 s per val against ~2.4 s, about 13 min over a 160k run.
+  val_batches: 0
+  save_steps: []
+  save_best: false
+  lr_decay: wsd

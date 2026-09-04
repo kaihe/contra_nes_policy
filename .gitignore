@@ -8,5 +8,13 @@ __pycache__/
 *.pyc
 outputs/
 
+# Local source references and disposable run artifacts
+ref/
+tmp/
+
 # training logs at the repo root
 *.log
+
+# queue state and logs are run artifacts
+queue/state.tsv
+queue/STOP

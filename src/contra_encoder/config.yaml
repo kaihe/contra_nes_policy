@@ -8,12 +8,14 @@ hydra:
 # Both targets are rendered by `goal.goal_mask`, the same renderer that draws the
 # cross-view prompt, from fields already in each episode's .json:
 #
-#   goal occupancy (1 ch)   <- `centroids` + `visibility`, present since the beginning
-#   entity occupancy (4 ch) <- `entities`, added by the 2026-07-30 re-export
+#   entity occupancy (4 ch) <- `entities`, from the 2026-07-30 re-export
+#
+# Both image kinds are trained: agent frames, and the episode's goal frame located by
+# `goal_frame_idx`. A goal frame IS an episode frame with the target painted on, so it
+# carries the same 4-class target — no special case anywhere.
 #
 # Shards older than that re-export have no `entities` field; the loader falls back to an
-# all-zero target rather than failing, so check `[enc] entity target` at startup before
-# trusting an entity number.
+# all-zero target rather than failing.
 shard_dir: ~/code/contra_nes_data/game_trace/hf
 cache_dir: ${hydra:runtime.cwd}/cache
 families: [kill, item, traverse, boss]
@@ -29,19 +31,20 @@ encoder:
   hiddim: 512             # token width; must equal the policy's hiddim to plug in
   depth: 32               # ConvEncoder base width — 1024 channels on a 4x4 grid at 256px
   minres: 4
-  mask_depth: 8           # the goal-mask trunk's input is a blob map, not a photograph
   # Channels kept after a 1x1 reduction of the trunk's 1024, before flattening to a
   # token. Flattening 1024x4x4 straight into a Linear is 8.4M parameters per projection
   # — more than the trunk itself; reducing first costs 0.26M and makes it 2.4M.
   proj_ch: 256
   aux_size: 32            # heatmap grid A; point_err_px is calibrated at A=32
   head_depth: 32
-  n_classes: 1            # channels of the goal head; 1 is the policy's contract
-  # Second head, supervised by the shards' per-class entity occupancy
-  # (player, player_bullets, enemies, enemy_bullets). 0 = off.
-  # Landed 2026-07-30; shards exported before then have no `entities` field and the
-  # target falls back to all-zero, so check the loader's report before enabling.
+  # player / player_bullets / enemies / enemy_bullets. The only occupancy target since
+  # 0002 — the encoder is goal-agnostic and goal matching is the policy's job.
   entity_classes: 4
+  # 0002 §4, an open question rather than a default: a decoder is 7M at recon_depth 16
+  # (27.97M at full width), and the precedent only shows a recon-*only* encoder goes
+  # entity-blind, not that recon adds anything once an entity head exists. Ablate it.
+  reconstruct: false
+  recon_depth: 16
   # An `ae_pretrained.pt` from contra_agent/dreamer/train_ae.py, to initialise the conv
   # trunk. null = from scratch.
   view_backbone_ckpt: null
@@ -52,16 +55,11 @@ encoder:
 
 # ── loss ──────────────────────────────────────────────────────────────────────
 loss:
-  # contra_policy.loss.GoalHeatmapLoss, reused unmodified so the number this reports is
-  # the number BC and the evaluator report.
-  heatmap_weight: 1.0
-  # At A=32 with sigma_px=12 the blob is ~1.7% of the map, so unweighted BCE is
-  # minimised by predicting "empty everywhere".
-  pos_weight: 10.0
-  # Entity head. Weighted below the goal head because the goal target feeds the pinned
-  # gate and the entity target is there to enrich the token, not to redefine success.
-  entity_weight: 0.5
+  # These maps are 95-98% empty, so unweighted BCE is minimised by predicting "empty
+  # everywhere". Applied per cell as 1 + pos_weight * target.
   entity_pos_weight: 10.0
+  # Only used when encoder.reconstruct is on.
+  recon_weight: 1.0
   # Tighter than the goal's 12 px: at A=32 that is 1.66 cells, which smears a boss
   # frame's ~4.9 enemy bullets into one blob. 6 px is 0.83 cells.
   entity_sigma_px: 6.0

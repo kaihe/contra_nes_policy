@@ -1,188 +1,103 @@
-"""The clipped PPO objective, plus the auxiliaries that protect the BC policy.
+"""Binary-return PPO with a learned causal-history value baseline.
 
-Everything here operates on **one chunk** of a recurrent minibatch — a ``(B, L)``
-block of consecutive steps from ``B`` episodes, with a validity mask for the episodes
-that already ended. The chunk is the unit because the trainer replays each episode in
-order with carried memory and backprops chunk by chunk, so the loss must be reducible
-by summation over chunks with no cross-chunk term.
-
-Metrics are returned as **sums over valid steps** rather than means, so the trainer
-can divide once at the end and get the same number a single large batch would give.
-Averaging per-chunk means instead would silently weight a 4-step tail chunk the same
-as a full 32-step one.
-
-Reward shaping is deliberately absent. If credit assignment turns out to be
-inadequate, the only shaping that leaves the optimal policy unchanged is
-potential-based::
-
-    r_shaped = r_task + beta * (gamma * potential(s') - potential(s))
-
-with ``potential`` coming from an authoritative progress API in ``contra_nes_data``
-and forced to zero at every terminal state so the telescoping sum cancels. No such
-API exists today (``TaskMaker`` defines ``goal_reached`` but nothing continuous), so
-shaping is not implemented rather than invented locally — see the run report.
-
-Never rewarded, under any configuration: predicted heatmap confidence, agreement with
-the expert action, ``bc_acc``, staying alive per step, moving right, or firing. The
-heatmap and BC objectives appear below as *auxiliary losses on privileged labels*,
-which is a different thing from an environment reward.
+The reward stays terminal and verifiable. GAE does not invent intermediate rewards; it
+uses changes in the old critic's prediction to distribute a conditional baseline across
+timesteps. Experiment 0028 tests whether that estimate is better than GRPO's one scalar
+per trajectory, and the critic must first beat a constant predictor.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from contra_policy.loss import GoalHeatmapLoss
+from contra_policy.rl.grpo import masked_mean
 
 
 @dataclass
 class PPOConfig:
-    """Every PPO knob. All of these are configuration; none is a literal in the code."""
-
-    learning_rate: float = 1.0e-5
     gamma: float = 1.0
-    gae_lambda: float = 1.0
-    clip_ratio: float = 0.1
+    gae_lambda: float = 0.95
+    clip_ratio: float = 0.2
     value_coef: float = 0.5
-    value_clip: float = 0.2          # 0 disables value clipping
+    kl_coef: float = 0.02
     entropy_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    target_kl: float = 0.01
-    ppo_epochs: int = 2
-    minibatch_episodes: int = 4
-    seq_len: int = 32
-    normalize_advantages: bool = True
-    #: Coefficient on KL(pi || pi_bc) against a frozen copy of the initialisation.
-    bc_kl_coef: float = 0.0
-    #: Coefficient on continued goal-heatmap supervision over on-policy frames.
-    heatmap_coef: float = 0.0
-    heatmap_pos_weight: float = 10.0
+    target_kl: float = 0.02
+    max_grad_norm: float = 1.0
+    temperature: float = 1.0
 
 
-def _masked_sum(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    return (x * mask).sum()
+def gae(reward: float, values: np.ndarray, gamma: float = 1.0,
+        lam: float = 0.95) -> tuple[np.ndarray, np.ndarray]:
+    """Return unnormalised GAE and lambda-return targets for one complete episode."""
+    v = np.asarray(values, dtype=np.float32)
+    if v.ndim != 1 or len(v) == 0:
+        raise ValueError("values must be a non-empty 1-D episode")
+    if not (0 <= gamma <= 1 and 0 <= lam <= 1):
+        raise ValueError("gamma and lambda must lie in [0, 1]")
+    rewards = np.zeros_like(v)
+    rewards[-1] = float(reward)
+    next_v = np.concatenate([v[1:], np.zeros(1, dtype=np.float32)])
+    delta = rewards + gamma * next_v - v
+    advantage = np.zeros_like(v)
+    carry = 0.0
+    for t in range(len(v) - 1, -1, -1):
+        carry = float(delta[t]) + gamma * lam * carry
+        advantage[t] = carry
+    return advantage, advantage + v
 
 
-def policy_loss(logprob: torch.Tensor, old_logprob: torch.Tensor,
-                advantage: torch.Tensor, mask: torch.Tensor, clip_ratio: float
-                ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Clipped surrogate, summed over valid steps.
+def explained_variance(target: np.ndarray, pred: np.ndarray) -> float:
+    target = np.asarray(target, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    var = float(np.var(target))
+    return 0.0 if var < 1e-12 else 1.0 - float(np.var(target - pred)) / var
 
-    ``approx_kl`` is Schulman's low-variance estimator ``E[(r - 1) - log r]``, which
-    is non-negative and much better behaved than ``E[-log r]`` when the ratio is close
-    to 1 — the regime the whole update is supposed to stay in.
-    """
-    log_ratio = logprob - old_logprob
-    ratio = torch.exp(log_ratio)
-    unclipped = ratio * advantage
-    clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantage
-    loss = -_masked_sum(torch.min(unclipped, clipped), mask)
+
+def ppo_loss(logits: torch.Tensor, values: torch.Tensor, batch, cfg: PPOConfig,
+             ref_logits: Optional[torch.Tensor] = None
+             ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Clipped PPO actor loss plus lambda-return value regression and reference KL."""
+    if cfg.temperature <= 0:
+        raise ValueError("PPO requires a positive sampling temperature")
+    mask = batch.mask
+    logp_all = F.log_softmax(logits.float() / cfg.temperature, dim=-1)
+    logp = logp_all.gather(-1, batch.action.unsqueeze(-1)).squeeze(-1)
+    ratio = torch.exp(logp - batch.old_logprob)
+    unclipped = ratio * batch.advantage
+    clipped = torch.clamp(ratio, 1 - cfg.clip_ratio, 1 + cfg.clip_ratio) * batch.advantage
+    policy_loss = -masked_mean(torch.min(unclipped, clipped), mask)
+
+    value_prob = values.float().sigmoid()
+    value_loss = masked_mean((value_prob - batch.value_target) ** 2, mask)
+    probs = logp_all.exp()
+    entropy = -(probs * logp_all).sum(-1)
+    loss = (policy_loss + cfg.value_coef * value_loss
+            - cfg.entropy_coef * masked_mean(entropy, mask))
+
+    metrics: Dict[str, torch.Tensor] = {"value_loss": value_loss.detach()}
+    if ref_logits is not None and cfg.kl_coef > 0:
+        ref_logp = F.log_softmax(ref_logits.float() / cfg.temperature, dim=-1)
+        kl_ref = (probs * (logp_all - ref_logp)).sum(-1)
+        kl_ref_mean = masked_mean(kl_ref, mask)
+        metrics["kl_ref"] = kl_ref_mean.detach()
+        loss = loss + cfg.kl_coef * kl_ref_mean
+
     with torch.no_grad():
-        metrics = {
-            "approx_kl": _masked_sum((ratio - 1.0) - log_ratio, mask),
-            "clip_frac": _masked_sum(
-                ((ratio - 1.0).abs() > clip_ratio).float(), mask),
-            "ratio": _masked_sum(ratio, mask),
-        }
+        d = batch.old_logprob - logp
+        metrics.update({
+            "policy_loss": policy_loss.detach(),
+            "entropy": masked_mean(entropy, mask),
+            "approx_kl": masked_mean(torch.exp(-d) - 1 + d, mask),
+            "clip_frac": masked_mean(
+                ((ratio - 1).abs() > cfg.clip_ratio).float(), mask),
+            "ratio_mean": masked_mean(ratio, mask),
+            "value_brier": masked_mean(
+                (value_prob - batch.reward.unsqueeze(1)) ** 2, mask),
+        })
+    metrics["loss"] = loss.detach()
     return loss, metrics
-
-
-def value_loss(vpred: torch.Tensor, old_value: torch.Tensor, returns: torch.Tensor,
-               mask: torch.Tensor, clip: float) -> torch.Tensor:
-    """Squared error, optionally clipped to a trust region around the old value.
-
-    Value clipping matters more than usual here: the critic starts from a head that
-    received **no gradient at all** during behaviour cloning, so its first predictions
-    are an untrained linear readout and the unclipped error can be large enough to
-    dominate the policy term on the very first updates.
-    """
-    unclipped = (vpred - returns) ** 2
-    if clip <= 0:
-        return 0.5 * _masked_sum(unclipped, mask)
-    v_clipped = old_value + torch.clamp(vpred - old_value, -clip, clip)
-    clipped = (v_clipped - returns) ** 2
-    return 0.5 * _masked_sum(torch.max(unclipped, clipped), mask)
-
-
-def categorical_entropy(logits: torch.Tensor) -> torch.Tensor:
-    logp = torch.log_softmax(logits, dim=-1)
-    return -(logp.exp() * logp).sum(-1)
-
-
-def reference_kl(logits: torch.Tensor, ref_logits: torch.Tensor) -> torch.Tensor:
-    """``KL(pi_current || pi_bc)`` per step, exactly (21 actions — no sampling needed).
-
-    The direction is the standard "stay near the reference" penalty: it is finite only
-    where the current policy puts mass, so it discourages the policy from moving
-    probability onto actions the BC policy considers implausible without forcing it to
-    keep every action the BC policy liked.
-    """
-    logp = torch.log_softmax(logits, dim=-1)
-    ref_logp = torch.log_softmax(ref_logits, dim=-1)
-    return (logp.exp() * (logp - ref_logp)).sum(-1)
-
-
-class PPOObjective:
-    """Assembles the chunk loss and its metric sums."""
-
-    def __init__(self, cfg: PPOConfig):
-        self.cfg = cfg
-        self.heatmap = GoalHeatmapLoss(1.0, cfg.heatmap_pos_weight)
-
-    def __call__(self, latents: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor],
-                 ref_logits: Optional[torch.Tensor] = None
-                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
-        cfg = self.cfg
-        mask = batch["mask"]
-        count = mask.sum()
-
-        logits = latents["pi_logits"].float()
-        vpred = latents["vpred"].squeeze(-1).float()
-        logprob = torch.log_softmax(logits, dim=-1).gather(
-            -1, batch["action"].unsqueeze(-1)).squeeze(-1)
-
-        pi_loss, metrics = policy_loss(logprob, batch["old_logprob"], batch["advantage"],
-                                       mask, cfg.clip_ratio)
-        v_loss = value_loss(vpred, batch["old_value"], batch["returns"], mask,
-                            cfg.value_clip)
-        entropy = _masked_sum(categorical_entropy(logits), mask)
-
-        total = pi_loss + cfg.value_coef * v_loss - cfg.entropy_coef * entropy
-        metrics.update({"policy_loss": pi_loss.detach(), "value_loss": v_loss.detach(),
-                        "entropy": entropy.detach()})
-
-        if cfg.bc_kl_coef > 0.0 and ref_logits is not None:
-            bc_kl = _masked_sum(reference_kl(logits, ref_logits.float()), mask)
-            total = total + cfg.bc_kl_coef * bc_kl
-            metrics["bc_kl"] = bc_kl.detach()
-
-        if cfg.heatmap_coef > 0.0 and "goal_heatmap" in batch:
-            # GoalHeatmapLoss reduces as a masked *mean*; rescale to a sum so it
-            # composes with the rest of this function's summed terms.
-            hm_loss, hm_metrics = self.heatmap(latents, batch)
-            total = total + cfg.heatmap_coef * hm_loss * count
-            metrics["heatmap_loss"] = hm_loss.detach() * count
-            metrics["point_err_px"] = hm_metrics["point_err_px"].detach() * count
-            metrics["exist_acc"] = hm_metrics["exist_acc"].detach() * count
-
-        return total, metrics, count
-
-
-def explained_variance(values: np.ndarray, returns: np.ndarray) -> float:
-    """``1 - Var(returns - values) / Var(returns)``; 0 means "no better than the mean".
-
-    Reported rather than the raw value loss because with a binary episodic return the
-    value loss is bounded by 0.25 whatever the critic does, so its absolute size says
-    almost nothing about whether the critic is informative.
-    """
-    values = np.asarray(values, dtype=np.float64)
-    returns = np.asarray(returns, dtype=np.float64)
-    var = returns.var()
-    if var < 1e-12:
-        return float("nan")
-    return float(1.0 - (returns - values).var() / var)

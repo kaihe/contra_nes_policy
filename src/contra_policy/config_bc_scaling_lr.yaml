@@ -1,0 +1,49 @@
+# The learning-rate sweep of doc/0018: the D10k-scale tier, cut from the D40k datahouse so
+# that it validates on doc/0016's holdout.
+#
+#   python -m contra_policy.train_bc --config-name config_bc_scaling_lr \
+#       policy.core.d_model=1024 policy.core.n_layer=8 policy.core.n_head=16 \
+#       policy.core.n_kv_head=16 train.learning_rate=1e-4 \
+#       hydra.run.dir=./runs/scaling_lr/XXL-D10k-C40k-lr1e-4
+#
+# Inherits `config_bc_scaling_40k.yaml` — same datahouse slice, same encoder assertions, same
+# provisional 1-in-20 uid-digest holdout, `val_batches: 0`. Two changes, both so the sweep is
+# cheap without giving up the comparison:
+#
+#   shard_count 13   train on the first 13 of 53 shards — 9,330 episodes after the holdout is
+#                    removed. That is the **D10k tier**: runs are named for the data they
+#                    train on, not for the store it is cut from, so these are `*-D10k-C40k`
+#                    even though the bytes come from the 40k datahouse. `split_uids` keys on the uid
+#                    digest, not on shard order, so **the val set is unchanged at 1,976
+#                    episodes**: the same episodes doc/0016's cells were scored on, and
+#                    therefore val CE that is directly comparable to them. Val episodes inside
+#                    the prefix are removed from train first; overlap is 0 by construction.
+#   steps 40000      68.6 epochs **at batch 16**; the parent now defaults to batch 32
+#                    (doc/0019), which makes this 137 epochs. Halve to 20,000 to keep the
+#                    exposure this sweep was sized for. Matched to the D10k-C40k cell's
+#                    64.6 rather than the D40k cell's 64.0 at 4x the cost. This tier is where the anomaly is already
+#                    visible: at D10k-C40k, XXL ends at train CE 0.312 against L's 0.090,
+#                    while at D40k-C40k all four sizes are still within 0.046 of each other.
+#
+# Validation remains every 500, but checkpointing is final-only. The CE trajectory lives in
+# `metrics.csv`; retaining optimizer-bearing periodic checkpoints is not needed for reporting.
+#
+# `train.learning_rate` is the swept axis and keeps the parent's value here, so an un-overridden
+# run of this file is the 3e-4 control. `train.decay_frac` is a documented follow-up arm
+# (doc/0018 §2, not run) and overriding it to 0.5 moves the cooldown onset to 20,000.
+defaults:
+  - config_bc_scaling_40k
+  - _self_
+
+hydra:
+  run:
+    dir: ./runs/scaling_lr/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datahouse:
+  shard_count: 13
+
+train:
+  steps: 40000
+  val_every: 500
+  save_steps: []
+  save_best: false

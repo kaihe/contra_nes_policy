@@ -59,9 +59,10 @@ def flatten_window(batch: Dict, device: Optional[torch.device] = None,
                    ) -> Dict[str, torch.Tensor]:
     """``(B, T, ...)`` window batch → ``(N, ...)`` frame batch, padding removed.
 
-    The cross-view members carry no time axis (one goal per episode, expanded by the
-    model), so they are repeated across ``T`` before the mask is applied — which is
-    what makes each surviving frame carry its own episode's goal.
+    Since 0002 the encoder is goal-agnostic, so the goal image is *not* paired with
+    each frame. It is returned separately as ``goal_image`` — one per window, not one
+    per frame — for the reconstruction term, which is the only supervision a goal frame
+    can carry (see the module docstring).
 
     Returns ``{}`` when a batch is entirely padding, which the caller must skip; that
     only happens for degenerate single-step episodes.
@@ -75,25 +76,20 @@ def flatten_window(batch: Dict, device: Optional[torch.device] = None,
     cv = batch["cross_view"]
     out = {
         "image": batch["image"].reshape(b * t, *batch["image"].shape[2:])[keep],
-        "goal_image": _repeat_t(cv["cross_view_image"], t)[keep],
-        "goal_mask": _repeat_t(cv["cross_view_obj_mask"], t)[keep],
-        "interaction": cv["cross_view_obj_id"].reshape(-1)[keep],
-        "goal_heatmap": batch["goal_heatmap"].reshape(b * t, *batch["goal_heatmap"].shape[2:])[keep],
-        "point": batch["point"].reshape(b * t, 2)[keep],
-        "exist": batch["exist"].reshape(-1)[keep],
-        # Per-frame family index, for the per-family metric split. `family` is one id
-        # per window; the gate on this rebuild is boss-specific, so it has to survive
-        # the flattening.
+        # One per window, not per frame: goal frames are encoded by the same function
+        # but carry no entity labels, so they never enter the per-frame batch.
+        "goal_image": cv["cross_view_image"],
+        # Per-frame family index, for the per-family metric split.
         "family": batch["family"].unsqueeze(1).expand(b, t).reshape(-1)[keep],
     }
     # Only present when the datamodule was built with want_entities.
     if "entity_heatmap" in batch:
         eh = batch["entity_heatmap"]
         out["entity_heatmap"] = eh.reshape(b * t, *eh.shape[2:])[keep]
-    # Added 2026-07-31. Carried when present so the point metrics can exclude
-    # multi-component goals; `per_family_grounding` assumes single when it is absent.
-    if "n_goal_points" in batch:
-        out["n_goal_points"] = batch["n_goal_points"].reshape(-1)[keep]
+    # The goal frame's target, one per window — same shape and semantics as a frame's,
+    # because a goal frame *is* a frame.
+    if "goal_entity_heatmap" in batch:
+        out["goal_entity_heatmap"] = batch["goal_entity_heatmap"]
     if device is not None:
         out = {k: v.to(device, non_blocking=True) for k, v in out.items()}
     return out
