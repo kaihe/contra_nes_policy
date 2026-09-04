@@ -47,4 +47,5 @@ class TorchSearchPolicy:
         with self._autocast():
             out = self.model.forward_tokens(frames, self.goal_token, interaction)
         priors = torch.softmax(out["pi_logits"][0, -1].float(), -1).cpu().numpy()
-        return Evaluation(priors, float(out["vpred"][0, -1].float().cpu()))
+        value = torch.sigmoid(out["vpred"][0, -1].float())
+        return Evaluation(priors, float(value.cpu()))

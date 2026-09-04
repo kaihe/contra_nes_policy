@@ -1,4 +1,4 @@
-"""Searched-episode records and joint policy/value/state training for design 0029."""
+"""Searched episodes and terminal-success training for designs 0029 and 0030."""
 
 from __future__ import annotations
 
@@ -18,24 +18,22 @@ class SearchEpisode:
     motion: np.ndarray
     weapon: np.ndarray
     rapid: np.ndarray
+    progress: np.ndarray
+    progress_mask: np.ndarray
     interaction: int
     outcome: str
 
     def __post_init__(self) -> None:
         n = len(self.frames)
         if not all(len(x) == n for x in (self.policy_targets, self.rewards, self.motion,
-                                         self.weapon, self.rapid)):
+                                         self.weapon, self.rapid, self.progress,
+                                         self.progress_mask)):
             raise ValueError("all episode targets must align with frames")
 
     @property
-    def returns(self) -> np.ndarray:
-        return reward_to_go(self.rewards)
-
-
-def reward_to_go(rewards: np.ndarray) -> np.ndarray:
-    """Undiscounted sum of rewards from every decision through termination."""
-    values = np.asarray(rewards, dtype=np.float32)
-    return np.flip(np.cumsum(np.flip(values), dtype=np.float32)).copy()
+    def success_targets(self) -> np.ndarray:
+        """Copy the stable terminal outcome to every decision in the episode."""
+        return np.full(len(self.frames), self.outcome == "success", dtype=np.float32)
 
 
 class AlphaZeroBatch:
@@ -53,16 +51,20 @@ class AlphaZeroBatch:
         self.motion = torch.zeros((b, t, 2), device=device)
         self.weapon = torch.zeros((b, t), dtype=torch.long, device=device)
         self.rapid = torch.zeros((b, t), device=device)
+        self.progress = torch.zeros((b, t), device=device)
+        self.progress_mask = torch.zeros((b, t), device=device)
         self.mask = torch.zeros((b, t), device=device)
         self.interaction = torch.tensor([e.interaction for e in episodes], device=device)
         for i, episode in enumerate(episodes):
             n = len(episode.frames)
             self.images[i, :n] = torch.from_numpy(episode.frames).to(device)
             self.policy_target[i, :n] = torch.from_numpy(episode.policy_targets).to(device)
-            self.value_target[i, :n] = torch.from_numpy(episode.returns).to(device)
+            self.value_target[i, :n] = torch.from_numpy(episode.success_targets).to(device)
             self.motion[i, :n] = torch.from_numpy(episode.motion).to(device)
             self.weapon[i, :n] = torch.from_numpy(episode.weapon).to(device)
             self.rapid[i, :n] = torch.from_numpy(episode.rapid).to(device)
+            self.progress[i, :n] = torch.from_numpy(episode.progress).to(device)
+            self.progress_mask[i, :n] = torch.from_numpy(episode.progress_mask).to(device)
             self.mask[i, :n] = 1
 
 
@@ -73,29 +75,34 @@ class LossWeights:
     motion: float = 0.1
     weapon: float = 0.1
     rapid: float = 0.1
+    progress: float = 0.1
 
 
 def alphazero_loss(out: dict[str, torch.Tensor], batch: AlphaZeroBatch,
                    weights: LossWeights = LossWeights()
                    ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Joint soft-policy, reward-to-go, and decoded-state objective."""
+    """Joint search-policy, terminal-success, and decoded-state objective."""
     mask, denom = batch.mask, batch.mask.sum().clamp(min=1)
     mean = lambda x: (x * mask).sum() / denom
     policy = mean(-(batch.policy_target * F.log_softmax(out["pi_logits"].float(), -1)).sum(-1))
-    # Dense mc_search returns are tens of points on the fixed Laser episode. Smooth L1
-    # keeps a randomly initialized value head from overwhelming policy distillation.
-    value = mean(F.smooth_l1_loss(out["vpred"].float(), batch.value_target,
-                                  reduction="none"))
+    value = mean(F.binary_cross_entropy_with_logits(
+        out["vpred"].float(), batch.value_target, reduction="none"))
     motion = mean(F.smooth_l1_loss(out["motion"].float(), batch.motion, reduction="none").mean(-1))
     weapon = mean(F.cross_entropy(out["weapon_logits"].float().transpose(1, 2),
                                   batch.weapon, reduction="none"))
     rapid = mean(F.binary_cross_entropy_with_logits(out["rapid_logit"].float(), batch.rapid,
                                                      reduction="none"))
+    progress_loss = F.binary_cross_entropy_with_logits(
+        out["progress_logit"].float(), batch.progress, reduction="none")
+    progress_denom = (batch.mask * batch.progress_mask).sum().clamp(min=1)
+    progress = (progress_loss * batch.mask * batch.progress_mask).sum() / progress_denom
     total = (weights.policy * policy + weights.value * value + weights.motion * motion
-             + weights.weapon * weapon + weights.rapid * rapid)
+             + weights.weapon * weapon + weights.rapid * rapid
+             + weights.progress * progress)
     metrics = {"loss": float(total.detach()), "policy_loss": float(policy.detach()),
                "value_loss": float(value.detach()), "motion_loss": float(motion.detach()),
-               "weapon_loss": float(weapon.detach()), "rapid_loss": float(rapid.detach())}
+               "weapon_loss": float(weapon.detach()), "rapid_loss": float(rapid.detach()),
+               "progress_loss": float(progress.detach())}
     return total, metrics
 
 

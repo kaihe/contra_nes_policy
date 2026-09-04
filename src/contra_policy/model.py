@@ -127,6 +127,7 @@ class ContraPolicy(nn.Module):
         self.weapon_head = (nn.Linear(d_core, cfg.weapon_classes)
                             if cfg.state_heads else None)
         self.rapid_head = nn.Linear(d_core, 1) if cfg.state_heads else None
+        self.progress_head = nn.Linear(d_core, 1) if cfg.state_heads else None
         # Grounding lives here now, not in the encoder: predicting where the goal is
         # requires comparing this frame against the goal token, which is what attention
         # upstream has just done.
@@ -233,6 +234,7 @@ class ContraPolicy(nn.Module):
             out["motion"] = self.motion_head(h)
             out["weapon_logits"] = self.weapon_head(h)
             out["rapid_logit"] = self.rapid_head(h).squeeze(-1)
+            out["progress_logit"] = self.progress_head(h).squeeze(-1)
         if self.aux_head is not None:
             heat = self.aux_head(h).view(b, t, self.cfg.aux_size, self.cfg.aux_size)
             point, exist = heatmap_readout(heat)
@@ -301,7 +303,8 @@ def initialize_alphazero_policy(path: str, *, seed: int = 0,
         if key.startswith(prefixes) or key == "null_goal"
     }
     missing, unexpected = model.load_state_dict(transferable, strict=False)
-    allowed_missing = ("value_head.", "motion_head.", "weapon_head.", "rapid_head.")
+    allowed_missing = ("value_head.", "motion_head.", "weapon_head.", "rapid_head.",
+                       "progress_head.")
     if unexpected or any(not key.startswith(allowed_missing) for key in missing):
         raise RuntimeError(f"invalid AlphaZero initialization: missing={missing}, "
                            f"unexpected={unexpected}")

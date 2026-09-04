@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from contra_policy.alphazero import train_epoch
-from contra_policy.mcts.laser import generate_episode
+from contra_policy.mcts.laser import evaluate_policy_episode, generate_episode
 from contra_policy.model import initialize_alphazero_policy
 from contra_policy.rl.tasks import TaskCatalog
 
@@ -43,9 +43,20 @@ def run(args: argparse.Namespace) -> str:
                     model, episodes, optimizer, device=device,
                     batch_episodes=args.batch_episodes,
                     seed=args.seed + generation * args.epochs + epoch)
+            evaluations = [evaluate_policy_episode(
+                model, catalog, task, device=device,
+                seed=args.seed + 1_000_000 + generation * args.eval_episodes + i,
+                precision=args.precision, image_size=args.image_size)
+                for i in range(args.eval_episodes)]
             row = {"generation": generation, "episodes": len(episodes),
                    "return_mean": float(np.mean([e.rewards.sum() for e in episodes])),
-                   "win_rate": float(np.mean([e.outcome == "success" for e in episodes])),
+                   "search_win_rate": float(np.mean([
+                       e.outcome == "success" for e in episodes])),
+                   "policy_eval_episodes": len(evaluations),
+                   "policy_win_rate": float(np.mean([
+                       outcome == "success" for outcome, _ in evaluations])),
+                   "policy_return_mean": float(np.mean([
+                       reward for _, reward in evaluations])),
                    **train_metrics}
             with open(metrics_path, "a") as fh:
                 fh.write(json.dumps(row) + "\n")
@@ -69,6 +80,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--generations", type=int, default=2)
     parser.add_argument("--episodes-per-generation", type=int, default=4)
+    parser.add_argument("--eval-episodes", type=int, default=16)
     parser.add_argument("--simulations", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-episodes", type=int, default=2)

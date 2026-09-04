@@ -1,6 +1,6 @@
 # Predict terminal success and game progress separately
 
-Status: Proposed
+Status: Implemented
 
 **Question.** What should the Contra policy-value network predict when successful
 episodes can have substantially different accumulated `mc_search` rewards, and how
@@ -117,4 +117,3 @@ label the policy being measured as either raw network actions or MCTS-enhanced a
 | fixed Laser episodes expose terminal success and decoded boss state | `src/contra_policy/mcts/laser.py` |
 | the policy network already has joint value, motion, weapon, and rapid-fire outputs | `src/contra_policy/model.py` |
 | root visits supervise the policy in the current iterative loop | `src/contra_policy/alphazero.py`; `src/contra_policy/train_alphazero.py` |
-

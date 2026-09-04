@@ -1,4 +1,4 @@
-"""PUCT search with exact emulator transitions and dense reward backup."""
+"""PUCT search with exact transitions and terminal-success value backup."""
 
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ class SearchTree:
             evaluation = self._expand(node, self.context(node))
             leaf_value = float(evaluation.value)
         else:
-            leaf_value = 0.0
+            leaf_value = 1.0 if node.terminal is Terminal.SUCCESS else 0.0
         self.backup(path, leaf_value)
         self.completed_simulations += 1
         return True
@@ -179,7 +179,6 @@ class SearchTree:
         for edge in reversed(path):
             if edge.reward is None:
                 raise RuntimeError("cannot back up an edge without an exact reward")
-            value = edge.reward + value
             edge.visits += 1
             edge.value_sum += value
 

@@ -92,11 +92,13 @@ def test_alphazero_heads_have_the_declared_shapes():
     with torch.no_grad():
         out = policy(images, goals, torch.tensor([0, 1]))
 
-    assert set(out) == {"pi_logits", "vpred", "motion", "weapon_logits", "rapid_logit"}
+    assert set(out) == {"pi_logits", "vpred", "motion", "weapon_logits", "rapid_logit",
+                        "progress_logit"}
     assert out["vpred"].shape == (2, 3)
     assert out["motion"].shape == (2, 3, 2)
     assert out["weapon_logits"].shape == (2, 3, 6)
     assert out["rapid_logit"].shape == (2, 3)
+    assert out["progress_logit"].shape == (2, 3)
 
 
 def test_alphazero_initialization_transfers_only_policy_weights(tmp_path):
