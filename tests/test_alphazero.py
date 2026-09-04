@@ -3,7 +3,8 @@
 import numpy as np
 import torch
 
-from contra_policy.alphazero import AlphaZeroBatch, SearchEpisode, alphazero_loss
+from contra_policy.alphazero import (AlphaZeroBatch, SearchEpisode, alphazero_loss,
+                                     evaluate_epoch)
 
 
 def episode(length=3):
@@ -43,3 +44,22 @@ def test_joint_loss_reaches_every_head():
     assert set(metrics) == {"loss", "policy_loss", "value_loss", "motion_loss",
                             "weapon_loss", "rapid_loss", "progress_loss"}
     assert all(tensor.grad is not None for tensor in out.values())
+
+
+def test_evaluate_epoch_does_not_create_gradients():
+    class Model(torch.nn.Module):
+        def forward(self, images, goal, interaction):
+            del goal, interaction
+            b, t = images.shape[:2]
+            zero = self.weight.expand(b, t)
+            return {"pi_logits": zero.unsqueeze(-1).expand(b, t, 2), "vpred": zero,
+                    "motion": zero.unsqueeze(-1).expand(b, t, 2),
+                    "weapon_logits": zero.unsqueeze(-1).expand(b, t, 6),
+                    "rapid_logit": zero, "progress_logit": zero}
+
+        weight = torch.nn.Parameter(torch.tensor(0.0))
+
+    model = Model()
+    metrics = evaluate_epoch(model, [episode()], device=torch.device("cpu"), batch_episodes=1)
+    assert "policy_loss" in metrics
+    assert model.weight.grad is None

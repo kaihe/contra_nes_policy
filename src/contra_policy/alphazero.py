@@ -92,8 +92,8 @@ def alphazero_loss(out: dict[str, torch.Tensor], batch: AlphaZeroBatch,
                                   batch.weapon, reduction="none"))
     rapid = mean(F.binary_cross_entropy_with_logits(out["rapid_logit"].float(), batch.rapid,
                                                      reduction="none"))
-    progress_loss = F.binary_cross_entropy_with_logits(
-        out["progress_logit"].float(), batch.progress, reduction="none")
+    progress_loss = F.smooth_l1_loss(
+        torch.sigmoid(out["progress_logit"].float()), batch.progress, reduction="none")
     progress_denom = (batch.mask * batch.progress_mask).sum().clamp(min=1)
     progress = (progress_loss * batch.mask * batch.progress_mask).sum() / progress_denom
     total = (weights.policy * policy + weights.value * value + weights.motion * motion
@@ -126,3 +126,21 @@ def train_epoch(model, episodes: Sequence[SearchEpisode], optimizer,
         for key, value in metrics.items():
             sums[key] = sums.get(key, 0.0) + value
     return {key: value / max(1, batches) for key, value in sums.items()}
+
+
+@torch.no_grad()
+def evaluate_epoch(model, episodes: Sequence[SearchEpisode], *, device: torch.device,
+                   batch_episodes: int = 4,
+                   weights: LossWeights = LossWeights()) -> dict[str, float]:
+    """Evaluate the joint objective on fixed episodes without changing the model."""
+    if not episodes:
+        raise ValueError("cannot evaluate an empty episode set")
+    model.eval()
+    sums, batches = {}, 0
+    for start in range(0, len(episodes), batch_episodes):
+        batch = AlphaZeroBatch(episodes[start:start + batch_episodes], device)
+        _, metrics = alphazero_loss(model(batch.images, None, batch.interaction), batch, weights)
+        batches += 1
+        for key, value in metrics.items():
+            sums[key] = sums.get(key, 0.0) + value
+    return {key: value / batches for key, value in sums.items()}

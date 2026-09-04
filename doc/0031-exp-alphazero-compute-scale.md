@@ -23,10 +23,10 @@ two complete episodes, seed 400, and stochastic root-visit action selection.
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | S16 prototype | complete | 10 | 16 | 16 | 2 | 16 | not logged | `runs/alphazero/laser-terminal-v-i10-e16-s16` |
 | S32 prototype | complete | 10 | 16 | 32 | 2 | 16 | not logged | `runs/alphazero/laser-terminal-v-i10-e16-s32` |
-| S32 scale | planned | 10 | 32 | 32 | up to 8 with early stopping | 64 | 1–2 h | `runs/alphazero/laser-terminal-v-i10-e32-s32` |
+| S32 scale | planned | 10 | 24 | 32 | up to 6 with early stopping | 64 | 90–110 min | `runs/alphazero/laser-terminal-v-i10-e24-s32` |
 
-For the planned cell, split each update's 32 newly searched episodes into 24 training
-episodes and eight fixed validation episodes. Record loss before optimization and after
+For the planned cell, split each update's 24 newly searched episodes into 18 training
+episodes and six fixed validation episodes. Record loss before optimization and after
 every epoch. Stop an update when validation policy loss fails to improve for two epochs;
 do not reuse episodes from earlier updates. Evaluate the unmodified initialization before
 update zero and evaluate every candidate with the same 64 action-sampling seeds.
@@ -44,7 +44,7 @@ it does not leave a partial checkpoint.
 |---|---:|---:|---:|---:|---:|---:|---|
 | S16 prototype | 81/160 | 50.63% | 29/160 | 18.13% | 81.25% | 37.50% | `runs/alphazero/laser-terminal-v-i10-e16-s16/metrics.jsonl` |
 | S32 prototype | 99/160 | 61.88% | 31/160 | 19.38% | 87.50% | 31.25% | `runs/alphazero/laser-terminal-v-i10-e16-s32/metrics.jsonl` |
-| S32 scale | pending | pending | pending | pending | pending | pending | `runs/alphazero/laser-terminal-v-i10-e32-s32/metrics.jsonl` |
+| S32 scale | pending | pending | pending | pending | pending | pending | `runs/alphazero/laser-terminal-v-i10-e24-s32/metrics.jsonl` |
 
 | scale-up gate | measurement | pass condition | source |
 |---|---|---|---|
