@@ -29,3 +29,4 @@
 - [0027 PPO critic](0027-design-ppo-critic.md) — Implemented — binary-return value head and GAE
 - [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — PPO progresses — inspect the value head before scaling
 - [0029 AlphaZero for Contra](0029-design-alphazero-contra.md) — Proposed — joint policy-value and game-state heads trained from emulator MCTS
+- [0030 Terminal success and progress heads](0030-design-terminal-value-progress-heads.md) — Proposed — calibrated success value with separately supervised game progress
