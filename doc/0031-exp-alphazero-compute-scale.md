@@ -23,9 +23,9 @@ two complete episodes, seed 400, and stochastic root-visit action selection.
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | S16 prototype | complete | 10 | 16 | 16 | 2 | 16 | not logged | `runs/alphazero/laser-terminal-v-i10-e16-s16` |
 | S32 prototype | complete | 10 | 16 | 32 | 2 | 16 | not logged | `runs/alphazero/laser-terminal-v-i10-e16-s32` |
-| S32 scale | planned | 10 | 24 | 32 | up to 6 with early stopping | 64 | 90–110 min | `runs/alphazero/laser-terminal-v-i10-e24-s32` |
+| S32 scale | complete | 10 | 24 | 32 | up to 6 with early stopping | 64 | 90.57 min measured | `runs/alphazero/laser-terminal-v-i10-e24-s32` |
 
-For the planned cell, split each update's 24 newly searched episodes into 18 training
+For the scale cell, split each update's 24 newly searched episodes into 18 training
 episodes and six fixed validation episodes. Record loss before optimization and after
 every epoch. Stop an update when validation policy loss fails to improve for two epochs;
 do not reuse episodes from earlier updates. Evaluate the unmodified initialization before
@@ -44,20 +44,25 @@ it does not leave a partial checkpoint.
 |---|---:|---:|---:|---:|---:|---:|---|
 | S16 prototype | 81/160 | 50.63% | 29/160 | 18.13% | 81.25% | 37.50% | `runs/alphazero/laser-terminal-v-i10-e16-s16/metrics.jsonl` |
 | S32 prototype | 99/160 | 61.88% | 31/160 | 19.38% | 87.50% | 31.25% | `runs/alphazero/laser-terminal-v-i10-e16-s32/metrics.jsonl` |
-| S32 scale | pending | pending | pending | pending | pending | pending | `runs/alphazero/laser-terminal-v-i10-e24-s32/metrics.jsonl` |
+| S32 scale | 159/240 | 66.25% | 150/640 | 23.44% | 87.50% | 26.56% | `runs/alphazero/laser-terminal-v-i10-e24-s32/metrics.jsonl` |
 
-| scale-up gate | measurement | pass condition | source |
-|---|---|---|---|
-| compute utilization | searched episodes and MCTS simulations per wall-clock hour | no unexplained throughput decline across updates | resolved config and per-update timing log |
-| policy optimization | training and validation visit-target cross-entropy by epoch | both decline within updates; validation does not systematically regress | per-epoch loss log |
-| search imitation | top-action agreement and probability assigned to MCTS-selected action | post-update exceeds pre-update on held-out roots | validation summary |
-| terminal value | validation binary cross-entropy and Brier score | improves over the constant-rate baseline | validation summary |
-| policy improvement | paired raw-policy wins before training and at each accepted update | best candidate exceeds initialization; report count and Wilson interval | fixed-seed raw evaluation log |
-| search improvement | MCTS-enhanced wins per update | report count and Wilson interval separately from raw policy | `metrics.jsonl` |
-| stability | best-to-final raw-policy change | final does not regress because failed candidates are not promoted | promotion log |
-| auxiliary progress | masked boss-progress validation error | declines without worsening policy validation loss | validation summary |
-| storage | checkpoint files | only `best-policy.pt` and `final-policy.pt` exist | run directory listing |
+| scale-up measurement | result | source |
+|---|---|---|
+| wall time | 90.57 min | final `elapsed_seconds` in `metrics.jsonl` |
+| search throughput | 159.00 complete searched episodes/hour | 240 episodes and final elapsed time in `metrics.jsonl` |
+| optimizer epochs | 49 total; updates 1, 2, and 8 stopped early | `epochs.jsonl` |
+| mean validation policy CE, before to after | 0.25585 to 0.25520 | pre/post fields in `metrics.jsonl` |
+| mean validation value BCE, before to after | 0.64140 to 0.61922 | pre/post fields in `metrics.jsonl` |
+| mean validation progress error, before to after | 0.08478 to 0.08367 | pre/post fields in `metrics.jsonl` |
+| paired raw-policy initialization | 15/64, 23.44%, 95% Wilson interval 14.75–35.13% | generation -1 in `metrics.jsonl` |
+| paired raw-policy best | 17/64, 26.56%, 95% Wilson interval 17.30–38.48%, update 5 | generation 5 and promotion fields in `metrics.jsonl` |
+| paired raw-policy final | 15/64, 23.44%, 95% Wilson interval 14.75–35.13% | generation 9 in `metrics.jsonl` |
+| aggregate searched policy | 159/240, 66.25%, 95% Wilson interval 60.05–71.93% | all generation rows in `metrics.jsonl` |
+| best searched update | 21/24, 87.50%, 95% Wilson interval 69.00–95.66%, update 6 | generation 6 in `metrics.jsonl` |
+| search-imitation top-action agreement | not recorded | metric absent from `metrics.jsonl` and `epochs.jsonl` |
+| terminal-value Brier score | not recorded | metric absent from `metrics.jsonl` and `epochs.jsonl` |
+| checkpoint files | `best-policy.pt` and `final-policy.pt` | run directory listing |
 
 ## 4. Conclusion
 
-_Pending — experiment not yet run._
+_Pending — metrics collected, awaiting discussion._
