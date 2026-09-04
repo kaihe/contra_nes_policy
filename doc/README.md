@@ -30,3 +30,4 @@
 - [0028 Laser PPO critic](0028-exp-laser-ppo-critic.md) — PPO progresses — inspect the value head before scaling
 - [0029 AlphaZero for Contra](0029-design-alphazero-contra.md) — Proposed — joint policy-value and game-state heads trained from emulator MCTS
 - [0030 Terminal success and progress heads](0030-design-terminal-value-progress-heads.md) — Implemented — calibrated success value with separately supervised game progress
+- [0031 AlphaZero compute scaling](0031-exp-alphazero-compute-scale.md) — Pending — one-to-two-hour search and distillation scale-up
